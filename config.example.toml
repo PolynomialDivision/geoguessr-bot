@@ -1,0 +1,83 @@
+[matrix]
+homeserver    = "https://matrix.example.org"
+user_id       = "@geobot:example.org"
+access_token  = "syt_REPLACE_ME"
+device_id     = "REPLACE_ME"
+# recovery_key = "OPTIONAL RECOVERY KEY"
+
+[security]
+# Only these users may invite the bot to rooms.
+allowed_inviters = ["@admin:example.org"]
+# Only these users may run admin commands (!startgeo, !prefetch).
+admin_users = ["@admin:example.org"]
+# encryption_strategy = "identity_based"  # AllDevices | IdentityBased (default) | OnlyTrusted
+
+[schedule]
+# Matrix room where all game messages are posted.
+room_id = "!REPLACE_ME:example.org"
+
+# Times to post the daily game (HH:MM, in the configured timezone).
+game_times = ["19:00"]
+
+# Game mode: "multiple_choice" (default) or "free_guess".
+#   multiple_choice — 4 country options; react 🇦🇧🇨🇩 or type !a/!b/!c/!d
+#   free_guess      — type any location in the DM; scored by Haversine distance
+#                     (GeoGuessr-style: 5000 pts at 0 km, ~1800 at 2000 km)
+#                     Accepts: city, country, full address (street + postcode),
+#                              or raw lat,lon coordinates.
+# game_mode = "multiple_choice"
+
+# Emoji used for the opt-in join message (free_guess + scheduled mode only).
+# The bot reacts to its own "who wants to play?" message with this emoji.
+# Anyone who also reacts with the same emoji receives questions via private DM.
+# join_emoji = "👍"
+
+# How many images per round (default 5).
+images_per_round = 5
+
+# How long (seconds) to collect answers per image.
+answer_timeout_secs = 90
+
+# Pause in seconds between images (default 15).
+inter_image_secs = 15
+
+# Seconds before game_time to post a "starting soon" reminder.
+# Set to 0 to disable.  Default: 300 (5 minutes).
+reminder_before_secs = 300
+
+# IANA timezone for scheduling.
+timezone = "Europe/Berlin"
+
+[sources]
+# Sources to draw images from. Supported: "wikimedia", "mapillary", "local".
+# The bot picks randomly from this list for each image.
+# Mix sources for variety, e.g. enabled = ["mapillary", "wikimedia"]
+enabled = ["mapillary"]
+
+[sources.mapillary]
+# Free client access token — register at https://www.mapillary.com/developer
+access_token  = "MLY|REPLACE_ME"
+# Search radius in metres around the seed coordinate (default 5 000).
+search_radius = 5000
+# Optional: only seed in these ISO 3166-1 alpha-2 countries.
+# countries = ["DE", "FR", "IT", "ES", "GB"]
+
+[sources.wikimedia]
+# Geosearch radius in metres (default 50 000).
+search_radius = 50000
+# Maximum image file size in bytes (default 4 MB). Larger images are skipped.
+max_image_bytes = 4194304
+# Optional: only use seed locations in these ISO 3166-1 alpha-2 countries.
+# Leave empty for the full world pool.
+# countries = ["DE", "FR", "IT", "ES", "GB"]
+
+# [sources.local]
+# path = "/data/geo-images"
+#
+# The directory must contain an index.json file:
+# [
+#   { "file": "berlin.jpg", "country": "Germany", "region": "Europe",
+#     "city": "Berlin", "attribution": "Photo by Alice" },
+#   ...
+# ]
+# "country" must match one of the names in the built-in countries list.

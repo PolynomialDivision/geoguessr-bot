@@ -1,0 +1,150 @@
+use serde::Deserialize;
+pub use mxbot_common::config::{EncryptionStrategy, MatrixConfig};
+
+#[derive(Deserialize)]
+pub struct Config {
+    pub matrix: MatrixConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
+    pub schedule: ScheduleConfig,
+    pub sources: SourcesConfig,
+}
+
+#[derive(Deserialize, Default)]
+pub struct SecurityConfig {
+    #[serde(default)]
+    pub allowed_inviters: Vec<String>,
+    #[serde(default)]
+    pub admin_users: Vec<String>,
+    #[serde(default)]
+    pub encryption_strategy: EncryptionStrategy,
+}
+
+#[derive(Deserialize, Clone, PartialEq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum GameMode {
+    /// Classic multiple-choice: 4 country options, react or type !a–!d.
+    MultipleChoice,
+    /// Free-guess: players type !guess <location>, scored by distance.
+    FreeGuess,
+}
+
+impl Default for GameMode {
+    fn default() -> Self { GameMode::MultipleChoice }
+}
+
+#[derive(Deserialize)]
+pub struct ScheduleConfig {
+    pub room_id: String,
+    /// One or more "HH:MM" times (in the configured timezone) to run the game.
+    pub game_times: Vec<String>,
+    /// Seconds to collect answers per image before revealing.
+    #[serde(default = "default_answer_timeout")]
+    pub answer_timeout_secs: u64,
+    /// Number of images per round.
+    #[serde(default = "default_images_per_round")]
+    pub images_per_round: u32,
+    /// Pause in seconds between images.
+    #[serde(default = "default_inter_image_secs")]
+    pub inter_image_secs: u64,
+    /// Seconds before game_time to post a "starting soon" reminder. 0 = disabled.
+    #[serde(default = "default_reminder_before_secs")]
+    pub reminder_before_secs: u64,
+    /// IANA timezone (e.g. "Europe/Berlin").
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+    /// Game mode: "multiple_choice" (default) or "free_guess".
+    #[serde(default)]
+    pub game_mode: GameMode,
+    /// Emoji the bot reacts with on the join-prompt message.
+    /// Any other user who reacts with the same emoji opts in to play via DM.
+    /// Only used when game_mode = "free_guess" and reminder_before_secs > 0.
+    #[serde(default = "default_join_emoji")]
+    pub join_emoji: String,
+    /// How many photos to show per question (from nearby locations).
+    /// Default 1 (classic single-photo). Increase to give players more visual context.
+    #[serde(default = "default_photos_per_location")]
+    pub photos_per_location: usize,
+}
+
+impl ScheduleConfig {
+    pub fn parse_game_time(s: &str) -> Option<(u32, u32)> {
+        let (h, m) = s.split_once(':')?;
+        let hour: u32   = h.trim().parse().ok()?;
+        let minute: u32 = m.trim().parse().ok()?;
+        if hour < 24 && minute < 60 { Some((hour, minute)) } else { None }
+    }
+}
+
+fn default_join_emoji()           -> String { "👍".to_owned() }
+fn default_answer_timeout()       -> u64 { 90 }
+fn default_images_per_round()     -> u32 { 5 }
+fn default_inter_image_secs()     -> u64 { 15 }
+fn default_reminder_before_secs() -> u64 { 300 }
+fn default_timezone()             -> String { "UTC".to_owned() }
+fn default_photos_per_location()  -> usize { 1 }
+
+// ── Sources ───────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct SourcesConfig {
+    /// Which sources to draw images from: "wikimedia", "mapillary", "local".
+    /// The bot picks a random source from this list for each image.
+    #[serde(default = "default_enabled_sources")]
+    pub enabled: Vec<String>,
+
+    #[serde(default)]
+    pub wikimedia: WikimediaConfig,
+
+    #[serde(default)]
+    pub mapillary: MapillaryConfig,
+
+    #[serde(default)]
+    pub local: LocalConfig,
+}
+
+fn default_enabled_sources() -> Vec<String> {
+    vec!["wikimedia".to_owned()]
+}
+
+#[derive(Deserialize, Default)]
+pub struct WikimediaConfig {
+    /// Geosearch radius in metres around each seed coordinate (default 50 000).
+    #[serde(default = "default_search_radius")]
+    pub search_radius: u32,
+    /// Maximum image size in bytes to accept (default 4 MB).
+    /// Larger images are skipped.
+    #[serde(default = "default_max_image_bytes")]
+    pub max_image_bytes: u64,
+    /// Optional allow-list of ISO 3166-1 alpha-2 country codes.
+    /// When set, only seed locations in these countries are used.
+    #[serde(default)]
+    pub countries: Vec<String>,
+}
+
+fn default_search_radius()   -> u32  { 50_000 }
+fn default_max_image_bytes() -> u64  { 4 * 1024 * 1024 }
+
+#[derive(Deserialize, Default)]
+pub struct MapillaryConfig {
+    /// Mapillary client access token (required).
+    /// Get one free at https://www.mapillary.com/developer
+    #[serde(default)]
+    pub access_token: String,
+    /// Search radius in metres around the seed coordinate (default 50 000 = 50 km, the API max).
+    /// The Mapillary API accepts up to 50 km; the value is divided by 1000 internally.
+    #[serde(default = "default_mapillary_radius")]
+    pub search_radius: u32,
+    /// Optional ISO 3166-1 alpha-2 country filter (same as wikimedia).
+    #[serde(default)]
+    pub countries: Vec<String>,
+}
+
+fn default_mapillary_radius() -> u32 { 50_000 }
+
+#[derive(Deserialize, Default)]
+pub struct LocalConfig {
+    /// Directory that contains images and an `index.json` file.
+    /// index.json format: array of { file, country, region, city?, attribution? }
+    pub path: Option<String>,
+}
