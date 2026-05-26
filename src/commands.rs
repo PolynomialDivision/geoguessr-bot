@@ -528,19 +528,31 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
 
 async fn cmd_lang(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
     let arg = body.split_whitespace().nth(1).unwrap_or("").trim();
-    let (lang, flag, label) = match arg {
-        "🇩🇪" | "de" | "DE" => ("de", "🇩🇪", "German"),
-        "🇬🇧" | "🇺🇸" | "en" | "EN" => ("en", "🇬🇧", "English"),
-        "🇺🇦" | "uk" | "UK" => ("uk", "🇺🇦", "Ukrainian"),
-        "" => {
-            let current = ctx.state.lock().await
-                .user_langs.get(sender.as_str()).cloned()
-                .unwrap_or_else(|| "en".to_owned());
-            let flag = match current.as_str() { "de" => "🇩🇪", "uk" => "🇺🇦", _ => "🇬🇧" };
-            return Ok(Some(format!("Your language: {flag} ({current}) · change with !lang 🇬🇧 / 🇩🇪 / 🇺🇦")));
-        }
-        other => return Ok(Some(format!("Unknown language «{other}» · use !lang 🇬🇧 / 🇩🇪 / 🇺🇦"))),
+
+    if arg.is_empty() {
+        let current = ctx.state.lock().await
+            .user_langs.get(sender.as_str()).cloned()
+            .unwrap_or_else(|| "en".to_owned());
+        let label = game::lang_label(&current);
+        return Ok(Some(format!(
+            "Your language: **{current}** ({label})\n\
+             Change with: !lang <flag>  or  !lang <code>  (e.g. !lang 🇩🇪  or  !lang de)"
+        )));
+    }
+
+    // Try as a flag emoji, then as a BCP-47 code.
+    let lang = if let Some(l) = game::flag_to_lang(arg) {
+        l
+    } else if let Some(l) = game::text_code_to_lang(&arg.to_lowercase()) {
+        l
+    } else {
+        return Ok(Some(format!(
+            "Unknown language «{arg}»\n\
+             Use !lang <flag>  or  !lang <code>  (e.g. !lang 🇩🇪  or  !lang de)"
+        )));
     };
+
+    let label = game::lang_label(lang);
 
     {
         let mut st = ctx.state.lock().await;
@@ -548,7 +560,7 @@ async fn cmd_lang(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<
         st.save(&ctx.state_path).await?;
     }
 
-    Ok(Some(format!("{flag} Language set to **{lang}** · your guess locations will now appear in {label}")))
+    Ok(Some(format!("Language set to **{lang}** ({label}) · your guess locations will now appear in {label}")))
 }
 
 // ── !help ─────────────────────────────────────────────────────────────────────
@@ -561,7 +573,7 @@ fn help_text() -> String {
   !mystats           · your rank and stats
   !countries         · country accuracy chart
   !fastest           · speed leaderboard
-  !lang 🇬🇧 / 🇩🇪 / 🇺🇦 · set your language for place names
+  !lang <flag or code>   · set your language (e.g. !lang 🇩🇪  or  !lang de)
   !help              · show this help
 
 **Admin:**

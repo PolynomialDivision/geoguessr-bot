@@ -401,12 +401,7 @@ async fn main() -> Result<()> {
 
                 if is_join_msg {
                     // Flag reaction → save language preference AND join the game.
-                    let lang_pref = match key.as_str() {
-                        "🇩🇪" => Some("de"),
-                        "🇬🇧" | "🇺🇸" => Some("en"),
-                        "🇺🇦" => Some("uk"),
-                        _ => None,
-                    };
+                    let lang_pref = game::flag_to_lang(&key);
                     if let Some(lang) = lang_pref {
                         // Save language preference.
                         {

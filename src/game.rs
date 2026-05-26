@@ -145,11 +145,14 @@ pub async fn start_round(
             let emoji         = ctx.config.schedule.join_emoji.clone();
 
             // Post the join-prompt message.
+            let flags_str = JOIN_REACTION_FLAGS.join(" ");
             let join_msg = format!(
                 "🌍 GeoGuessr starts in {}! @room\n\
                  I'll invite you to a private chat · answer there.\n\
-                 🇬🇧 🇩🇪 🇺🇦 React with your flag to join and set the map language.",
+                 React with your flag to join and set the map language:\n\
+                 {}",
                 format_duration(reminder_secs),
+                flags_str,
             );
             let mut join_content = format::mentionify(&join_msg);
             join_content = join_content.add_mentions({
@@ -161,7 +164,7 @@ pub async fn start_round(
             let join_event_id = join_event.response.event_id.clone();
 
             // Bot primes the flag reactions so clients show them as tappable buttons.
-            for flag in &["🇬🇧", "🇩🇪", "🇺🇦"] {
+            for flag in JOIN_REACTION_FLAGS {
                 room.send(ReactionEventContent::new(Annotation::new(
                     join_event_id.clone(),
                     flag.to_string(),
@@ -1185,7 +1188,76 @@ pub async fn open_join_dm(
 
 /// Query the server for all reactions on `join_event_id` with `join_emoji`
 /// and add matching users to `participants` (excluding the bot).
-const JOIN_FLAGS: &[&str] = &["🇬🇧", "🇩🇪", "🇺🇦"];
+/// Flags the bot posts as reactions on the join message (the most common ones).
+/// Any flag recognised by `flag_to_lang` counts as a join, even unlisted ones.
+const JOIN_REACTION_FLAGS: &[&str] = &["🇬🇧", "🇩🇪", "🇺🇦", "🇫🇷"];
+
+/// Map a flag emoji to a BCP-47 language code.
+/// Returns `None` for unrecognised flags.
+pub fn flag_to_lang(flag: &str) -> Option<&'static str> {
+    match flag {
+        "🇬🇧" | "🇺🇸" | "🇦🇺" | "🇨🇦" | "🇮🇪" | "🇳🇿" => Some("en"),
+        "🇩🇪" | "🇦🇹"                                    => Some("de"),
+        "🇺🇦"                                            => Some("uk"),
+        "🇫🇷" | "🇧🇪" | "🇲🇨"                           => Some("fr"),
+        "🇪🇸" | "🇲🇽" | "🇦🇷" | "🇨🇴" | "🇨🇱"          => Some("es"),
+        "🇷🇺" | "🇧🇾"                                    => Some("ru"),
+        "🇮🇹" | "🇸🇲"                                    => Some("it"),
+        "🇵🇱"                                            => Some("pl"),
+        "🇳🇱"                                            => Some("nl"),
+        "🇵🇹" | "🇧🇷"                                    => Some("pt"),
+        "🇯🇵"                                            => Some("ja"),
+        "🇨🇳" | "🇹🇼" | "🇭🇰"                           => Some("zh"),
+        "🇸🇦" | "🇦🇪" | "🇪🇬" | "🇲🇦" | "🇩🇿"          => Some("ar"),
+        "🇹🇷"                                            => Some("tr"),
+        "🇸🇪"                                            => Some("sv"),
+        "🇫🇮"                                            => Some("fi"),
+        "🇩🇰"                                            => Some("da"),
+        "🇨🇿"                                            => Some("cs"),
+        "🇭🇺"                                            => Some("hu"),
+        "🇷🇴"                                            => Some("ro"),
+        "🇬🇷"                                            => Some("el"),
+        "🇮🇱"                                            => Some("he"),
+        "🇰🇷"                                            => Some("ko"),
+        "🇹🇭"                                            => Some("th"),
+        "🇻🇳"                                            => Some("vi"),
+        "🇮🇩" | "🇲🇾"                                   => Some("id"),
+        _                                                => None,
+    }
+}
+
+/// Map a BCP-47 language code string to the canonical code we store.
+/// Accepts lowercase codes; returns `None` for unsupported codes.
+pub fn text_code_to_lang(code: &str) -> Option<&'static str> {
+    match code {
+        "en" => Some("en"), "de" => Some("de"), "uk" => Some("uk"),
+        "fr" => Some("fr"), "es" => Some("es"), "ru" => Some("ru"),
+        "it" => Some("it"), "pl" => Some("pl"), "nl" => Some("nl"),
+        "pt" => Some("pt"), "ja" => Some("ja"), "zh" => Some("zh"),
+        "ar" => Some("ar"), "tr" => Some("tr"), "sv" => Some("sv"),
+        "fi" => Some("fi"), "da" => Some("da"), "cs" => Some("cs"),
+        "hu" => Some("hu"), "ro" => Some("ro"), "el" => Some("el"),
+        "he" => Some("he"), "ko" => Some("ko"), "th" => Some("th"),
+        "vi" => Some("vi"), "id" => Some("id"),
+        _ => None,
+    }
+}
+
+/// Human-readable name for a BCP-47 language code.
+pub fn lang_label(code: &str) -> &'static str {
+    match code {
+        "en" => "English",  "de" => "German",     "uk" => "Ukrainian",
+        "fr" => "French",   "es" => "Spanish",    "ru" => "Russian",
+        "it" => "Italian",  "pl" => "Polish",     "nl" => "Dutch",
+        "pt" => "Portuguese","ja" => "Japanese",  "zh" => "Chinese",
+        "ar" => "Arabic",   "tr" => "Turkish",    "sv" => "Swedish",
+        "fi" => "Finnish",  "da" => "Danish",     "cs" => "Czech",
+        "hu" => "Hungarian","ro" => "Romanian",   "el" => "Greek",
+        "he" => "Hebrew",   "ko" => "Korean",     "th" => "Thai",
+        "vi" => "Vietnamese","id" => "Indonesian",
+        _ => "unknown",
+    }
+}
 
 async fn reconcile_join_reactions(
     client:        &Client,
@@ -1214,7 +1286,7 @@ async fn reconcile_join_reactions(
                     let Ok(AnyMessageLikeEvent::Reaction(ev)) = raw.deserialize() else { continue };
                     let Some(orig) = ev.as_original() else { continue };
                     if bot_user_id.map(|b| b == orig.sender).unwrap_or(false) { continue; }
-                    if JOIN_FLAGS.contains(&orig.content.relates_to.key.as_str()) {
+                    if flag_to_lang(&orig.content.relates_to.key).is_some() {
                         participants.insert(orig.sender.clone());
                     }
                 }
