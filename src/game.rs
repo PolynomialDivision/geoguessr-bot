@@ -735,10 +735,11 @@ async fn play_free_guess(
     let user_ids: Vec<&str> = scored.iter().map(|(uid, _, _, _)| uid.as_str()).collect();
     let names        = fetch_names(room, &user_ids).await;
     let raw_avatars  = crate::avatar::fetch_player_avatars(room, &user_ids).await;
+    let avatar_mxcs  = fetch_avatar_mxc_urls(room, &user_ids).await;
     post_reveal_free_guess(
         ctx, client, img,
         actual_lat, actual_lon,
-        &scored, &names, &raw_avatars, dm_participants,
+        &scored, &names, &raw_avatars, &avatar_mxcs, dm_participants,
     )
     .await;
 
@@ -754,6 +755,7 @@ async fn post_reveal_free_guess(
     scored:          &[(String, FreeGuess, f64, i64)],
     names:           &HashMap<String, String>,
     raw_avatars:     &HashMap<String, Vec<u8>>,
+    avatar_mxcs:     &HashMap<String, String>,
     dm_participants: &HashMap<OwnedUserId, OwnedRoomId>,
 ) {
     let location_str = match &img.city {
@@ -767,18 +769,21 @@ async fn post_reveal_free_guess(
     );
 
     // ── Reverse-geocode each guess for human-readable labels ─────────────────
-    let mut guess_labels:    Vec<String>                   = Vec::with_capacity(scored.len());
-    let mut overview_entries: Vec<(&str, f64, f64, u8, u8, u8)> = Vec::with_capacity(scored.len());
-    for (i, (uid, guess, _, _)) in scored.iter().enumerate() {
+    // overview_entries: (uid, lat, lon, r, g, b, score, dist_km, mxc_url)
+    let mut guess_labels:     Vec<String>                                        = Vec::with_capacity(scored.len());
+    let mut overview_entries: Vec<(&str, f64, f64, u8, u8, u8, i64, f64, String)> = Vec::with_capacity(scored.len());
+    for (i, (uid, guess, dist, score)) in scored.iter().enumerate() {
         let (r, g, b, _) = crate::mapimage::PLAYER_COLORS[i % crate::mapimage::PLAYER_COLORS.len()];
+        let mxc = avatar_mxcs.get(uid.as_str()).cloned().unwrap_or_default();
         let map_url = build_guess_map_url(
             guess.lat, guess.lon, actual_lat, actual_lon, r, g, b, "en",
+            &mxc, *score, *dist,
         );
         let label = crate::geocode::reverse_geocode(guess.lat, guess.lon, "en")
             .await
             .unwrap_or_else(|| format!("{:.2}, {:.2}", guess.lat, guess.lon));
         guess_labels.push(format!("[{label}]({map_url})"));
-        overview_entries.push((uid.as_str(), guess.lat, guess.lon, r, g, b));
+        overview_entries.push((uid.as_str(), guess.lat, guess.lon, r, g, b, *score, *dist, mxc));
     }
 
     // ── Build "all guesses" overview map URL ──────────────────────────────────
@@ -904,7 +909,8 @@ async fn post_reveal_free_guess(
 
         // Geocode the player's guess in their language + build an interactive map link.
         let (pr, pg, pb, _) = crate::mapimage::PLAYER_COLORS[rank_0 % crate::mapimage::PLAYER_COLORS.len()];
-        let guess_map_url = build_guess_map_url(guess.lat, guess.lon, actual_lat, actual_lon, pr, pg, pb, &lang);
+        let mxc = avatar_mxcs.get(uid.as_str()).map(|s| s.as_str()).unwrap_or("");
+        let guess_map_url = build_guess_map_url(guess.lat, guess.lon, actual_lat, actual_lon, pr, pg, pb, &lang, mxc, *score, *dist);
         let guess_label = crate::geocode::reverse_geocode(guess.lat, guess.lon, &lang)
             .await
             .unwrap_or_else(|| format!("{:.2}, {:.2}", guess.lat, guess.lon));
@@ -1530,18 +1536,24 @@ fn build_guess_map_url(
     guess_lat:  f64, guess_lon:  f64,
     actual_lat: f64, actual_lon: f64,
     r: u8, g: u8, b: u8,
-    lang: &str,
+    lang:    &str,
+    mxc:     &str,
+    score:   i64,
+    dist_km: f64,
 ) -> String {
+    let mxc_enc = url_encode_component(mxc);
     format!(
         "https://polynomialdivision.github.io/geo-picker/reveal.html\
          ?lang={lang}&alat={actual_lat:.4}&alon={actual_lon:.4}\
-         &glat={guess_lat:.4}&glon={guess_lon:.4}&color={r:02X}{g:02X}{b:02X}"
+         &glat={guess_lat:.4}&glon={guess_lon:.4}&color={r:02X}{g:02X}{b:02X}\
+         &mxc={mxc_enc}&score={score}&dist={dist_km:.1}"
     )
 }
 
 /// Build a reveal.html URL showing every player's guess and the actual location.
+/// Entry tuple: (uid, lat, lon, r, g, b, score, dist_km, mxc_url)
 fn build_all_guesses_map_url(
-    entries:    &[(&str, f64, f64, u8, u8, u8)],  // (uid, lat, lon, r, g, b)
+    entries:    &[(&str, f64, f64, u8, u8, u8, i64, f64, String)],
     actual_lat: f64,
     actual_lon: f64,
     names:      &HashMap<String, String>,
@@ -1550,9 +1562,12 @@ fn build_all_guesses_map_url(
         "https://polynomialdivision.github.io/geo-picker/reveal.html\
          ?lang=en&alat={actual_lat:.4}&alon={actual_lon:.4}"
     );
-    for (uid, lat, lon, r, g, b) in entries {
-        let name = url_encode_component(display_name(names, uid));
-        url.push_str(&format!("&g={name}|{lat:.4}|{lon:.4}|{r:02X}{g:02X}{b:02X}"));
+    for (uid, lat, lon, r, g, b, score, dist, mxc) in entries {
+        let name    = url_encode_component(display_name(names, uid));
+        let mxc_enc = url_encode_component(mxc);
+        url.push_str(&format!(
+            "&g={name}|{lat:.4}|{lon:.4}|{r:02X}{g:02X}{b:02X}|{mxc_enc}|{score}|{dist:.1}"
+        ));
     }
     url
 }
@@ -1576,6 +1591,22 @@ fn display_name<'a>(names: &'a HashMap<String, String>, uid: &'a str) -> &'a str
     names.get(uid).map(|s| s.as_str()).unwrap_or_else(|| {
         uid.split(':').next().unwrap_or("").trim_start_matches('@')
     })
+}
+
+/// Fetch each player's Matrix avatar_url (mxc://…) from their room member state.
+/// Returns an empty string for users without an avatar.
+async fn fetch_avatar_mxc_urls(room: &Room, user_ids: &[&str]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for &uid_str in user_ids {
+        if let Ok(uid) = matrix_sdk::ruma::OwnedUserId::try_from(uid_str) {
+            if let Ok(Some(member)) = room.get_member(&uid).await {
+                if let Some(mxc) = member.avatar_url() {
+                    map.insert(uid_str.to_owned(), mxc.to_string());
+                }
+            }
+        }
+    }
+    map
 }
 
 async fn fetch_names(room: &Room, user_ids: &[&str]) -> HashMap<String, String> {
