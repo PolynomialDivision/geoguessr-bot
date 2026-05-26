@@ -57,7 +57,7 @@ async fn cmd_startgeo(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<S
     *ctx.round_abort.lock().await = Some(handle.abort_handle());
 
     Ok(Some(format!(
-        "🌍 GeoGuessr starting! {} guesses, {} per guess.",
+        "🌍 Starting! {} guesses · {} each.",
         ctx.config.schedule.guesses_per_round,
         crate::game::format_duration(ctx.config.schedule.answer_timeout_secs),
     )))
@@ -80,7 +80,7 @@ async fn cmd_cancelgeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Re
         let (qh, qm) = match ScheduleConfig::parse_game_time(time_arg) {
             Some(t) => t,
             None    => return Ok(Some(format!(
-                "❌ Invalid time \"{time_arg}\" — use HH:MM, e.g. !cancelgeo 15:00"
+                "❌ Invalid time \"{time_arg}\" · use HH:MM (e.g. 15:00)"
             ))),
         };
         let game_time = format!("{qh:02}:{qm:02}");
@@ -166,7 +166,7 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
     let (qh, qm) = match ScheduleConfig::parse_game_time(time_arg) {
         Some(t) => t,
         None    => return Ok(Some(format!(
-            "❌ Invalid time \"{time_arg}\" — use HH:MM, e.g. !schedulegeo 15:00"
+            "❌ Invalid time \"{time_arg}\" · use HH:MM (e.g. 15:00)"
         ))),
     };
 
@@ -177,17 +177,16 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
         if let Some(v) = arg.strip_prefix("reminder=") {
             match v.parse::<u64>() {
                 Ok(n)  => reminder_override = Some(n),
-                Err(_) => return Ok(Some(format!("❌ Invalid reminder value \"{v}\" — must be seconds."))),
+                Err(_) => return Ok(Some(format!("❌ Invalid reminder \"{v}\" · must be seconds."))),
             }
         } else if let Some(v) = arg.strip_prefix("timeout=") {
             match v.parse::<u64>() {
                 Ok(n)  => timeout_override = Some(n),
-                Err(_) => return Ok(Some(format!("❌ Invalid timeout value \"{v}\" — must be seconds."))),
+                Err(_) => return Ok(Some(format!("❌ Invalid timeout \"{v}\" · must be seconds."))),
             }
         } else {
             return Ok(Some(format!(
-                "❌ Unknown argument \"{arg}\".\n\
-                 Usage: !schedulegeo HH:MM [reminder=<secs>] [timeout=<secs>]"
+                "❌ Unknown argument \"{arg}\"\nUsage: !schedulegeo HH:MM [reminder=N] [timeout=N]"
             )));
         }
     }
@@ -234,16 +233,14 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
     let fire_hour = (fire_secs / 3600) as u32;
     let fire_min  = ((fire_secs % 3600) / 60) as u32;
 
-    let mut detail = format!("✅ GeoGuessr scheduled for {day_str} at {game_time}");
+    let mut detail = format!("✅ GeoGuessr: {day_str} at {game_time}");
     if reminder > 0 {
-        detail.push_str(&format!(
-            " (join prompt at {fire_hour:02}:{fire_min:02})"
-        ));
+        detail.push_str(&format!(" (join {fire_hour:02}:{fire_min:02})"));
     }
     if let Some(t) = timeout_override {
-        detail.push_str(&format!(", timeout {}", crate::game::format_duration(t)));
+        detail.push_str(&format!(", {}", crate::game::format_duration(t)));
     }
-    detail.push_str(&format!(".\nCancel with: !cancelgeo {game_time}"));
+    detail.push_str(&format!("\nCancel: !cancelgeo {game_time}"));
     Ok(Some(detail))
 }
 
@@ -266,8 +263,7 @@ async fn cmd_resetstats(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> R
     let confirmed = body.split_whitespace().nth(1).unwrap_or("") == "confirm";
     if !confirmed {
         return Ok(Some(
-            "⚠️ This will delete ALL game history — rounds, images, answers and scores.\n\
-             To confirm: !resetstats confirm".to_owned()
+            "⚠️ This deletes ALL game history.\nConfirm: !resetstats confirm".to_owned()
         ));
     }
 
@@ -296,11 +292,11 @@ async fn cmd_scores(ctx: &BotContext) -> Result<Option<String>> {
         }
     };
     if board.is_empty() {
-        return Ok(Some("No scores yet — no games have been played.".to_owned()));
+        return Ok(Some("No scores yet.".to_owned()));
     }
 
     let round_count = ctx.db.round_count().await.unwrap_or(0);
-    let mut lines = vec![format!("🏆 Leaderboard  ({} round(s) played)", round_count)];
+    let mut lines = vec![format!("🏆 **Leaderboard** · {} round(s)", round_count)];
     lines.push(String::new());
     for (i, entry) in board.iter().enumerate() {
         let pct   = if entry.total_questions > 0 {
@@ -308,7 +304,7 @@ async fn cmd_scores(ctx: &BotContext) -> Result<Option<String>> {
         } else { 0 };
         let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
         lines.push(format!(
-            "{medal} {:>2}. {} — {}/{} correct ({}%)",
+            "{medal} {:>2}. {} : {}/{} ({}%)",
             i + 1, entry.user_id, entry.total_correct, entry.total_questions, pct,
         ));
     }
@@ -347,7 +343,7 @@ pub async fn build_alltime_leaderboard(ctx: &BotContext) -> Option<String> {
 
     let round_count = ctx.db.round_count().await.unwrap_or(0);
     let mut lines = vec![
-        format!("🏆 **All-time Leaderboard**  ({} round(s) · ranked by skill)", round_count),
+        format!("🏆 **All-time Leaderboard** · {} round(s)", round_count),
         String::new(),
     ];
 
@@ -357,10 +353,10 @@ pub async fn build_alltime_leaderboard(ctx: &BotContext) -> Option<String> {
         let b_avg  = bayesian(entry);
         let filled = ((b_avg / 5000.0) * BAR_W as f64).round() as usize;
         let bar    = format!("{}{}", "█".repeat(filled.min(BAR_W)), "░".repeat(BAR_W - filled.min(BAR_W)));
-        let avg_dist  = if entry.guesses_played > 0 { format_dist(entry.avg_distance_km)  } else { "—".to_owned() };
-        let best_dist = if entry.guesses_played > 0 { format_dist(entry.best_distance_km) } else { "—".to_owned() };
+        let avg_dist  = if entry.guesses_played > 0 { format_dist(entry.avg_distance_km)  } else { "n/a".to_owned() };
+        let best_dist = if entry.guesses_played > 0 { format_dist(entry.best_distance_km) } else { "n/a".to_owned() };
 
-        lines.push(format!("{medal} {:>2}. {}  —  {} pts/guess", i + 1, entry.user_id, b_avg.round() as i64));
+        lines.push(format!("{medal} {:>2}. {} : {} pts/guess", i + 1, entry.user_id, b_avg.round() as i64));
         lines.push(format!("      {bar}  ⌀ {}  🏅 {}  ({} guesses)", avg_dist, best_dist, entry.guesses_played));
     }
     Some(lines.join("\n"))
@@ -376,7 +372,7 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
             error!("DB user_stats error: {e}");
             return Ok(Some("❌ Could not read stats from database.".to_owned()));
         }
-        Ok(None) => return Ok(Some("You haven't played any GeoGuessr rounds yet.".to_owned())),
+        Ok(None) => return Ok(Some("No rounds played yet.".to_owned())),
         Ok(Some(s)) => s,
     };
 
@@ -387,11 +383,11 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
     let board = ctx.db.leaderboard().await.unwrap_or_default();
     let rank  = board.iter().position(|e| e.user_id == user).map(|i| i + 1);
     let rank_str = rank
-        .map(|r| format!("  |  rank #{r} of {}", board.len()))
+        .map(|r| format!(" · rank #{r} of {}", board.len()))
         .unwrap_or_default();
 
     let mut lines = vec![format!(
-        "🌍 Your stats: {}/{} correct ({}%)  |  {} round(s) played{rank_str}",
+        "🌍 **Your stats** · {}/{} correct ({}%) · {} round(s){rank_str}",
         stats.total_correct, stats.total_questions, pct, stats.rounds_played,
     )];
 
@@ -401,8 +397,8 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
         let worst = country_stats.last().unwrap();
         let best_pct  = best.correct  * 100 / best.answered;
         let worst_pct = worst.correct * 100 / worst.answered;
-        lines.push(format!("🏆 Best country:  {} ({}%)", best.country,  best_pct));
-        lines.push(format!("😬 Worst country: {} ({}%)", worst.country, worst_pct));
+        lines.push(format!("🏆 Best: {} ({}%)", best.country, best_pct));
+        lines.push(format!("😬 Worst: {} ({}%)", worst.country, worst_pct));
     }
 
     Ok(Some(lines.join("\n")))
@@ -426,7 +422,7 @@ async fn cmd_countries(ctx: &BotContext) -> Result<Option<String>> {
     let max_asked: i64   = stats.iter().map(|s| s.times_asked).max().unwrap_or(1);
 
     let mut lines = vec![
-        format!("🗺️ Countries  ({} guesses)", total_q),
+        format!("🗺️ **Countries** · {} guesses", total_q),
         String::new(),
     ];
 
@@ -458,18 +454,18 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
     };
     if board.is_empty() {
         return Ok(Some(
-            "Not enough data yet — need at least 3 correct answers per player.".to_owned()
+            "Not enough data yet · need at least 3 correct answers per player.".to_owned()
         ));
     }
 
     let mut lines = vec![
-        "⚡ Speed Leaderboard  (correct answers only, min. 3 samples)".to_owned(),
+        "⚡ **Speed** · fastest correct answers (min. 3 samples)".to_owned(),
         String::new(),
     ];
     for (i, e) in board.iter().enumerate() {
         let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
         lines.push(format!(
-            "{medal} {:>2}. {} — avg {:.1}s  ({} correct answers)",
+            "{medal} {:>2}. {} : {:.1}s avg · {} correct",
             i + 1, e.user_id, e.avg_secs, e.sample_count,
         ));
     }
@@ -491,7 +487,7 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
 
     let reminder_line = if s.reminder_before_secs > 0 {
         format!(
-            "\n  ⏰ **Join window** opens {} before game time — react with {} to opt in.",
+            "\n⏰ Join window {} early · react with {} to play",
             game::format_duration(s.reminder_before_secs),
             s.join_emoji,
         )
@@ -501,33 +497,27 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
 
     let mode_line = match s.game_mode {
         crate::config::GameMode::MultipleChoice =>
-            "  🗺️ **Mode** multiple choice — pick the right country from 4 options.\n\
-             \n\
-             **How to answer:** react with 🇦 🇧 🇨 🇩 or type **!a** / **!b** / **!c** / **!d**.".to_owned(),
+            "🗺️ Multiple choice · pick from 4 countries\n\
+             React with 🇦 🇧 🇨 🇩 or type **!a** / **!b** / **!c** / **!d**".to_owned(),
         crate::config::GameMode::FreeGuess =>
-            "  🗺️ **Mode** free guess — type any location in the private chat.\n\
-             \n\
-             **How to answer:** reply in the private chat with a city, country, full address, \
-             or lat,lon coordinates. Scored by distance (5 000 pts at 0 km).".to_owned(),
+            "🗺️ Free guess · type a location in private chat\n\
+             City, country, full address, or lat,lon · scored by distance".to_owned(),
     };
 
     let photos_line = if s.photos_per_location > 1 {
-        format!("\n  📸 **{} photos** per location.", s.photos_per_location)
+        format!("\n📸 {} photos per location", s.photos_per_location)
     } else {
         String::new()
     };
 
     let msg = format!(
-        "🌍 **GeoGuessr Bot — game info**\n\
-         \n\
-           🕐 **Daily game** at {times_str} ({tz}).{reminder_line}\n\
-         \n\
-           🖼️ **{images}** guess{plural} per round, **{timeout}** to answer each one.{photos_line}\n\
-         \n\
+        "🌍 **GeoGuessr**\n\
+         🕐 {times_str} ({tz}){reminder_line}\n\
+         📍 {} guess{} · {}{photos_line}\n\n\
          {mode_line}",
-        images  = s.guesses_per_round,
-        plural  = if s.guesses_per_round == 1 { "" } else { "es" },
-        timeout = game::format_duration(s.answer_timeout_secs),
+        s.guesses_per_round,
+        if s.guesses_per_round == 1 { "" } else { "es" },
+        game::format_duration(s.answer_timeout_secs),
     );
 
     Ok(Some(msg))
@@ -536,27 +526,21 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
 // ── !help ─────────────────────────────────────────────────────────────────────
 
 fn help_text() -> String {
-    "🌍 GeoGuessr Bot commands:
+    "🌍 **GeoGuessr** commands:
 
-  !gameinfo                — show schedule, mode and how to play
-  !scores / !leaderboard   — overall ranking of all players
-  !mystats                 — your personal score, rank and best/worst country
-  !countries               — bar chart of every country shown with accuracy
-  !fastest                 — speed leaderboard (avg seconds to correct answer)
-  !help                    — show this help
+  !gameinfo          · schedule & how to play
+  !scores            · all-time leaderboard
+  !mystats           · your rank and stats
+  !countries         · country accuracy chart
+  !fastest           · speed leaderboard
+  !help              · show this help
 
-Admin commands:
-  !startgeo / !geoguessr          — start a round right now
-  !cancelgeo                      — abort the current round (join phase or active)
-  !cancelgeo HH:MM                — cancel a pending one-time game
-  !schedulegeo HH:MM              — schedule a one-time game (join prompt fires earlier)
-  !schedulegeo HH:MM reminder=N   — override join-prompt lead time (seconds)
-  !schedulegeo HH:MM timeout=N    — override answer window (seconds)
-  !schedulegeo                    — list pending one-time games
-  !prefetch                       — manually pre-fetch images into the cache
-  !resetstats confirm             — wipe all game history and reset the leaderboard
-
-During a game, reply in the private chat with your location guess.
-Any format works: city, country, full address, or lat,lon coordinates."
+**Admin:**
+  !startgeo          · start a round now
+  !cancelgeo         · abort current round
+  !cancelgeo HH:MM   · cancel a scheduled game
+  !schedulegeo HH:MM · schedule a one-time game
+  !prefetch          · fill the image cache
+  !resetstats confirm · wipe all history"
         .to_owned()
 }

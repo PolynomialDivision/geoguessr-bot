@@ -61,6 +61,24 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
             continue;
         }
 
+        // ── [label](url) markdown links ──────────────────────────────────────────
+        if text.as_bytes()[pos] == b'[' {
+            if let Some(bracket_end) = text[pos + 1..].find(']') {
+                let after_bracket = pos + 1 + bracket_end + 1;
+                if text.as_bytes().get(after_bracket) == Some(&b'(') {
+                    if let Some(paren_end) = text[after_bracket + 1..].find(')') {
+                        let label = &text[pos + 1 .. pos + 1 + bracket_end];
+                        let url   = &text[after_bracket + 1 .. after_bracket + 1 + paren_end];
+                        plain.push_str(label);
+                        html.push_str(&format!(r#"<a href="{url}">{label}</a>"#));
+                        found = true;
+                        pos   = after_bracket + 1 + paren_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
         // ── @user:server MXID pills ───────────────────────────────────────────
         if text.as_bytes()[pos] == b'@' {
             let token_len = text[pos..]
@@ -177,6 +195,17 @@ mod tests {
         let html = html.expect("should have HTML body");
         assert!(html.contains("<strong>"), "html={html}");
         assert!(html.contains(r#"href="https://matrix.to/#/@alice:example.org""#));
+    }
+
+    #[test]
+    fn markdown_link_becomes_anchor() {
+        let c = mentionify("📍 Italy [Map](https://example.com/map)");
+        let (plain, html) = bodies(&c);
+        let html = html.expect("should have HTML body");
+        assert!(html.contains(r#"href="https://example.com/map""#), "html={html}");
+        assert!(html.contains(">Map<"), "html={html}");
+        assert!(plain.contains("Map"), "plain={plain}");
+        assert!(!plain.contains("https://"), "raw URL should not appear in plain body");
     }
 
     #[test]
