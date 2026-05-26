@@ -22,6 +22,7 @@ pub async fn handle(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Resul
         "!countries"     => cmd_countries(ctx).await,
         "!gameinfo"      => cmd_gameinfo(ctx).await,
         "!fastest"       => cmd_fastest(ctx).await,
+        "!lang"          => cmd_lang(ctx, sender, body).await,
         "!help"          => Ok(Some(help_text())),
         _                => Ok(None),
     }
@@ -523,6 +524,33 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
     Ok(Some(msg))
 }
 
+// ── !lang ─────────────────────────────────────────────────────────────────────
+
+async fn cmd_lang(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
+    let arg = body.split_whitespace().nth(1).unwrap_or("").trim();
+    let (lang, flag, label) = match arg {
+        "🇩🇪" | "de" | "DE" => ("de", "🇩🇪", "German"),
+        "🇬🇧" | "🇺🇸" | "en" | "EN" => ("en", "🇬🇧", "English"),
+        "🇺🇦" | "uk" | "UK" => ("uk", "🇺🇦", "Ukrainian"),
+        "" => {
+            let current = ctx.state.lock().await
+                .user_langs.get(sender.as_str()).cloned()
+                .unwrap_or_else(|| "en".to_owned());
+            let flag = match current.as_str() { "de" => "🇩🇪", "uk" => "🇺🇦", _ => "🇬🇧" };
+            return Ok(Some(format!("Your language: {flag} ({current}) · change with !lang 🇬🇧 / 🇩🇪 / 🇺🇦")));
+        }
+        other => return Ok(Some(format!("Unknown language «{other}» · use !lang 🇬🇧 / 🇩🇪 / 🇺🇦"))),
+    };
+
+    {
+        let mut st = ctx.state.lock().await;
+        st.user_langs.insert(sender.as_str().to_owned(), lang.to_owned());
+        st.save(&ctx.state_path).await?;
+    }
+
+    Ok(Some(format!("{flag} Language set to **{lang}** · your guess locations will now appear in {label}")))
+}
+
 // ── !help ─────────────────────────────────────────────────────────────────────
 
 fn help_text() -> String {
@@ -533,6 +561,7 @@ fn help_text() -> String {
   !mystats           · your rank and stats
   !countries         · country accuracy chart
   !fastest           · speed leaderboard
+  !lang 🇬🇧 / 🇩🇪 / 🇺🇦 · set your language for place names
   !help              · show this help
 
 **Admin:**

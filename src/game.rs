@@ -146,10 +146,10 @@ pub async fn start_round(
 
             // Post the join-prompt message.
             let join_msg = format!(
-                "🌍 GeoGuessr starts in {}! @room React with {} to join.\n\
-                 I'll invite you to a private chat · answer there.",
+                "🌍 GeoGuessr starts in {}! @room\n\
+                 I'll invite you to a private chat · answer there.\n\
+                 🇬🇧 🇩🇪 🇺🇦 React with your flag to join and set the map language.",
                 format_duration(reminder_secs),
-                emoji,
             );
             let mut join_content = format::mentionify(&join_msg);
             join_content = join_content.add_mentions({
@@ -160,13 +160,15 @@ pub async fn start_round(
             let join_event    = room.send(join_content).await?;
             let join_event_id = join_event.response.event_id.clone();
 
-            // Bot reacts first (this "primes" the emoji so clients show it).
-            room.send(ReactionEventContent::new(Annotation::new(
-                join_event_id.clone(),
-                emoji.clone(),
-            )))
-            .await
-            .ok();
+            // Bot primes the flag reactions so clients show them as tappable buttons.
+            for flag in &["🇬🇧", "🇩🇪", "🇺🇦"] {
+                room.send(ReactionEventContent::new(Annotation::new(
+                    join_event_id.clone(),
+                    flag.to_string(),
+                )))
+                .await
+                .ok();
+            }
 
             // Register the join event so the reaction handler populates participants.
             {
@@ -207,7 +209,6 @@ pub async fn start_round(
                 &client,
                 &room,
                 &join_event_id,
-                &emoji,
                 bot_uid.as_deref(),
                 &mut participants,
             )
@@ -621,14 +622,7 @@ async fn play_free_guess(
          City, country, address, or lat,lon\n\
          ↩️ Main room: https://matrix.to/#/{room_id_str}"
     );
-    let dm_prompt_html = format!(
-        "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}<br>\
-         📍 Where is this?<br>\
-         City, country, address, or \
-         <a href=\"https://polynomialdivision.github.io/geo-picker/\">pick on map</a><br>\
-         <a href=\"https://matrix.to/#/{room_id_str}\">↩️ Main room</a>"
-    );
-    for dm_room_id in dm_participants.values() {
+    for (uid, dm_room_id) in dm_participants.iter() {
         if let Some(dm_room) = client.get_room(dm_room_id) {
             for (i, (mxc_uri, _mime)) in all_images.iter().enumerate() {
                 let label = if n_imgs == 1 {
@@ -639,6 +633,16 @@ async fn play_free_guess(
                 let dm_img = ImageMessageEventContent::plain(label, mxc_uri.clone());
                 dm_room.send(RoomMessageEventContent::new(MessageType::Image(dm_img))).await.ok();
             }
+            let lang = ctx.state.lock().await
+                .user_langs.get(uid.as_str()).cloned()
+                .unwrap_or_else(|| "en".to_owned());
+            let dm_prompt_html = format!(
+                "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}<br>\
+                 📍 Where is this?<br>\
+                 City, country, address, or \
+                 <a href=\"https://polynomialdivision.github.io/geo-picker/?lang={lang}\">pick on map</a><br>\
+                 ↩️ <a href=\"https://matrix.to/#/{room_id_str}\">Main room</a>"
+            );
             dm_room.send(RoomMessageEventContent::text_html(&dm_prompt_plain, &dm_prompt_html)).await.ok();
         }
     }
@@ -767,7 +771,7 @@ async fn post_reveal_free_guess(
         let map_url = build_guess_map_url(
             guess.lat, guess.lon, actual_lat, actual_lon, r, g, b,
         );
-        let label = crate::geocode::reverse_geocode(guess.lat, guess.lon)
+        let label = crate::geocode::reverse_geocode(guess.lat, guess.lon, "en")
             .await
             .unwrap_or_else(|| format!("{:.2}, {:.2}", guess.lat, guess.lon));
         guess_labels.push(format!("[{label}]({map_url})"));
@@ -891,15 +895,27 @@ async fn post_reveal_free_guess(
             Err(_)        => None,
         };
 
+        let lang = ctx.state.lock().await
+            .user_langs.get(uid.as_str()).cloned()
+            .unwrap_or_else(|| "en".to_owned());
+
+        // Geocode the player's guess in their language + build an interactive map link.
+        let (pr, pg, pb, _) = crate::mapimage::PLAYER_COLORS[rank_0 % crate::mapimage::PLAYER_COLORS.len()];
+        let guess_map_url = build_guess_map_url(guess.lat, guess.lon, actual_lat, actual_lon, pr, pg, pb);
+        let guess_label = crate::geocode::reverse_geocode(guess.lat, guess.lon, &lang)
+            .await
+            .unwrap_or_else(|| format!("{:.2}, {:.2}", guess.lat, guess.lon));
+
+        // Geocode the actual location in their language.
+        let actual_label = crate::geocode::reverse_geocode(actual_lat, actual_lon, &lang)
+            .await
+            .unwrap_or_else(|| "Map".to_owned());
+
         let fb_text = format!(
             "{medal} Rank #{rank} of {}\n\
-             \"{}\"\n\
-             📏 {} away · {} pts\n\
-             📍 Actual: [Map]({})",
+             [{guess_label}]({guess_map_url}) · {dist_str} · {score} pts\n\
+             📍 Actual: [{actual_label}]({})",
             scored.len(),
-            guess.text,
-            dist_str,
-            score,
             maps_url,
         );
 
@@ -935,9 +951,15 @@ async fn post_reveal_free_guess(
         });
         if !already_got_fb {
             if let Some(dm_room) = client.get_room(dm_room_id) {
+                let lang = ctx.state.lock().await
+                    .user_langs.get(uid.as_str()).cloned()
+                    .unwrap_or_else(|| "en".to_owned());
+                let actual_label = crate::geocode::reverse_geocode(actual_lat, actual_lon, &lang)
+                    .await
+                    .unwrap_or_else(|| "Map".to_owned());
                 dm_room.send(format::mentionify(&format!(
                     "⏰ Time's up! No guess submitted.\n\
-                     📍 Actual: [Map]({})",
+                     📍 Actual: [{actual_label}]({})",
                     maps_url,
                 )))
                 .await
@@ -1163,11 +1185,12 @@ pub async fn open_join_dm(
 
 /// Query the server for all reactions on `join_event_id` with `join_emoji`
 /// and add matching users to `participants` (excluding the bot).
+const JOIN_FLAGS: &[&str] = &["🇬🇧", "🇩🇪", "🇺🇦"];
+
 async fn reconcile_join_reactions(
     client:        &Client,
     room:          &Room,
     join_event_id: &OwnedEventId,
-    join_emoji:    &str,
     bot_user_id:   Option<&matrix_sdk::ruma::UserId>,
     participants:  &mut HashSet<OwnedUserId>,
 ) {
@@ -1191,7 +1214,7 @@ async fn reconcile_join_reactions(
                     let Ok(AnyMessageLikeEvent::Reaction(ev)) = raw.deserialize() else { continue };
                     let Some(orig) = ev.as_original() else { continue };
                     if bot_user_id.map(|b| b == orig.sender).unwrap_or(false) { continue; }
-                    if orig.content.relates_to.key == join_emoji {
+                    if JOIN_FLAGS.contains(&orig.content.relates_to.key.as_str()) {
                         participants.insert(orig.sender.clone());
                     }
                 }
@@ -1728,7 +1751,6 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         &client,
         &room,
         &join_event_id,
-        &pj.join_emoji,
         bot_uid.as_deref(),
         &mut participants,
     )

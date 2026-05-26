@@ -393,30 +393,42 @@ async fn main() -> Result<()> {
                 let reacted_to = ev.content.relates_to.event_id.as_str().to_owned();
                 let key        = ev.content.relates_to.key.clone();
 
-                // Check if this is a join opt-in reaction.
-                {
-                    let mut js = ctx.join_state.lock().await;
-                    if js.message_event_id.as_ref().map(|id| id.as_str()) == Some(&reacted_to)
-                        && key == js.join_emoji
-                    {
-                        let is_new = js.participants.insert(ev.sender.clone());
-                        drop(js);
+                // Check if this is a reaction to the join-phase message.
+                let is_join_msg = {
+                    let js = ctx.join_state.lock().await;
+                    js.message_event_id.as_ref().map(|id| id.as_str()) == Some(&reacted_to)
+                };
 
-                        // Use actual remaining seconds until game start if a
-                        // one-time game is pending; fall back to config default.
-                        let reminder_secs = {
-                            let st = ctx.state.lock().await;
-                            if let Some(ref pj) = st.pending_join {
-                                (pj.game_at_utc - chrono::Utc::now())
-                                    .num_seconds()
-                                    .max(0) as u64
-                            } else {
-                                ctx.config.schedule.reminder_before_secs
-                            }
+                if is_join_msg {
+                    // Flag reaction → save language preference AND join the game.
+                    let lang_pref = match key.as_str() {
+                        "🇩🇪" => Some("de"),
+                        "🇬🇧" | "🇺🇸" => Some("en"),
+                        "🇺🇦" => Some("uk"),
+                        _ => None,
+                    };
+                    if let Some(lang) = lang_pref {
+                        // Save language preference.
+                        {
+                            let mut st = ctx.state.lock().await;
+                            st.user_langs.insert(ev.sender.as_str().to_owned(), lang.to_owned());
+                            st.save(&ctx.state_path).await.ok();
+                        }
+                        // Flag = join: add to participants and open DM.
+                        let is_new = {
+                            let mut js = ctx.join_state.lock().await;
+                            js.participants.insert(ev.sender.clone())
                         };
-
-                        // Immediately open (or reuse) a DM and send a confirmation.
                         if is_new {
+                            let reminder_secs = {
+                                let st = ctx.state.lock().await;
+                                if let Some(ref pj) = st.pending_join {
+                                    (pj.game_at_utc - chrono::Utc::now())
+                                        .num_seconds().max(0) as u64
+                                } else {
+                                    ctx.config.schedule.reminder_before_secs
+                                }
+                            };
                             let sender  = ev.sender.clone();
                             let ctx2    = ctx.clone();
                             let client2 = client.clone();

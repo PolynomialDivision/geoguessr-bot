@@ -28,6 +28,10 @@ pub struct State {
     /// One-time games added via `!schedulegeo`.
     #[serde(default)]
     pub scheduled_once: Vec<ScheduledOnce>,
+    /// Per-player language preference (MXID → BCP-47 code, e.g. "en" or "de").
+    /// Used for reverse-geocoding guess labels. Defaults to "en" when absent.
+    #[serde(default)]
+    pub user_langs: HashMap<String, String>,
 }
 
 /// State saved when the "who wants to play?" message is posted.

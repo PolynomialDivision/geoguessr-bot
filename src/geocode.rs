@@ -39,9 +39,11 @@ impl NominatimAddress {
 
 /// Reverse-geocode `(lat, lon)` and return a short label like
 /// `"Astana, Kazakhstan"` or just `"Kazakhstan"` if no city is found.
+/// `lang` is a BCP-47 language code (`"en"`, `"de"`, …) passed as
+/// `accept-language` to Nominatim so place names come back in that language.
 /// Returns `None` on network/parse failure; callers should fall back to
 /// showing the raw coordinates.
-pub async fn reverse_geocode(lat: f64, lon: f64) -> Option<String> {
+pub async fn reverse_geocode(lat: f64, lon: f64, lang: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(std::time::Duration::from_secs(5))
@@ -49,7 +51,7 @@ pub async fn reverse_geocode(lat: f64, lon: f64) -> Option<String> {
         .ok()?;
 
     let url = format!(
-        "{NOMINATIM_URL}?lat={lat}&lon={lon}&format=json&zoom=10",
+        "{NOMINATIM_URL}?lat={lat}&lon={lon}&format=json&zoom=10&accept-language={lang}",
     );
     let resp: NominatimResponse = client
         .get(&url)
