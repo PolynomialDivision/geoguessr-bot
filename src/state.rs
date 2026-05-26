@@ -5,9 +5,12 @@ use std::{collections::{HashMap, VecDeque}, path::Path};
 
 use crate::sources::GeoImage;
 
-/// Ephemeral operational state — persisted across restarts.
-/// Analytics live in SQLite (geo.db via db.rs); this only holds what the
-/// bot needs to resume without re-fetching everything.
+// ── Persistent state (operational, not analytics) ─────────────────────────────
+//
+// Analytics data lives in SQLite (geo.db via db.rs).  This file holds only
+// what the bot needs to survive a restart without re-fetching or losing
+// in-progress state.
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct State {
     /// Pre-fetched images waiting to be used.
@@ -18,7 +21,49 @@ pub struct State {
     /// Per-slot last-fired date. Key = "HH:MM" string from config.
     #[serde(default)]
     pub last_game_dates: HashMap<String, NaiveDate>,
+    /// Saved when the join-phase message is posted; cleared when the game runs.
+    /// Used to reconstruct participants after a restart mid-join-window.
+    #[serde(default)]
+    pub pending_join: Option<PendingJoin>,
+    /// One-time games added via `!schedulegeo`.
+    #[serde(default)]
+    pub scheduled_once: Vec<ScheduledOnce>,
 }
+
+/// State saved when the "who wants to play?" message is posted.
+/// Persisted so a restart during the join window can resume correctly.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PendingJoin {
+    /// Matrix event ID of the join-prompt message (used to re-read reactions).
+    pub event_id: String,
+    /// The emoji players react with to join.
+    pub join_emoji: String,
+    /// Slot key ("12:00") or None for one-time / manual games.
+    pub slot: Option<String>,
+    /// UTC instant when the game images should start being sent.
+    pub game_at_utc: DateTime<Utc>,
+    /// How long (seconds) players have to submit answers.
+    pub answer_timeout_secs: u64,
+}
+
+/// A one-time game scheduled via `!schedulegeo`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ScheduledOnce {
+    /// Game *start* time as "HH:MM" in the configured timezone.
+    pub game_time: String,
+    /// Calendar date on which this game should fire.
+    pub date: NaiveDate,
+    /// Override for how long before game_time the join message fires (seconds).
+    /// None → use the value from config.
+    #[serde(default)]
+    pub reminder_before_secs: Option<u64>,
+    /// Override for how long players have to answer (seconds).
+    /// None → use the value from config.
+    #[serde(default)]
+    pub answer_timeout_secs: Option<u64>,
+}
+
+// ── I/O ───────────────────────────────────────────────────────────────────────
 
 impl State {
     pub async fn load(path: &Path) -> Result<Self> {

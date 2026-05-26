@@ -19,10 +19,24 @@ pub struct LeaderboardEntry {
     pub rounds_played:   i64,
 }
 
+pub struct RoundStatsEntry {
+    pub user_id:          String,
+    pub total_score:      i64,
+    pub images_played:    i64,
+    pub avg_distance_km:  f64,
+    pub best_distance_km: f64,
+}
+
 pub struct ScoreLeaderboardEntry {
-    pub user_id:       String,
-    pub total_score:   i64,
-    pub rounds_played: i64,
+    pub user_id:          String,
+    pub total_score:      i64,
+    pub rounds_played:    i64,
+    /// Number of individual image guesses submitted.
+    pub images_played:    i64,
+    /// Average Haversine distance across all guesses (km).
+    pub avg_distance_km:  f64,
+    /// Best (closest) single guess ever (km).
+    pub best_distance_km: f64,
 }
 
 pub struct UserStatsRow {
@@ -372,20 +386,61 @@ impl Db {
     }
 
     /// Leaderboard ranked by total GeoGuessr score (free-guess mode).
-    pub async fn score_leaderboard(&self) -> Result<Vec<ScoreLeaderboardEntry>> {
-        self.run(|conn| {
+    /// Also returns avg distance and images played per user.
+    pub async fn round_stats(&self, round_id: i64) -> Result<Vec<RoundStatsEntry>> {
+        self.run(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT user_id,
-                        SUM(total_score) AS total_score,
-                        COUNT(*)         AS rounds_played
-                   FROM round_scores
+                        SUM(score)         AS total_score,
+                        COUNT(*)           AS images_played,
+                        AVG(distance_km)   AS avg_distance_km,
+                        MIN(distance_km)   AS best_distance_km
+                   FROM answers
+                  WHERE round_id = ?1
+                    AND distance_km IS NOT NULL
                   GROUP BY user_id
                   ORDER BY total_score DESC",
             )?;
+            let rows = stmt.query_map([round_id], |r| Ok(RoundStatsEntry {
+                user_id:          r.get(0)?,
+                total_score:      r.get(1)?,
+                images_played:    r.get(2)?,
+                avg_distance_km:  r.get(3)?,
+                best_distance_km: r.get(4)?,
+            }))?;
+            rows.map(|r| r.context("reading round stats row")).collect()
+        })
+        .await
+    }
+
+    pub async fn score_leaderboard(&self) -> Result<Vec<ScoreLeaderboardEntry>> {
+        self.run(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT rs.user_id,
+                        SUM(rs.total_score)               AS total_score,
+                        COUNT(DISTINCT rs.round_id)       AS rounds_played,
+                        COALESCE(a.images_played, 0)      AS images_played,
+                        COALESCE(a.avg_distance_km, 0.0)  AS avg_distance_km,
+                        COALESCE(a.best_distance_km, 0.0) AS best_distance_km
+                   FROM round_scores rs
+                   LEFT JOIN (
+                       SELECT user_id,
+                              COUNT(*)          AS images_played,
+                              AVG(distance_km)  AS avg_distance_km,
+                              MIN(distance_km)  AS best_distance_km
+                         FROM answers
+                        WHERE distance_km IS NOT NULL
+                        GROUP BY user_id
+                   ) a ON a.user_id = rs.user_id
+                  GROUP BY rs.user_id",
+            )?;
             let rows = stmt.query_map([], |r| Ok(ScoreLeaderboardEntry {
-                user_id:      r.get(0)?,
-                total_score:  r.get(1)?,
-                rounds_played: r.get(2)?,
+                user_id:          r.get(0)?,
+                total_score:      r.get(1)?,
+                rounds_played:    r.get(2)?,
+                images_played:    r.get(3)?,
+                avg_distance_km:  r.get(4)?,
+                best_distance_km: r.get(5)?,
             }))?;
             rows.map(|r| r.context("reading score leaderboard row")).collect()
         })

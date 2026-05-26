@@ -28,7 +28,18 @@ use crate::{
     db::AnswerRecord,
     format,
     sources::GeoImage,
+    state::PendingJoin,
 };
+
+// ── Per-round overrides ───────────────────────────────────────────────────────
+
+/// Optional overrides for a single game round, used by `!schedulegeo`.
+pub struct GameOverrides {
+    /// Override for how long before game time the join message fires (seconds).
+    pub reminder_before_secs: Option<u64>,
+    /// Override for how long players have to answer (seconds).
+    pub answer_timeout_secs:  Option<u64>,
+}
 
 pub const CHOICE_EMOJIS: [&str; 4] = ["🇦", "🇧", "🇨", "🇩"];
 
@@ -95,10 +106,11 @@ impl ActiveGame {
 // ── Round entry point ─────────────────────────────────────────────────────────
 
 pub async fn start_round(
-    ctx:    BotContext,
-    client: Client,
-    manual: bool,
-    slot:   Option<String>,
+    ctx:       BotContext,
+    client:    Client,
+    manual:    bool,
+    slot:      Option<String>,
+    overrides: Option<GameOverrides>,
 ) -> anyhow::Result<()> {
     let room = match client.get_room(&ctx.room_id) {
         Some(r) => r,
@@ -111,6 +123,14 @@ pub async fn start_round(
     let n = ctx.config.schedule.images_per_round as usize;
     let triggered_by = if manual { "manual" } else { "scheduler" };
 
+    // Apply per-round overrides (from !schedulegeo).
+    let reminder_before_secs_cfg = overrides.as_ref()
+        .and_then(|o| o.reminder_before_secs)
+        .unwrap_or(ctx.config.schedule.reminder_before_secs);
+    let answer_timeout_secs_cfg = overrides.as_ref()
+        .and_then(|o| o.answer_timeout_secs)
+        .unwrap_or(ctx.config.schedule.answer_timeout_secs);
+
     // ── Join phase (free-guess + scheduled only) ──────────────────────────────
     // When reminder_before_secs > 0 and game_mode == FreeGuess, post a
     // "who wants to play?" message, react to it, wait for participants,
@@ -118,17 +138,20 @@ pub async fn start_round(
     let dm_participants: HashMap<OwnedUserId, OwnedRoomId> =
         if !manual
             && ctx.config.schedule.game_mode == GameMode::FreeGuess
-            && ctx.config.schedule.reminder_before_secs > 0
+            && reminder_before_secs_cfg > 0
         {
-            let reminder_secs = ctx.config.schedule.reminder_before_secs;
+            let reminder_secs = reminder_before_secs_cfg;
             let emoji         = ctx.config.schedule.join_emoji.clone();
 
             // Post the join-prompt message.
+            let bot_mxid = client
+                .user_id()
+                .map(|u| u.to_string())
+                .unwrap_or_default();
             let join_msg = format!(
-                "🌍 GeoGuessr starts in {}! \
-                 React with {} to join — I'll send you the photo privately.\n\
-                 📍 Answers: type any location — full address, city, country, or lat,lon — \
-                 no command prefix needed in the DM.",
+                "🌍 GeoGuessr starts in {}! React with {} to join.\n\
+                 After reacting, {bot_mxid} will invite you to a private chat — accept the invite.\n\
+                 When the game starts, the photo will appear there — just reply with your answer.",
                 format_duration(reminder_secs),
                 emoji,
             );
@@ -149,6 +172,21 @@ pub async fn start_round(
                 js.message_event_id = Some(join_event_id.clone());
                 js.join_emoji       = emoji.clone();
                 js.participants.clear();
+            }
+
+            // Persist the join phase so a restart can resume it.
+            {
+                let game_at_utc = chrono::Utc::now()
+                    + chrono::Duration::seconds(reminder_secs as i64);
+                let mut st = ctx.state.lock().await;
+                st.pending_join = Some(PendingJoin {
+                    event_id:           join_event_id.to_string(),
+                    join_emoji:         emoji.clone(),
+                    slot:               slot.clone(),
+                    game_at_utc,
+                    answer_timeout_secs: answer_timeout_secs_cfg,
+                });
+                st.save(&ctx.state_path).await.ok();
             }
 
             // Wait for the join window.
@@ -172,6 +210,13 @@ pub async fn start_round(
                 &mut participants,
             )
             .await;
+
+            // Clear pending_join — join window is over.
+            {
+                let mut st = ctx.state.lock().await;
+                st.pending_join = None;
+                st.save(&ctx.state_path).await.ok();
+            }
 
             if participants.is_empty() {
                 room.send(format::mentionify(
@@ -232,11 +277,11 @@ pub async fn start_round(
             // Scheduled with reminder but not free-guess, or manual game:
             // classic main-room flow with the old "starting soon" message.
             if !manual {
-                let reminder_secs = ctx.config.schedule.reminder_before_secs;
+                let reminder_secs = reminder_before_secs_cfg;
                 if reminder_secs > 0 {
                     room.send(format::mentionify(&format!(
-                        "🌍 GeoGuessr starts in {} minutes — get ready!",
-                        reminder_secs / 60,
+                        "🌍 GeoGuessr starts in {} — get ready!",
+                        format_duration(reminder_secs),
                     )))
                     .await?;
                     tokio::time::sleep(tokio::time::Duration::from_secs(reminder_secs)).await;
@@ -296,6 +341,7 @@ pub async fn start_round(
                     &ctx, &client, &room,
                     round_id, i as u32 + 1, n as u32,
                     &img, &mut round_results,
+                    answer_timeout_secs_cfg,
                 )
                 .await?;
             }
@@ -304,6 +350,7 @@ pub async fn start_round(
                     &ctx, &client, &room,
                     round_id, i as u32 + 1, n as u32,
                     &img, &mut round_scores_free, &dm_participants,
+                    answer_timeout_secs_cfg,
                 )
                 .await?;
             }
@@ -337,7 +384,7 @@ pub async fn start_round(
         GameMode::FreeGuess => {
             post_round_summary_free_guess(
                 &ctx, &client, &room,
-                &round_scores_free, &dm_participants,
+                round_id, &round_scores_free, &dm_participants,
             )
             .await;
         }
@@ -359,14 +406,15 @@ pub async fn start_round(
 // ── Single image — multiple choice ───────────────────────────────────────────
 
 async fn play_image(
-    ctx:           &BotContext,
-    client:        &Client,
-    room:          &Room,
-    round_id:      i64,
-    image_num:     u32,
-    n_total:       u32,
-    img:           &GeoImage,
-    round_results: &mut HashMap<String, Vec<bool>>,
+    ctx:                &BotContext,
+    client:             &Client,
+    room:               &Room,
+    round_id:           i64,
+    image_num:          u32,
+    n_total:            u32,
+    img:                &GeoImage,
+    round_results:      &mut HashMap<String, Vec<bool>>,
+    answer_timeout_secs: u64,
 ) -> anyhow::Result<()> {
     let mut distractors = countries::pick_distractors(&img.country, &img.region, 3);
     distractors.push(img.country.clone());
@@ -383,7 +431,7 @@ async fn play_image(
             &img.country, &img.region, img.city.as_deref(),
             &img.source, img.attribution.as_deref(),
             &choices, correct_index,
-            ctx.config.schedule.answer_timeout_secs,
+            answer_timeout_secs,
             img.lat, img.lon,
         )
         .await?;
@@ -407,7 +455,7 @@ async fn play_image(
         room.send(RoomMessageEventContent::new(MessageType::Image(image_content))).await?;
     }
 
-    let total_secs    = ctx.config.schedule.answer_timeout_secs;
+    let total_secs    = answer_timeout_secs;
     let question_text = build_question_text(image_num, n_total, &choices, total_secs, total_secs);
     let q_event       = room.send(format::mentionify(&question_text)).await?;
     let q_event_id    = q_event.response.event_id.clone();
@@ -480,15 +528,16 @@ async fn play_image(
 // ── Single image — free guess ─────────────────────────────────────────────────
 
 async fn play_image_free_guess(
-    ctx:             &BotContext,
-    client:          &Client,
-    room:            &Room,
-    round_id:        i64,
-    image_num:       u32,
-    n_total:         u32,
-    img:             &GeoImage,
-    round_scores:    &mut HashMap<String, i64>,
-    dm_participants: &HashMap<OwnedUserId, OwnedRoomId>,
+    ctx:                &BotContext,
+    client:             &Client,
+    room:               &Room,
+    round_id:           i64,
+    image_num:          u32,
+    n_total:            u32,
+    img:                &GeoImage,
+    round_scores:       &mut HashMap<String, i64>,
+    dm_participants:    &HashMap<OwnedUserId, OwnedRoomId>,
+    answer_timeout_secs: u64,
 ) -> anyhow::Result<()> {
     let (actual_lat, actual_lon) = match (img.lat, img.lon) {
         (Some(lat), Some(lon)) => (lat, lon),
@@ -506,7 +555,7 @@ async fn play_image_free_guess(
             &img.country, &img.region, img.city.as_deref(),
             &img.source, img.attribution.as_deref(),
             &[], 0,
-            ctx.config.schedule.answer_timeout_secs,
+            answer_timeout_secs,
             Some(actual_lat), Some(actual_lon),
         )
         .await?;
@@ -533,33 +582,66 @@ async fn play_image_free_guess(
         room.send(RoomMessageEventContent::new(MessageType::Image(image_content))).await?;
     }
 
-    let total_secs  = ctx.config.schedule.answer_timeout_secs;
+    let total_secs  = answer_timeout_secs;
     let timeout_str = format_duration(total_secs);
-    let main_prompt = if dm_participants.is_empty() {
-        format!(
+    let bot_mxid    = client.user_id().map(|u| u.to_string()).unwrap_or_default();
+    let room_id_str = ctx.room_id.as_str();
+
+    // Show the "can't find the chat?" hint only once per round, below the first batch of photos.
+    // Plain variant: used in countdown edits (plain-text). HTML variant: used in the initial send.
+    let (dm_hint_plain, dm_hint_html) = if !dm_participants.is_empty() && image_num == 1 {
+        let plain = format!(
+            "\n💬 Can't find the chat? https://matrix.to/#/{bot_mxid}"
+        );
+        let html = format!(
+            "<br>💬 Can't find the chat? \
+             <a href=\"https://matrix.to/#/{bot_mxid}\">Open chat with bot</a>"
+        );
+        (plain, html)
+    } else {
+        (String::new(), String::new())
+    };
+
+    let q_event = if dm_participants.is_empty() {
+        room.send(format::mentionify(&format!(
             "🌍 Image {image_num}/{n_total} — ⏳ {timeout_str}\n\n\
              Where was this photo taken?\n\
              Type: **!guess <location>**  (address, city, country, or lat,lon)",
-        )
+        ))).await?
     } else {
-        format!(
+        let plain = format!(
             "🌍 Image {image_num}/{n_total} — ⏳ {timeout_str}\n\n\
-             Answers are coming in via private DMs.",
-        )
+             Answers are coming in via private DMs.{dm_hint_plain}"
+        );
+        let html = format!(
+            "🌍 Image {image_num}/{n_total} — ⏳ {timeout_str}<br><br>\
+             Answers are coming in via private DMs.{dm_hint_html}"
+        );
+        room.send(RoomMessageEventContent::text_html(plain, html)).await?
     };
-    let q_event    = room.send(format::mentionify(&main_prompt)).await?;
     let q_event_id = q_event.response.event_id.clone();
 
     ctx.db.set_image_event_id(image_id, q_event_id.as_str()).await.ok();
 
     // Post all images + prompt in each participant's DM.
-    let dm_prompt = format!(
+    let dm_prompt_plain = format!(
         "🌍 Image {image_num}/{n_total} — ⏳ {timeout_str}\n\n\
          Where was this photo taken?\n\
          Type your answer — any of these work:\n\
          • City or country name\n\
          • Full address: \"Unter den Linden 1, 10117 Berlin, Germany\"\n\
-         • Coordinates: \"52.5163,13.3777\"",
+         • Coordinates: \"52.5163,13.3777\" (tap your guess on https://polynomialdivision.github.io/geo-picker/)\n\
+         ↩️ Back to main room: https://matrix.to/#/{room_id_str}"
+    );
+    let dm_prompt_html = format!(
+        "🌍 Image {image_num}/{n_total} — ⏳ {timeout_str}<br><br>\
+         Where was this photo taken?<br>\
+         Type your answer — any of these work:<br>\
+         • City or country name<br>\
+         • Full address: \"Unter den Linden 1, 10117 Berlin, Germany\"<br>\
+         • Coordinates: \"52.5163,13.3777\" \
+           (<a href=\"https://polynomialdivision.github.io/geo-picker/\">tap your guess on this map</a>)<br>\
+         ↩️ <a href=\"https://matrix.to/#/{room_id_str}\">Back to main room</a>"
     );
     for dm_room_id in dm_participants.values() {
         if let Some(dm_room) = client.get_room(dm_room_id) {
@@ -572,7 +654,7 @@ async fn play_image_free_guess(
                 let dm_img = ImageMessageEventContent::plain(label, mxc_uri.clone());
                 dm_room.send(RoomMessageEventContent::new(MessageType::Image(dm_img))).await.ok();
             }
-            dm_room.send(format::mentionify(&dm_prompt)).await.ok();
+            dm_room.send(RoomMessageEventContent::text_html(&dm_prompt_plain, &dm_prompt_html)).await.ok();
         }
     }
 
@@ -598,20 +680,25 @@ async fn play_image_free_guess(
         remaining -= edit_interval;
         let bar       = time_bar(remaining, total_secs);
         let time_str  = format_duration(remaining);
-        let updated   = if dm_participants.is_empty() {
-            format!(
+        let edit_msg = if dm_participants.is_empty() {
+            format::mentionify(&format!(
                 "🌍 Image {image_num}/{n_total} — ⏳ {time_str}  {bar}\n\n\
                  Where was this photo taken?\n\
                  Type: **!guess <location>**  (address, city, country, or lat,lon)",
-            )
+            ))
         } else {
-            format!(
+            let plain = format!(
                 "🌍 Image {image_num}/{n_total} — ⏳ {time_str}  {bar}\n\n\
-                 Answers are coming in via private DMs.",
-            )
+                 Answers are coming in via private DMs.{dm_hint_plain}"
+            );
+            let html = format!(
+                "🌍 Image {image_num}/{n_total} — ⏳ {time_str}  {bar}<br><br>\
+                 Answers are coming in via private DMs.{dm_hint_html}"
+            );
+            RoomMessageEventContent::text_html(plain, html)
         };
         if let Some(r) = client.get_room(&ctx.room_id) {
-            let edit = RoomMessageEventContent::text_plain(&updated)
+            let edit = edit_msg
                 .make_replacement(ReplacementMetadata::new(q_event_id.clone(), None));
             r.send(edit).await.ok();
         }
@@ -712,6 +799,59 @@ async fn post_reveal_free_guess(
         r.send(format::mentionify(&text)).await.ok();
     }
 
+    // ── Main-room map images ──────────────────────────────────────────────────
+    let map_mime: mime::Mime = "image/png".parse().unwrap();
+
+    // 1. Winner's individual map (always shown when anyone guessed).
+    if let Some((_, winner_guess, winner_dist, _)) = scored.first() {
+        let (g_lat, g_lon, d) = (winner_guess.lat, winner_guess.lon, *winner_dist);
+        if let Ok(Some(png)) = tokio::task::spawn_blocking(move || {
+            crate::mapimage::render_guess_map(g_lat, g_lon, actual_lat, actual_lon, d)
+        })
+        .await
+        {
+            if let Ok(resp) = client.media().upload(&map_mime, png, None).await {
+                let label = format!("🥇 Best guess — {} away", format_dist(d));
+                let img = ImageMessageEventContent::plain(label, resp.content_uri);
+                if let Some(r) = client.get_room(&ctx.room_id) {
+                    r.send(RoomMessageEventContent::new(MessageType::Image(img))).await.ok();
+                }
+            }
+        }
+    }
+
+    // 2. Combined round map — only when 2+ players guessed.
+    if scored.len() >= 2 {
+        let guess_data: Vec<(String, f64, f64)> = scored
+            .iter()
+            .map(|(uid, guess, _, _)| (display_name(names, uid).to_owned(), guess.lat, guess.lon))
+            .collect();
+
+        if let Ok(Some((png, legend))) = tokio::task::spawn_blocking(move || {
+            crate::mapimage::render_round_map(&guess_data, actual_lat, actual_lon)
+        })
+        .await
+        {
+            if let Ok(resp) = client.media().upload(&map_mime, png, None).await {
+                let label = format!("🗺️ All {} guesses this round", scored.len());
+                let img = ImageMessageEventContent::plain(label, resp.content_uri);
+                if let Some(r) = client.get_room(&ctx.room_id) {
+                    r.send(RoomMessageEventContent::new(MessageType::Image(img))).await.ok();
+
+                    // Legend: 🔵 alice  🔴 bob  🟢 charlie  ⬛ actual
+                    let mut parts: Vec<String> = legend
+                        .iter()
+                        .map(|(name, emoji)| format!("{} {}", emoji, name))
+                        .collect();
+                    parts.push("⬛ actual location".to_owned());
+                    r.send(RoomMessageEventContent::text_plain(parts.join("   ")))
+                        .await
+                        .ok();
+                }
+            }
+        }
+    }
+
     // ── Per-user DM feedback ──────────────────────────────────────────────────
     for (rank_0, (uid, guess, dist, score)) in scored.iter().enumerate() {
         let rank  = rank_0 + 1;
@@ -738,6 +878,24 @@ async fn post_reveal_free_guess(
         if let Some(dm_room_id) = dm_room_id {
             if let Some(dm_room) = client.get_room(&dm_room_id) {
                 dm_room.send(format::mentionify(&fb_text)).await.ok();
+
+                // Map image: blue dot = guess, red dot = actual, orange line.
+                let (g_lat, g_lon, dist_val) = (guess.lat, guess.lon, *dist);
+                if let Ok(Some(png)) = tokio::task::spawn_blocking(move || {
+                    crate::mapimage::render_guess_map(g_lat, g_lon, actual_lat, actual_lon, dist_val)
+                })
+                .await
+                {
+                    let map_mime: mime::Mime = "image/png".parse().unwrap();
+                    if let Ok(resp) = client.media().upload(&map_mime, png, None).await {
+                        let label = format!("📍 {} away", format_dist(dist_val));
+                        let img = ImageMessageEventContent::plain(label, resp.content_uri);
+                        dm_room
+                            .send(RoomMessageEventContent::new(MessageType::Image(img)))
+                            .await
+                            .ok();
+                    }
+                }
             }
         }
     }
@@ -765,6 +923,7 @@ async fn post_round_summary_free_guess(
     ctx:             &BotContext,
     client:          &Client,
     _room:           &Room,
+    round_id:        i64,
     scores:          &HashMap<String, i64>,
     dm_participants: &HashMap<OwnedUserId, OwnedRoomId>,
 ) {
@@ -775,34 +934,60 @@ async fn post_round_summary_free_guess(
         return;
     }
 
-    let mut ranking: Vec<(&str, i64)> = scores
-        .iter()
-        .map(|(uid, &s)| (uid.as_str(), s))
-        .collect();
+    // ── Round results (this round only) ──────────────────────────────────────
+    let n_images = ctx.config.schedule.images_per_round as usize;
+    let max_pts  = 5000i64 * n_images as i64;
+
+    // Fetch per-user stats for this round from DB.
+    let round_stats = ctx.db.round_stats(round_id).await.unwrap_or_default();
+
+    const BAR_W: usize = 10;
+
+    let mut lines = vec![
+        format!("🌍 **Round over!**  ({} image(s) · max {} pts)", n_images, max_pts),
+        String::new(),
+    ];
+
+    // Sort by total score desc. Use DB stats if available, fall back to in-memory scores.
+    let mut ranking: Vec<(&str, i64)> = scores.iter().map(|(u, &s)| (u.as_str(), s)).collect();
     ranking.sort_by(|a, b| b.1.cmp(&a.1));
 
-    let n_images      = ctx.config.schedule.images_per_round as usize;
-    let max_possible  = 5000i64 * n_images as i64;
-
-    let mut lines = vec![format!(
-        "🌍 Round over! Total scores (max {max_possible} pts, {n_images} images):"
-    )];
-    lines.push(String::new());
     for (i, (uid, score)) in ranking.iter().enumerate() {
         let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
-        let pct = score * 100 / max_possible;
-        lines.push(format!("{medal} {} — {} pts ({}%)", uid, score, pct));
+        let name  = uid.split(':').next().unwrap_or(uid).trim_start_matches('@');
+
+        // Bar: fraction of max possible score.
+        let filled = ((*score as f64 / max_pts as f64) * BAR_W as f64).round() as usize;
+        let bar    = format!("{}{}", "█".repeat(filled.min(BAR_W)), "░".repeat(BAR_W - filled.min(BAR_W)));
+
+        let avg_pts_img = if n_images > 0 { score / n_images as i64 } else { 0 };
+
+        // Distance stats from DB if available for this user.
+        let (avg_dist, best_dist) = round_stats
+            .iter()
+            .find(|e| e.user_id == *uid)
+            .map(|e| (format_dist(e.avg_distance_km), format_dist(e.best_distance_km)))
+            .unwrap_or_else(|| ("—".to_owned(), "—".to_owned()));
+
+        lines.push(format!("{medal} {:>2}. {}  —  {} pts/img", i + 1, name, avg_pts_img));
+        lines.push(format!("      {bar}  ⌀ {}  🏅 {}", avg_dist, best_dist));
     }
-    let text = lines.join("\n");
+
+    let round_text = lines.join("\n");
 
     if let Some(r) = client.get_room(&ctx.room_id) {
-        r.send(format::mentionify(&text)).await.ok();
+        r.send(format::mentionify(&round_text)).await.ok();
     }
-
-    // Also send the round summary to each DM.
     for dm_room_id in dm_participants.values() {
         if let Some(dm_room) = client.get_room(dm_room_id) {
-            dm_room.send(format::mentionify(&text)).await.ok();
+            dm_room.send(format::mentionify(&round_text)).await.ok();
+        }
+    }
+
+    // ── All-time leaderboard ──────────────────────────────────────────────────
+    if let Some(lb_text) = crate::commands::build_alltime_leaderboard(ctx).await {
+        if let Some(r) = client.get_room(&ctx.room_id) {
+            r.send(format::mentionify(&lb_text)).await.ok();
         }
     }
 }
@@ -886,7 +1071,7 @@ fn distance_score(distance_km: f64) -> i64 {
     (5000.0 * (-distance_km / 2000.0).exp()).round() as i64
 }
 
-fn format_dist(dist_km: f64) -> String {
+pub fn format_dist(dist_km: f64) -> String {
     if dist_km < 1.0 {
         format!("{:.0} m", dist_km * 1000.0)
     } else {
@@ -1228,7 +1413,7 @@ fn time_bar(remaining: u64, total: u64) -> String {
 
 /// Format a duration in seconds as a human-readable string.
 /// Examples: 21600 → "6h", 5400 → "1h 30m", 90 → "1m 30s", 45 → "45s".
-fn format_duration(secs: u64) -> String {
+pub fn format_duration(secs: u64) -> String {
     if secs >= 3600 {
         let h = secs / 3600;
         let m = (secs % 3600) / 60;
@@ -1367,4 +1552,184 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
             Err(e) => warn!("GeoGuessr: prefetch failed ({source}): {e}"),
         }
     }
+}
+
+// ── Resume after restart ──────────────────────────────────────────────────────
+
+/// Called on startup when a join phase was in progress at shutdown time.
+/// Waits until the game-start instant, re-reads reactions to rebuild the
+/// participant list, then runs the game exactly as `start_round` would.
+pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoin) {
+    // Wait until game_at_utc.
+    let now_utc   = chrono::Utc::now();
+    let wait_secs = (pj.game_at_utc - now_utc)
+        .max(chrono::Duration::zero())
+        .num_seconds() as u64;
+    if wait_secs > 0 {
+        info!("resume_pending_join: waiting {wait_secs}s until game start");
+        tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs)).await;
+    }
+
+    let room = match client.get_room(&ctx.room_id) {
+        Some(r) => r,
+        None    => {
+            warn!("resume_pending_join: room {} not joined", ctx.room_id);
+            let mut st = ctx.state.lock().await;
+            st.pending_join = None;
+            st.save(&ctx.state_path).await.ok();
+            return;
+        }
+    };
+
+    // Parse the saved event ID.
+    let join_event_id: OwnedEventId = match pj.event_id.parse() {
+        Ok(id) => id,
+        Err(e) => {
+            warn!("resume_pending_join: invalid event_id: {e}");
+            let mut st = ctx.state.lock().await;
+            st.pending_join = None;
+            st.save(&ctx.state_path).await.ok();
+            return;
+        }
+    };
+
+    // Re-read reactions from the join message to rebuild the participant set.
+    let bot_uid = client.user_id().map(|u| u.to_owned());
+    // Start from in-memory participants captured since the restart.
+    let mut participants: HashSet<OwnedUserId> = {
+        let mut js = ctx.join_state.lock().await;
+        js.message_event_id = None;
+        std::mem::take(&mut js.participants)
+    };
+    reconcile_join_reactions(
+        &client,
+        &room,
+        &join_event_id,
+        &pj.join_emoji,
+        bot_uid.as_deref(),
+        &mut participants,
+    )
+    .await;
+
+    // Clear pending_join.
+    {
+        let mut st = ctx.state.lock().await;
+        st.pending_join = None;
+        st.save(&ctx.state_path).await.ok();
+    }
+
+    let n            = ctx.config.schedule.images_per_round as usize;
+    let triggered_by = "scheduler";
+
+    if participants.is_empty() {
+        room.send(format::mentionify("😴 Nobody opted in — skipping this round."))
+            .await.ok();
+        if let Some(slot) = &pj.slot {
+            let tz: Tz = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
+            let today  = chrono::Utc::now().with_timezone(&tz).date_naive();
+            let mut st = ctx.state.lock().await;
+            st.last_game_dates.insert(slot.clone(), today);
+            st.save(&ctx.state_path).await.ok();
+        }
+        return;
+    }
+
+    // Open (or reuse) DMs with each participant.
+    let mut dm_map: HashMap<OwnedUserId, OwnedRoomId> = HashMap::new();
+    for uid in &participants {
+        match get_or_create_dm(&client, uid).await {
+            Ok(dm_room_id) => {
+                ctx.dm_rooms.lock().await.insert(dm_room_id.clone(), uid.clone());
+                if let Some(dm_room) = client.get_room(&dm_room_id) {
+                    dm_room.send(format::mentionify(
+                        "🌍 GeoGuessr is starting now! Here comes the first image…",
+                    )).await.ok();
+                }
+                dm_map.insert(uid.clone(), dm_room_id);
+            }
+            Err(e) => warn!("resume_pending_join: could not open DM with {uid}: {e}"),
+        }
+    }
+
+    let participant_list: Vec<String> = dm_map.keys()
+        .map(|u| u.localpart().to_owned())
+        .collect();
+    room.send(format::mentionify(&format!(
+        "🌍 GeoGuessr starting now! {} player{}: {}",
+        dm_map.len(),
+        if dm_map.len() == 1 { "" } else { "s" },
+        participant_list.join(", "),
+    ))).await.ok();
+
+    // Pre-fetch and run images.
+    prefetch_if_needed(&ctx, n + 2).await;
+
+    let round_id = match ctx.db
+        .start_round(ctx.room_id.as_str(), n as u32, triggered_by)
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            error!("resume_pending_join: failed to start DB round: {e}");
+            return;
+        }
+    };
+
+    info!("GeoGuessr round {round_id} resumed after restart ({n} images)");
+
+    let mut round_scores_free: HashMap<String, i64> = HashMap::new();
+
+    for i in 0..n {
+        let img = {
+            let mut st = ctx.state.lock().await;
+            match st.cached_images.pop_front() {
+                Some(img) => {
+                    st.save(&ctx.state_path).await.ok();
+                    img
+                }
+                None => {
+                    warn!("resume_pending_join: image cache empty — skipping remaining");
+                    break;
+                }
+            }
+        };
+
+        if i > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(
+                ctx.config.schedule.inter_image_secs,
+            )).await;
+        }
+
+        if let Err(e) = play_image_free_guess(
+            &ctx, &client, &room,
+            round_id, i as u32 + 1, n as u32,
+            &img, &mut round_scores_free, &dm_map,
+            pj.answer_timeout_secs,
+        ).await {
+            error!("resume_pending_join: play_image_free_guess error: {e}");
+        }
+    }
+
+    ctx.db.finish_round(round_id).await.ok();
+    ctx.db.upsert_round_scores_free_guess(round_id, &round_scores_free).await.ok();
+
+    if let Some(slot) = &pj.slot {
+        let tz: Tz = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
+        let today  = chrono::Utc::now().with_timezone(&tz).date_naive();
+        let mut st = ctx.state.lock().await;
+        st.last_game_dates.insert(slot.clone(), today);
+        st.save(&ctx.state_path).await.ok();
+    }
+
+    post_round_summary_free_guess(&ctx, &client, &room, round_id, &round_scores_free, &dm_map).await;
+
+    // Clear DM mappings.
+    {
+        let dm_room_ids: Vec<OwnedRoomId> = dm_map.values().cloned().collect();
+        let mut dm_rooms = ctx.dm_rooms.lock().await;
+        for id in &dm_room_ids {
+            dm_rooms.remove(id);
+        }
+    }
+    *ctx.round_abort.lock().await = None;
 }

@@ -12,6 +12,7 @@ pub fn mentionify(text: &str) -> RoomMessageEventContent {
 /// (key = full MXID, value = display name) so the pill shows the
 /// friendly name instead of the localpart.
 /// The plain-text body is also updated: `@user:server` → `Name`.
+#[allow(dead_code)]
 pub fn mentionify_with_names(
     text: &str,
     names: &HashMap<String, String>,

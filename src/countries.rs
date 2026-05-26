@@ -101,6 +101,7 @@ pub const COUNTRIES: &[Country] = &[
 ];
 
 /// Return all country names as a flat list.
+#[allow(dead_code)]
 pub fn all_names() -> Vec<&'static str> {
     COUNTRIES.iter().map(|c| c.name).collect()
 }
@@ -135,6 +136,7 @@ pub fn pick_distractors(correct: &str, correct_region: &str, n: usize) -> Vec<St
 }
 
 /// Look up a country by ISO code.
+#[allow(dead_code)]
 pub fn by_iso(iso: &str) -> Option<&'static Country> {
     COUNTRIES.iter().find(|c| c.iso.eq_ignore_ascii_case(iso))
 }

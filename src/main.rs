@@ -29,6 +29,7 @@ mod countries;
 mod db;
 mod format;
 mod game;
+mod mapimage;
 mod scheduler;
 mod sources;
 mod state;
@@ -75,6 +76,9 @@ pub struct BotContext {
     pub join_state:  Arc<Mutex<JoinState>>,
     /// Maps DM room IDs to the user_id of the participant (for routing DM answers).
     pub dm_rooms:    Arc<Mutex<HashMap<OwnedRoomId, OwnedUserId>>>,
+    /// Abort handle for the currently running round task (join phase or active game).
+    /// Set when a round is spawned; cleared when it finishes.
+    pub round_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
 fn thread_reply(text: &str, root: matrix_sdk::ruma::OwnedEventId) -> matrix_sdk::ruma::events::room::message::RoomMessageEventContent {
@@ -157,6 +161,7 @@ async fn main() -> Result<()> {
         db,
         join_state,
         dm_rooms:    Arc::new(Mutex::new(HashMap::new())),
+        round_abort: Arc::new(Mutex::new(None)),
     };
 
     // ── Invite handler ────────────────────────────────────────────────────────
@@ -392,9 +397,21 @@ async fn main() -> Result<()> {
                     if js.message_event_id.as_ref().map(|id| id.as_str()) == Some(&reacted_to)
                         && key == js.join_emoji
                     {
-                        let is_new        = js.participants.insert(ev.sender.clone());
-                        let reminder_secs = ctx.config.schedule.reminder_before_secs;
+                        let is_new = js.participants.insert(ev.sender.clone());
                         drop(js);
+
+                        // Use actual remaining seconds until game start if a
+                        // one-time game is pending; fall back to config default.
+                        let reminder_secs = {
+                            let st = ctx.state.lock().await;
+                            if let Some(ref pj) = st.pending_join {
+                                (pj.game_at_utc - chrono::Utc::now())
+                                    .num_seconds()
+                                    .max(0) as u64
+                            } else {
+                                ctx.config.schedule.reminder_before_secs
+                            }
+                        };
 
                         // Immediately open (or reuse) a DM and send a confirmation.
                         if is_new {
@@ -462,6 +479,41 @@ async fn main() -> Result<()> {
             )
             .await;
         });
+    }
+
+    // Resume a pending join phase that was interrupted by a restart.
+    {
+        let pending = ctx.state.lock().await.pending_join.clone();
+        if let Some(pj) = pending {
+            let now_utc = chrono::Utc::now();
+            if pj.game_at_utc > now_utc {
+                info!(
+                    "Resuming pending join phase — game starts at {} UTC",
+                    pj.game_at_utc.format("%H:%M")
+                );
+                // Restore in-memory JoinState so new reactions are still tracked.
+                {
+                    let mut js = ctx.join_state.lock().await;
+                    if let Ok(eid) = pj.event_id.parse() {
+                        js.message_event_id = Some(eid);
+                    }
+                    js.join_emoji = pj.join_emoji.clone();
+                    js.participants.clear();
+                }
+                let ctx2   = ctx.clone();
+                let client2 = client.clone();
+                let handle = tokio::spawn(async move {
+                    game::resume_pending_join(ctx2, client2, pj).await;
+                });
+                *ctx.round_abort.lock().await = Some(handle.abort_handle());
+            } else {
+                // Game time already passed — discard the stale pending join.
+                info!("Discarding stale pending_join (game_at was in the past)");
+                let mut st = ctx.state.lock().await;
+                st.pending_join = None;
+                st.save(&ctx.state_path).await.ok();
+            }
+        }
     }
 
     tokio::spawn(scheduler::run(ctx, client.clone()));
