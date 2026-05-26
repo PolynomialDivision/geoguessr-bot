@@ -760,8 +760,9 @@ async fn post_reveal_free_guess(
     );
 
     // ── Reverse-geocode each guess for human-readable labels ─────────────────
-    let mut guess_labels: Vec<String> = Vec::with_capacity(scored.len());
-    for (i, (_, guess, _, _)) in scored.iter().enumerate() {
+    let mut guess_labels:    Vec<String>                   = Vec::with_capacity(scored.len());
+    let mut overview_entries: Vec<(&str, f64, f64, u8, u8, u8)> = Vec::with_capacity(scored.len());
+    for (i, (uid, guess, _, _)) in scored.iter().enumerate() {
         let (r, g, b, _) = crate::mapimage::PLAYER_COLORS[i % crate::mapimage::PLAYER_COLORS.len()];
         let map_url = build_guess_map_url(
             guess.lat, guess.lon, actual_lat, actual_lon, r, g, b,
@@ -770,11 +771,20 @@ async fn post_reveal_free_guess(
             .await
             .unwrap_or_else(|| format!("{:.2}, {:.2}", guess.lat, guess.lon));
         guess_labels.push(format!("[{label}]({map_url})"));
+        overview_entries.push((uid.as_str(), guess.lat, guess.lon, r, g, b));
     }
 
+    // ── Build "all guesses" overview map URL ──────────────────────────────────
+    let overview_url = if !overview_entries.is_empty() {
+        build_all_guesses_map_url(&overview_entries, actual_lat, actual_lon, names)
+    } else {
+        maps_url.clone()
+    };
+
     // ── Main-room reveal ──────────────────────────────────────────────────────
+    let header_map_label = if scored.is_empty() { "Map" } else { "All guesses" };
     let mut lines = vec![
-        format!("📍 **{}** [Map]({})", location_str, maps_url),
+        format!("📍 **{}** [{header_map_label}]({})", location_str, overview_url),
         String::new(),
     ];
 
@@ -1452,6 +1462,47 @@ fn build_guess_map_url(
         ]
     });
     let encoded = url_encode_component(&geojson.to_string());
+    format!("https://geojson.io/#data=data:application/json,{encoded}")
+}
+
+/// Build a geojson.io URL showing every player's guess, the actual location,
+/// and a coloured line per player — the interactive equivalent of the round map PNG.
+fn build_all_guesses_map_url(
+    entries:    &[(&str, f64, f64, u8, u8, u8)],  // (uid, lat, lon, r, g, b)
+    actual_lat: f64,
+    actual_lon: f64,
+    names:      &HashMap<String, String>,
+) -> String {
+    let mut features: Vec<serde_json::Value> = Vec::new();
+
+    for (uid, lat, lon, r, g, b) in entries {
+        let color = format!("#{r:02X}{g:02X}{b:02X}");
+        let name  = display_name(names, uid);
+        // Line first so it renders below the markers
+        features.push(serde_json::json!({
+            "type": "Feature",
+            "properties": { "stroke": color, "stroke-width": 2 },
+            "geometry": {
+                "type": "LineString",
+                "coordinates": [[lon, lat], [actual_lon, actual_lat]]
+            }
+        }));
+        features.push(serde_json::json!({
+            "type": "Feature",
+            "properties": { "name": name, "marker-color": color },
+            "geometry": { "type": "Point", "coordinates": [lon, lat] }
+        }));
+    }
+
+    // Actual location on top
+    features.push(serde_json::json!({
+        "type": "Feature",
+        "properties": { "name": "Actual location", "marker-color": "#141414" },
+        "geometry": { "type": "Point", "coordinates": [actual_lon, actual_lat] }
+    }));
+
+    let geojson  = serde_json::json!({ "type": "FeatureCollection", "features": features });
+    let encoded  = url_encode_component(&geojson.to_string());
     format!("https://geojson.io/#data=data:application/json,{encoded}")
 }
 
