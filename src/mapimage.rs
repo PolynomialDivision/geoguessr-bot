@@ -25,7 +25,12 @@ pub const PLAYER_COLORS: &[(u8, u8, u8, &str)] = &[
 
 // ── Single-player map ─────────────────────────────────────────────────────────
 
-/// Render a 640×400 PNG showing one guess (🔵) vs the actual location (🔴).
+/// Render a 640×400 PNG showing one guess vs the actual location.
+///
+/// * `player_pin` – pre-rendered avatar pin PNG (from `avatar::render_avatar_pin`).
+///   If `None`, a plain filled circle is drawn instead.
+/// * `(r, g, b)` – the player's colour (used for the line and the circle fallback).
+///
 /// Zoom is chosen automatically based on `dist_km`.
 /// Returns `None` if tile fetching or encoding fails.
 pub fn render_guess_map(
@@ -34,6 +39,8 @@ pub fn render_guess_map(
     actual_lat: f64,
     actual_lon: f64,
     dist_km:    f64,
+    player_pin: Option<Vec<u8>>,
+    r: u8, g: u8, b: u8,
 ) -> Option<Vec<u8>> {
     let center_lat = (guess_lat + actual_lat) / 2.0;
     let center_lon = (guess_lon + actual_lon) / 2.0;
@@ -58,8 +65,25 @@ pub fn render_guess_map(
         .build()
         .ok()?;
 
-    add_line(&mut map, guess_lat, guess_lon, actual_lat, actual_lon, 255, 140, 0);
-    add_circle(&mut map, guess_lat, guess_lon, 50, 100, 255);
+    add_line(&mut map, guess_lat, guess_lon, actual_lat, actual_lon, r, g, b);
+
+    // Avatar pin if available; plain circle as fallback.
+    let placed = player_pin.and_then(|png| {
+        IconBuilder::new()
+            .lat_coordinate(guess_lat)
+            .lon_coordinate(guess_lon)
+            .x_offset(PIN_ANCHOR_X)
+            .y_offset(PIN_ANCHOR_Y)
+            .data(png.as_slice())
+            .and_then(|b| b.build())
+            .ok()
+    });
+    if let Some(icon) = placed {
+        map.add_tool(icon);
+    } else {
+        add_circle(&mut map, guess_lat, guess_lon, r, g, b);
+    }
+
     add_actual_marker(&mut map, actual_lat, actual_lon);
 
     map.encode_png().ok()

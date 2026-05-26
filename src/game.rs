@@ -826,10 +826,13 @@ async fn post_reveal_free_guess(
     let map_mime: mime::Mime = "image/png".parse().unwrap();
 
     // 1. Winner's individual map (always shown when anyone guessed).
-    if let Some((_, winner_guess, winner_dist, _)) = scored.first() {
+    if let Some((winner_uid, winner_guess, winner_dist, _)) = scored.first() {
+        let (pr, pg, pb, _) = crate::mapimage::PLAYER_COLORS[0];
+        let winner_raw = raw_avatars.get(winner_uid.as_str()).cloned();
         let (g_lat, g_lon, d) = (winner_guess.lat, winner_guess.lon, *winner_dist);
         if let Ok(Some(png)) = tokio::task::spawn_blocking(move || {
-            crate::mapimage::render_guess_map(g_lat, g_lon, actual_lat, actual_lon, d)
+            let pin = crate::avatar::render_avatar_pin(winner_raw.as_deref(), pr, pg, pb);
+            crate::mapimage::render_guess_map(g_lat, g_lon, actual_lat, actual_lon, d, pin, pr, pg, pb)
         })
         .await
         {
@@ -935,10 +938,12 @@ async fn post_reveal_free_guess(
             if let Some(dm_room) = client.get_room(&dm_room_id) {
                 dm_room.send(format::mentionify(&fb_text)).await.ok();
 
-                // Map image: blue dot = guess, red dot = actual, orange line.
+                // Map image: avatar pin = guess, dark dot = actual, coloured line.
+                let player_raw = raw_avatars.get(uid.as_str()).cloned();
                 let (g_lat, g_lon, dist_val) = (guess.lat, guess.lon, *dist);
                 if let Ok(Some(png)) = tokio::task::spawn_blocking(move || {
-                    crate::mapimage::render_guess_map(g_lat, g_lon, actual_lat, actual_lon, dist_val)
+                    let pin = crate::avatar::render_avatar_pin(player_raw.as_deref(), pr, pg, pb);
+                    crate::mapimage::render_guess_map(g_lat, g_lon, actual_lat, actual_lon, dist_val, pin, pr, pg, pb)
                 })
                 .await
                 {
