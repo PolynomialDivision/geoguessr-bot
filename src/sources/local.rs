@@ -71,6 +71,7 @@ pub async fn fetch(dir: &str) -> Result<GeoImage> {
         attribution:      entry.attribution.clone(),
         lat:              entry.lat,
         lon:              entry.lon,
+        sequence:         None,
         extra_image_urls: vec![],
     })
 }

@@ -1505,6 +1505,20 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
 
     let sources = &ctx.config.sources.enabled;
 
+    // Collect existing coordinates and sequence IDs so each fetch in this
+    // batch avoids duplicating locations already in the cache or fetched
+    // earlier in the same batch.
+    let (mut existing_coords, mut existing_seqs): (Vec<(f64, f64)>, Vec<Option<String>>) = {
+        let st = ctx.state.lock().await;
+        st.cached_guesses.iter()
+            .map(|img| {
+                let coord = img.lat.zip(img.lon);
+                (coord, img.sequence.clone())
+            })
+            .filter_map(|(coord, seq)| coord.map(|c| (c, seq)))
+            .unzip()
+    };
+
     for _ in 0..needed {
         let source = {
             let mut rng = rand::thread_rng();
@@ -1514,7 +1528,12 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
         let n_photos = ctx.config.schedule.photos_per_location;
         let result = match source.as_str() {
             "mapillary" => {
-                crate::sources::mapillary::fetch(&ctx.config.sources.mapillary, n_photos).await
+                crate::sources::mapillary::fetch(
+                    &ctx.config.sources.mapillary,
+                    n_photos,
+                    &existing_coords,
+                    &existing_seqs,
+                ).await
             }
             "local" => {
                 match &ctx.config.sources.local.path {
@@ -1525,11 +1544,21 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
                     }
                 }
             }
-            _ => crate::sources::wikimedia::fetch(&ctx.config.sources.wikimedia, n_photos).await,
+            _ => crate::sources::wikimedia::fetch(
+                &ctx.config.sources.wikimedia,
+                n_photos,
+                &existing_coords,
+            ).await,
         };
 
         match result {
             Ok(img) => {
+                // Update the local diversity lists so the next iteration in
+                // this batch also respects the location we just fetched.
+                if let Some(coord) = img.lat.zip(img.lon) {
+                    existing_coords.push(coord);
+                    existing_seqs.push(img.sequence.clone());
+                }
                 let mut st = ctx.state.lock().await;
                 st.cached_guesses.push_back(img);
                 st.save(&ctx.state_path).await.ok();

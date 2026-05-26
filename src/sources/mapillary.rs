@@ -3,8 +3,9 @@
 //! Strategy:
 //!  1. Pick a random seed country from `countries::COUNTRIES` (optionally
 //!     filtered by the configured country allow-list).
-//!  2. Call the Mapillary /images endpoint with `closeto=lon,lat&radius=…`.
-//!  3. Pick a random image from the results.
+//!  2. Call the Mapillary /images endpoint with `lat=…&lng=…&radius=…`.
+//!  3. Reject any candidate whose coordinates are within MIN_DISTANCE_KM of an
+//!     already-cached location, or that share a sequence ID with one.
 //!  4. Return a `GeoImage` with the actual GPS coordinates from the API.
 //!
 //! Requires a free Mapillary client access token (register at
@@ -15,7 +16,7 @@ use rand::seq::SliceRandom;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use super::get_with_retry;
+use super::{get_with_retry, min_dist_to_existing, MIN_DISTANCE_KM};
 
 use crate::{
     config::MapillaryConfig,
@@ -40,6 +41,10 @@ struct MapillaryImage {
     geometry:        Geometry,
     thumb_1024_url:  Option<String>,
     creator:         Option<Creator>,
+    /// Mapillary v4 sequence UUID — images in the same sequence are from the
+    /// same capture run on the same road/trail.
+    #[serde(default)]
+    sequence:        Option<String>,
 }
 
 /// GeoJSON Point geometry — coordinates are [longitude, latitude].
@@ -57,8 +62,19 @@ struct Creator {
 
 /// Fetch a `GeoImage` (with up to `n_photos` images) from Mapillary.
 ///
+/// `existing` — coordinates of already-cached locations; candidates within
+/// MIN_DISTANCE_KM of any existing point are rejected.
+///
+/// `existing_seqs` — Mapillary sequence IDs already in the cache; candidates
+/// sharing a sequence with any cached location are rejected.
+///
 /// Tries up to 10 different seed countries before giving up.
-pub async fn fetch(cfg: &MapillaryConfig, n_photos: usize) -> Result<GeoImage> {
+pub async fn fetch(
+    cfg:           &MapillaryConfig,
+    n_photos:      usize,
+    existing:      &[(f64, f64)],
+    existing_seqs: &[Option<String>],
+) -> Result<GeoImage> {
     let n_photos = n_photos.max(1);
     if cfg.access_token.is_empty() {
         bail!("Mapillary: access_token is not configured");
@@ -81,7 +97,6 @@ pub async fn fetch(cfg: &MapillaryConfig, n_photos: usize) -> Result<GeoImage> {
         bail!("Mapillary: country filter matches no known countries");
     }
 
-    // Shuffle before any awaits so ThreadRng doesn't cross await points.
     let candidates: Vec<&Country> = {
         let mut rng = rand::thread_rng();
         let mut v = pool.clone();
@@ -90,14 +105,19 @@ pub async fn fetch(cfg: &MapillaryConfig, n_photos: usize) -> Result<GeoImage> {
     };
 
     for seed in candidates.iter().take(10) {
-        match try_seed(&client, seed, cfg, n_photos).await {
+        match try_seed(&client, seed, cfg, n_photos, existing, existing_seqs).await {
             Ok(img) => {
-                info!("Mapillary: found {} image(s) for {} ({})", 1 + img.extra_image_urls.len(), seed.name, seed.iso);
+                info!(
+                    "Mapillary: found {} photo(s) for {} ({}) — nearest existing {:.0} km",
+                    1 + img.extra_image_urls.len(),
+                    seed.name, seed.iso,
+                    img.lat.zip(img.lon)
+                        .map(|(lat, lon)| min_dist_to_existing(lat, lon, existing))
+                        .unwrap_or(f64::INFINITY),
+                );
                 return Ok(img);
             }
-            Err(e) => {
-                warn!("Mapillary: seed {} failed: {e}", seed.name);
-            }
+            Err(e) => warn!("Mapillary: seed {} failed: {e}", seed.name),
         }
     }
 
@@ -107,18 +127,17 @@ pub async fn fetch(cfg: &MapillaryConfig, n_photos: usize) -> Result<GeoImage> {
 // ── Internals ─────────────────────────────────────────────────────────────────
 
 async fn try_seed(
-    client:   &reqwest::Client,
-    seed:     &Country,
-    cfg:      &MapillaryConfig,
-    n_photos: usize,
+    client:        &reqwest::Client,
+    seed:          &Country,
+    cfg:           &MapillaryConfig,
+    n_photos:      usize,
+    existing:      &[(f64, f64)],
+    existing_seqs: &[Option<String>],
 ) -> Result<GeoImage> {
-    // Mapillary v4 Graph API: proximity search uses separate `lat` and `lng`.
-    // The `radius` parameter is in **kilometres** (max 50).
-    // Our config stores `search_radius` in metres, so divide by 1000 and clamp.
     let radius_km = (cfg.search_radius / 1000).clamp(1, 50);
     let url = format!(
         "{API}?access_token={token}\
-         &fields=id,geometry,thumb_1024_url,creator\
+         &fields=id,geometry,thumb_1024_url,creator,sequence\
          &lat={lat}&lng={lon}\
          &radius={radius}\
          &limit=50",
@@ -134,25 +153,52 @@ async fn try_seed(
         bail!("no images found near {} within {}km", seed.name, radius_km);
     }
 
-    // Shuffle and take up to n_photos (must happen before any further awaits).
-    let selected: Vec<MapillaryImage> = {
+    // Shuffle, then filter to images that have a thumbnail URL.
+    let mut candidates: Vec<MapillaryImage> = {
         let mut rng  = rand::thread_rng();
         let mut data = resp.data;
         data.shuffle(&mut rng);
-        // Only keep images that actually have a thumbnail URL.
         data.into_iter()
             .filter(|img| img.thumb_1024_url.as_deref().map(|u| !u.is_empty()).unwrap_or(false))
-            .take(n_photos)
             .collect()
     };
 
-    if selected.is_empty() {
+    if candidates.is_empty() {
         bail!("no images with thumbnail URL near {}", seed.name);
     }
 
-    let primary = &selected[0];
+    // ── Find a primary image that passes diversity checks ─────────────────────
+    let primary_idx = candidates.iter().position(|img| {
+        let lon = img.geometry.coordinates[0];
+        let lat = img.geometry.coordinates[1];
 
-    // GeoJSON: coordinates = [lon, lat]
+        // Distance check: reject if too close to any existing location.
+        let dist = min_dist_to_existing(lat, lon, existing);
+        if dist < MIN_DISTANCE_KM {
+            return false;
+        }
+
+        // Sequence check: reject if same capture run as any existing location.
+        if let Some(ref seq) = img.sequence {
+            if existing_seqs.iter().any(|es| es.as_deref() == Some(seq.as_str())) {
+                return false;
+            }
+        }
+
+        true
+    });
+
+    let primary_idx = match primary_idx {
+        Some(i) => i,
+        None    => bail!(
+            "all {} candidates near {} are within {MIN_DISTANCE_KM:.0} km of an existing \
+             location or share a sequence",
+            candidates.len(), seed.name
+        ),
+    };
+
+    let primary = candidates.remove(primary_idx);
+
     let lon = primary.geometry.coordinates[0];
     let lat = primary.geometry.coordinates[1];
 
@@ -163,20 +209,30 @@ async fn try_seed(
         .map(|u| format!("© {u} on Mapillary (CC BY-SA)"))
         .unwrap_or_else(|| "© Mapillary contributors (CC BY-SA)".to_owned());
 
-    let extra_image_urls: Vec<String> = selected[1..]
+    // ── Extra photos: different sequence from primary ─────────────────────────
+    // For multi-photo guesses we still want nearby images for visual context,
+    // but avoid showing frames from the exact same capture run as the primary.
+    let primary_seq = primary.sequence.as_deref();
+    let extra_image_urls: Vec<String> = candidates
         .iter()
+        .filter(|img| {
+            // Different sequence than primary (or sequence unknown).
+            img.sequence.as_deref() != primary_seq || primary_seq.is_none()
+        })
         .filter_map(|img| img.thumb_1024_url.clone())
+        .take(n_photos.saturating_sub(1))
         .collect();
 
     Ok(GeoImage {
         country:  seed.name.to_owned(),
         region:   seed.region.to_owned(),
         city:     None,
-        image_url: primary.thumb_1024_url.clone().unwrap(), // safe: filtered above
+        image_url: primary.thumb_1024_url.unwrap(), // safe: filtered above
         source:   "mapillary".to_owned(),
         attribution: Some(attribution),
         lat:      Some(lat),
         lon:      Some(lon),
+        sequence: primary.sequence,
         extra_image_urls,
     })
 }

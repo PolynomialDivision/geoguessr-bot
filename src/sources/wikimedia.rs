@@ -14,7 +14,7 @@ use rand::seq::SliceRandom;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use super::get_with_retry;
+use super::{get_with_retry, min_dist_to_existing, MIN_DISTANCE_KM};
 
 use crate::{
     config::WikimediaConfig,
@@ -73,8 +73,11 @@ struct ImageInfo {
 
 /// Fetch a `GeoImage` (with up to `n_photos` images) from Wikimedia Commons.
 ///
+/// `existing` — coordinates of already-cached locations; candidates within
+/// MIN_DISTANCE_KM of any existing point are rejected.
+///
 /// Tries up to 10 different seed locations before giving up.
-pub async fn fetch(cfg: &WikimediaConfig, n_photos: usize) -> Result<GeoImage> {
+pub async fn fetch(cfg: &WikimediaConfig, n_photos: usize, existing: &[(f64, f64)]) -> Result<GeoImage> {
     let n_photos = n_photos.max(1);
     let client = reqwest::Client::builder()
         .user_agent(UA)
@@ -103,11 +106,14 @@ pub async fn fetch(cfg: &WikimediaConfig, n_photos: usize) -> Result<GeoImage> {
 
     // Try up to 10 seed locations.
     for seed in candidates.iter().take(10) {
-        match try_seed(&client, seed, cfg, n_photos).await {
+        match try_seed(&client, seed, cfg, n_photos, existing).await {
             Ok(img) => {
                 info!(
-                    "Wikimedia: found {} image(s) for {} ({})",
-                    1 + img.extra_image_urls.len(), seed.name, seed.iso
+                    "Wikimedia: found {} image(s) for {} ({}) — nearest existing {:.0} km",
+                    1 + img.extra_image_urls.len(), seed.name, seed.iso,
+                    img.lat.zip(img.lon)
+                        .map(|(lat, lon)| min_dist_to_existing(lat, lon, existing))
+                        .unwrap_or(f64::INFINITY),
                 );
                 return Ok(img);
             }
@@ -127,6 +133,7 @@ async fn try_seed(
     seed:     &Country,
     cfg:      &WikimediaConfig,
     n_photos: usize,
+    existing: &[(f64, f64)],
 ) -> Result<GeoImage> {
     // Step 1: geosearch — request more results when we need multiple photos.
     let gslimit = (n_photos * 4).clamp(20, 50); // request extra to survive failures
@@ -136,32 +143,57 @@ async fn try_seed(
         seed.lat, seed.lon, cfg.search_radius
     );
     let resp: GeoSearchResp = get_with_retry(client, &geo_url).await?;
-    let results = resp.query.geosearch;
+
+    // Shuffle: the Wikimedia geosearch API returns results sorted by distance
+    // from the seed point, so without a shuffle we'd always pick the same
+    // nearest photo — shuffling ensures variety across prefetch batches.
+    let mut results = resp.query.geosearch;
+    {
+        let mut rng = rand::thread_rng();
+        results.shuffle(&mut rng);
+    }
 
     if results.is_empty() {
         bail!("geosearch returned no results");
     }
 
-    // Step 2: collect up to n_photos valid image URLs from the result set.
-    let mut image_urls: Vec<String> = Vec::with_capacity(n_photos);
+    // Step 2: find a primary image whose coordinates pass the distance check.
     let mut primary_result: Option<&GeoResult> = None;
 
     for result in &results {
-        if image_urls.len() >= n_photos { break; }
+        let dist = min_dist_to_existing(result.lat, result.lon, existing);
+        if dist < MIN_DISTANCE_KM {
+            continue; // too close to an already-cached location
+        }
+        // Verify we can actually fetch a usable image for this result.
         match get_image_info(client, result.pageid, cfg.max_image_bytes).await {
-            Ok(url) => {
-                if primary_result.is_none() { primary_result = Some(result); }
-                image_urls.push(url);
+            Ok(_) => {
+                primary_result = Some(result);
+                break;
             }
             Err(e) => warn!("Wikimedia: pageId {} skipped: {e}", result.pageid),
         }
     }
 
-    let primary = primary_result
-        .ok_or_else(|| anyhow::anyhow!("no suitable image found among geosearch results"))?;
+    let primary = primary_result.ok_or_else(|| anyhow::anyhow!(
+        "no suitable image found among geosearch results (all too close to existing locations \
+         or failed image-info fetch)"
+    ))?;
 
-    let mut urls = image_urls.into_iter();
-    let primary_url = urls.next().unwrap();
+    // Step 3: fetch the primary image URL, then collect extra photos from
+    // *different* coordinates within the result set (but skip the distance
+    // check for extras — they're near the primary by definition).
+    let primary_url = get_image_info(client, primary.pageid, cfg.max_image_bytes).await?;
+
+    let mut extra_image_urls: Vec<String> = Vec::with_capacity(n_photos.saturating_sub(1));
+    for result in &results {
+        if extra_image_urls.len() >= n_photos.saturating_sub(1) { break; }
+        if result.pageid == primary.pageid { continue; }
+        match get_image_info(client, result.pageid, cfg.max_image_bytes).await {
+            Ok(url) => extra_image_urls.push(url),
+            Err(e)  => warn!("Wikimedia: extra pageId {} skipped: {e}", result.pageid),
+        }
+    }
 
     Ok(GeoImage {
         country:          seed.name.to_owned(),
@@ -172,7 +204,8 @@ async fn try_seed(
         attribution:      Some("© Wikimedia Commons contributors (CC BY-SA)".to_owned()),
         lat:              Some(primary.lat),
         lon:              Some(primary.lon),
-        extra_image_urls: urls.collect(),
+        sequence:         None,
+        extra_image_urls,
     })
 }
 
