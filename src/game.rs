@@ -619,7 +619,7 @@ async fn play_free_guess(
         "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}\n\
          📍 Where is this?\n\
          City, country, address, or lat,lon\n\
-         Main room: https://matrix.to/#/{room_id_str}"
+         ↩️ Main room: https://matrix.to/#/{room_id_str}"
     );
     let dm_prompt_html = format!(
         "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}<br>\
