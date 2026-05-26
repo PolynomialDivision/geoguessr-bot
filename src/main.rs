@@ -475,7 +475,7 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             game::prefetch_if_needed(
                 &ctx2,
-                ctx2.config.schedule.images_per_round as usize + 2,
+                ctx2.config.schedule.guesses_per_round as usize + 2,
             )
             .await;
         });

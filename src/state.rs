@@ -13,9 +13,9 @@ use crate::sources::GeoImage;
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct State {
-    /// Pre-fetched images waiting to be used.
-    #[serde(default)]
-    pub cached_images: VecDeque<GeoImage>,
+    /// Pre-fetched guess data (photo + location) waiting to be used.
+    #[serde(default, alias = "cached_images")]
+    pub cached_guesses: VecDeque<GeoImage>,
     /// Set on first boot.
     pub created_at: Option<DateTime<Utc>>,
     /// Per-slot last-fired date. Key = "HH:MM" string from config.

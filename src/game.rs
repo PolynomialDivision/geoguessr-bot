@@ -120,7 +120,7 @@ pub async fn start_round(
         }
     };
 
-    let n = ctx.config.schedule.images_per_round as usize;
+    let n = ctx.config.schedule.guesses_per_round as usize;
     let triggered_by = if manual { "manual" } else { "scheduler" };
 
     // Apply per-round overrides (from !schedulegeo).
@@ -248,7 +248,7 @@ pub async fn start_round(
                         // Game-start notice in the DM (brief — they got the full how-to on reaction).
                         if let Some(dm_room) = client.get_room(&dm_room_id) {
                             dm_room.send(format::mentionify(
-                                "🌍 GeoGuessr is starting now! Here comes the first image…",
+                                "🌍 GeoGuessr is starting now! Here comes the first guess…",
                             ))
                             .await
                             .ok();
@@ -260,7 +260,7 @@ pub async fn start_round(
             }
 
             let participant_list: Vec<String> = dm_map.keys()
-                .map(|u| u.localpart().to_owned())
+                .map(|u| u.to_string())
                 .collect();
             room.send(format::mentionify(&format!(
                 "🌍 GeoGuessr starting now! {} player{}: {}",
@@ -305,13 +305,13 @@ pub async fn start_round(
     for i in 0..n {
         let img = {
             let mut st = ctx.state.lock().await;
-            match st.cached_images.pop_front() {
+            match st.cached_guesses.pop_front() {
                 Some(img) => {
                     st.save(&ctx.state_path).await.ok();
                     img
                 }
                 None => {
-                    warn!("GeoGuessr: image cache empty — skipping remaining questions");
+                    warn!("GeoGuessr: guess cache empty — skipping remaining");
                     break;
                 }
             }
@@ -319,7 +319,7 @@ pub async fn start_round(
 
         // Background refill.
         {
-            let remaining = ctx.state.lock().await.cached_images.len();
+            let remaining = ctx.state.lock().await.cached_guesses.len();
             if remaining < 3 {
                 let ctx2 = ctx.clone();
                 tokio::spawn(async move {
@@ -330,14 +330,14 @@ pub async fn start_round(
 
         if i > 0 {
             tokio::time::sleep(tokio::time::Duration::from_secs(
-                ctx.config.schedule.inter_image_secs,
+                ctx.config.schedule.inter_guess_secs,
             ))
             .await;
         }
 
         match ctx.config.schedule.game_mode {
             GameMode::MultipleChoice => {
-                play_image(
+                play_guess(
                     &ctx, &client, &room,
                     round_id, i as u32 + 1, n as u32,
                     &img, &mut round_results,
@@ -346,7 +346,7 @@ pub async fn start_round(
                 .await?;
             }
             GameMode::FreeGuess => {
-                play_image_free_guess(
+                play_free_guess(
                     &ctx, &client, &room,
                     round_id, i as u32 + 1, n as u32,
                     &img, &mut round_scores_free, &dm_participants,
@@ -405,12 +405,12 @@ pub async fn start_round(
 
 // ── Single image — multiple choice ───────────────────────────────────────────
 
-async fn play_image(
+async fn play_guess(
     ctx:                &BotContext,
     client:             &Client,
     room:               &Room,
     round_id:           i64,
-    image_num:          u32,
+    guess_num:          u32,
     n_total:            u32,
     img:                &GeoImage,
     round_results:      &mut HashMap<String, Vec<bool>>,
@@ -425,9 +425,9 @@ async fn play_image(
         .unwrap_or(0) as u8;
     let choices = distractors;
 
-    let image_id = ctx.db
-        .start_image(
-            round_id, image_num,
+    let guess_id = ctx.db
+        .start_guess(
+            round_id, guess_num,
             &img.country, &img.region, img.city.as_deref(),
             &img.source, img.attribution.as_deref(),
             &choices, correct_index,
@@ -456,11 +456,11 @@ async fn play_image(
     }
 
     let total_secs    = answer_timeout_secs;
-    let question_text = build_question_text(image_num, n_total, &choices, total_secs, total_secs);
+    let question_text = build_question_text(guess_num, n_total, &choices, total_secs, total_secs);
     let q_event       = room.send(format::mentionify(&question_text)).await?;
     let q_event_id    = q_event.response.event_id.clone();
 
-    ctx.db.set_image_event_id(image_id, q_event_id.as_str()).await.ok();
+    ctx.db.set_guess_event_id(guess_id, q_event_id.as_str()).await.ok();
 
     for emoji in &CHOICE_EMOJIS[..choices.len()] {
         room.send(ReactionEventContent::new(Annotation::new(
@@ -488,7 +488,7 @@ async fn play_image(
     while remaining > edit_interval {
         tokio::time::sleep(tokio::time::Duration::from_secs(edit_interval)).await;
         remaining -= edit_interval;
-        let updated = build_question_text(image_num, n_total, &choices, remaining, total_secs);
+        let updated = build_question_text(guess_num, n_total, &choices, remaining, total_secs);
         if let Some(r) = client.get_room(&ctx.room_id) {
             let edit = RoomMessageEventContent::text_plain(&updated)
                 .make_replacement(ReplacementMetadata::new(q_event_id.clone(), None));
@@ -509,8 +509,8 @@ async fn play_image(
     let n_correct = answers.values().filter(|r| r.choice == correct_index).count();
     let n_total_a = answers.len();
 
-    ctx.db.record_answers(image_id, round_id, answers.clone(), correct_index).await?;
-    ctx.db.finish_image(image_id, n_total_a, n_correct).await?;
+    ctx.db.record_answers(guess_id, round_id, answers.clone(), correct_index).await?;
+    ctx.db.finish_guess(guess_id, n_total_a, n_correct).await?;
 
     for (user_id, rec) in &answers {
         round_results
@@ -519,20 +519,18 @@ async fn play_image(
             .push(rec.choice == correct_index);
     }
 
-    let user_ids: Vec<&str> = answers.keys().map(|s| s.as_str()).collect();
-    let names = fetch_names(room, &user_ids).await;
-    post_reveal(ctx, client, room, img, &choices, correct_index, &answers, &names, n_correct).await;
+    post_reveal(ctx, client, room, img, &choices, correct_index, &answers, n_correct).await;
     Ok(())
 }
 
 // ── Single image — free guess ─────────────────────────────────────────────────
 
-async fn play_image_free_guess(
+async fn play_free_guess(
     ctx:                &BotContext,
     client:             &Client,
     room:               &Room,
     round_id:           i64,
-    image_num:          u32,
+    guess_num:          u32,
     n_total:            u32,
     img:                &GeoImage,
     round_scores:       &mut HashMap<String, i64>,
@@ -549,9 +547,9 @@ async fn play_image_free_guess(
         }
     };
 
-    let image_id = ctx.db
-        .start_image(
-            round_id, image_num,
+    let guess_id = ctx.db
+        .start_guess(
+            round_id, guess_num,
             &img.country, &img.region, img.city.as_deref(),
             &img.source, img.attribution.as_deref(),
             &[], 0,
@@ -589,7 +587,7 @@ async fn play_image_free_guess(
 
     // Show the "can't find the chat?" hint only once per round, below the first batch of photos.
     // Plain variant: used in countdown edits (plain-text). HTML variant: used in the initial send.
-    let (dm_hint_plain, dm_hint_html) = if !dm_participants.is_empty() && image_num == 1 {
+    let (dm_hint_plain, dm_hint_html) = if !dm_participants.is_empty() && guess_num == 1 {
         let plain = format!(
             "\n💬 Can't find the chat? https://matrix.to/#/{bot_mxid}"
         );
@@ -604,28 +602,28 @@ async fn play_image_free_guess(
 
     let q_event = if dm_participants.is_empty() {
         room.send(format::mentionify(&format!(
-            "🌍 Image {image_num}/{n_total} — ⏳ {timeout_str}\n\n\
+            "🌍 Guess {guess_num}/{n_total} — ⏳ {timeout_str}\n\n\
              Where was this photo taken?\n\
              Type: **!guess <location>**  (address, city, country, or lat,lon)",
         ))).await?
     } else {
         let plain = format!(
-            "🌍 Image {image_num}/{n_total} — ⏳ {timeout_str}\n\n\
+            "🌍 Guess {guess_num}/{n_total} — ⏳ {timeout_str}\n\n\
              Answers are coming in via private DMs.{dm_hint_plain}"
         );
         let html = format!(
-            "🌍 Image {image_num}/{n_total} — ⏳ {timeout_str}<br><br>\
+            "🌍 Guess {guess_num}/{n_total} — ⏳ {timeout_str}<br><br>\
              Answers are coming in via private DMs.{dm_hint_html}"
         );
         room.send(RoomMessageEventContent::text_html(plain, html)).await?
     };
     let q_event_id = q_event.response.event_id.clone();
 
-    ctx.db.set_image_event_id(image_id, q_event_id.as_str()).await.ok();
+    ctx.db.set_guess_event_id(guess_id, q_event_id.as_str()).await.ok();
 
     // Post all images + prompt in each participant's DM.
     let dm_prompt_plain = format!(
-        "🌍 Image {image_num}/{n_total} — ⏳ {timeout_str}\n\n\
+        "🌍 Guess {guess_num}/{n_total} — ⏳ {timeout_str}\n\n\
          Where was this photo taken?\n\
          Type your answer — any of these work:\n\
          • City or country name\n\
@@ -634,7 +632,7 @@ async fn play_image_free_guess(
          ↩️ Back to main room: https://matrix.to/#/{room_id_str}"
     );
     let dm_prompt_html = format!(
-        "🌍 Image {image_num}/{n_total} — ⏳ {timeout_str}<br><br>\
+        "🌍 Guess {guess_num}/{n_total} — ⏳ {timeout_str}<br><br>\
          Where was this photo taken?<br>\
          Type your answer — any of these work:<br>\
          • City or country name<br>\
@@ -682,17 +680,17 @@ async fn play_image_free_guess(
         let time_str  = format_duration(remaining);
         let edit_msg = if dm_participants.is_empty() {
             format::mentionify(&format!(
-                "🌍 Image {image_num}/{n_total} — ⏳ {time_str}  {bar}\n\n\
+                "🌍 Guess {guess_num}/{n_total} — ⏳ {time_str}  {bar}\n\n\
                  Where was this photo taken?\n\
                  Type: **!guess <location>**  (address, city, country, or lat,lon)",
             ))
         } else {
             let plain = format!(
-                "🌍 Image {image_num}/{n_total} — ⏳ {time_str}  {bar}\n\n\
+                "🌍 Guess {guess_num}/{n_total} — ⏳ {time_str}  {bar}\n\n\
                  Answers are coming in via private DMs.{dm_hint_plain}"
             );
             let html = format!(
-                "🌍 Image {image_num}/{n_total} — ⏳ {time_str}  {bar}<br><br>\
+                "🌍 Guess {guess_num}/{n_total} — ⏳ {time_str}  {bar}<br><br>\
                  Answers are coming in via private DMs.{dm_hint_html}"
             );
             RoomMessageEventContent::text_html(plain, html)
@@ -733,8 +731,8 @@ async fn play_image_free_guess(
             (uid.clone(), g.text.clone(), g.lat, g.lon, *dist, *score)
         })
         .collect();
-    ctx.db.record_free_guess_answers(image_id, round_id, db_rows).await?;
-    ctx.db.finish_image(image_id, n_answers, 0).await?;
+    ctx.db.record_free_guess_answers(guess_id, round_id, db_rows).await?;
+    ctx.db.finish_guess(guess_id, n_answers, 0).await?;
 
     for (uid, _, _, score) in &scored {
         *round_scores.entry(uid.clone()).or_insert(0) += score;
@@ -785,12 +783,11 @@ async fn post_reveal_free_guess(
         lines.push("Nobody guessed this one!".to_owned());
     } else {
         for (i, (uid, guess, dist, score)) in scored.iter().enumerate() {
-            let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
-            let display = display_name(names, uid);
+            let medal    = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
             let dist_str = format_dist(*dist);
             lines.push(format!(
-                "{medal} {} ({}) — \"{}\" — {} — {} pts",
-                uid, display, guess.text, dist_str, score,
+                "{medal} {} — \"{}\" — {} — {} pts",
+                uid, guess.text, dist_str, score,
             ));
         }
     }
@@ -838,13 +835,14 @@ async fn post_reveal_free_guess(
                 if let Some(r) = client.get_room(&ctx.room_id) {
                     r.send(RoomMessageEventContent::new(MessageType::Image(img))).await.ok();
 
-                    // Legend: 🔵 alice  🔴 bob  🟢 charlie  ⬛ actual
-                    let mut parts: Vec<String> = legend
+                    // Legend: 🔵 @alice:s  🔴 @bob:s  ⬛ actual
+                    let mut parts: Vec<String> = scored
                         .iter()
-                        .map(|(name, emoji)| format!("{} {}", emoji, name))
+                        .zip(legend.iter())
+                        .map(|((uid, _, _, _), (_, emoji))| format!("{} {}", emoji, uid))
                         .collect();
                     parts.push("⬛ actual location".to_owned());
-                    r.send(RoomMessageEventContent::text_plain(parts.join("   ")))
+                    r.send(format::mentionify(&parts.join("   ")))
                         .await
                         .ok();
                 }
@@ -908,7 +906,7 @@ async fn post_reveal_free_guess(
         if !already_got_fb {
             if let Some(dm_room) = client.get_room(dm_room_id) {
                 dm_room.send(format::mentionify(&format!(
-                    "⏰ Time's up! You didn't submit a guess for this image.\n\
+                    "⏰ Time's up! You didn't submit a guess for this one.\n\
                      📍 Actual: {}",
                     maps_url,
                 )))
@@ -935,8 +933,8 @@ async fn post_round_summary_free_guess(
     }
 
     // ── Round results (this round only) ──────────────────────────────────────
-    let n_images = ctx.config.schedule.images_per_round as usize;
-    let max_pts  = 5000i64 * n_images as i64;
+    let n_guesses = ctx.config.schedule.guesses_per_round as usize;
+    let max_pts  = 5000i64 * n_guesses as i64;
 
     // Fetch per-user stats for this round from DB.
     let round_stats = ctx.db.round_stats(round_id).await.unwrap_or_default();
@@ -944,7 +942,7 @@ async fn post_round_summary_free_guess(
     const BAR_W: usize = 10;
 
     let mut lines = vec![
-        format!("🌍 **Round over!**  ({} image(s) · max {} pts)", n_images, max_pts),
+        format!("🌍 **Round over!**  ({} guess(es) · max {} pts)", n_guesses, max_pts),
         String::new(),
     ];
 
@@ -954,13 +952,12 @@ async fn post_round_summary_free_guess(
 
     for (i, (uid, score)) in ranking.iter().enumerate() {
         let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
-        let name  = uid.split(':').next().unwrap_or(uid).trim_start_matches('@');
 
         // Bar: fraction of max possible score.
         let filled = ((*score as f64 / max_pts as f64) * BAR_W as f64).round() as usize;
         let bar    = format!("{}{}", "█".repeat(filled.min(BAR_W)), "░".repeat(BAR_W - filled.min(BAR_W)));
 
-        let avg_pts_img = if n_images > 0 { score / n_images as i64 } else { 0 };
+        let pts_per_guess = if n_guesses > 0 { score / n_guesses as i64 } else { 0 };
 
         // Distance stats from DB if available for this user.
         let (avg_dist, best_dist) = round_stats
@@ -969,7 +966,7 @@ async fn post_round_summary_free_guess(
             .map(|e| (format_dist(e.avg_distance_km), format_dist(e.best_distance_km)))
             .unwrap_or_else(|| ("—".to_owned(), "—".to_owned()));
 
-        lines.push(format!("{medal} {:>2}. {}  —  {} pts/img", i + 1, name, avg_pts_img));
+        lines.push(format!("{medal} {:>2}. {}  —  {} pts/guess", i + 1, uid, pts_per_guess));
         lines.push(format!("      {bar}  ⌀ {}  🏅 {}", avg_dist, best_dist));
     }
 
@@ -1189,7 +1186,6 @@ async fn reconcile_join_reactions(
 
 // ── Reveal message — multiple choice ─────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 async fn post_reveal(
     ctx:           &BotContext,
     client:        &Client,
@@ -1198,7 +1194,6 @@ async fn post_reveal(
     choices:       &[String],
     correct_index: u8,
     answers:       &HashMap<String, AnswerRecord>,
-    names:         &HashMap<String, String>,
     n_correct:     usize,
 ) {
     let location_str = match &img.city {
@@ -1234,8 +1229,7 @@ async fn post_reveal(
         correct_users.sort_by_key(|(_, r)| r.submitted_at);
 
         for (uid, _rec) in &correct_users {
-            let display = display_name(names, uid);
-            lines.push(format!("✅ {} ({})", uid, display));
+            lines.push(format!("✅ {}", uid));
         }
 
         let wrong: Vec<&str> = answers
@@ -1246,8 +1240,7 @@ async fn post_reveal(
         if !wrong.is_empty() {
             lines.push(String::new());
             for uid in wrong {
-                let display = display_name(names, uid);
-                lines.push(format!("❌ {} ({})", uid, display));
+                lines.push(format!("❌ {}", uid));
             }
         }
     }
@@ -1274,13 +1267,6 @@ async fn post_round_summary(
         return;
     }
 
-    let user_ids: Vec<&str> = round_results.keys().map(|s| s.as_str()).collect();
-    let names = if let Some(r) = client.get_room(&ctx.room_id) {
-        fetch_names(&r, &user_ids).await
-    } else {
-        HashMap::new()
-    };
-
     let mut scores: Vec<(&str, usize, usize)> = round_results
         .iter()
         .map(|(uid, results)| {
@@ -1291,14 +1277,13 @@ async fn post_round_summary(
         .collect();
     scores.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
 
-    let n_images = ctx.config.schedule.images_per_round as usize;
-    let mut lines = vec![format!("🌍 Round over! Results ({n_images} images):")];
+    let n_guesses = ctx.config.schedule.guesses_per_round as usize;
+    let mut lines = vec![format!("🌍 Round over! Results ({n_guesses} guesses):")];
     lines.push(String::new());
 
     for (i, (uid, correct, total)) in scores.iter().enumerate() {
-        let medal   = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
-        let display = display_name(&names, uid);
-        lines.push(format!("{medal} {} ({}) — {}/{}", uid, display, correct, total));
+        let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
+        lines.push(format!("{medal} {} — {}/{}", uid, correct, total));
     }
 
     let text = lines.join("\n");
@@ -1379,7 +1364,7 @@ fn detect_mime(data: &[u8]) -> mime::Mime {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn build_question_text(
-    image_num: u32,
+    guess_num: u32,
     n_total:   u32,
     choices:   &[String],
     remaining: u64,
@@ -1388,7 +1373,7 @@ fn build_question_text(
     let bar      = time_bar(remaining, total);
     let time_str = format_duration(remaining);
     let mut lines = vec![
-        format!("🌍 Image {image_num}/{n_total}  — ⏳ {time_str}  {bar}"),
+        format!("🌍 Guess {guess_num}/{n_total}  — ⏳ {time_str}  {bar}"),
         String::new(),
         "Where was this photo taken?".to_owned(),
         String::new(),
@@ -1512,7 +1497,7 @@ async fn reconcile_reactions(
 // ── Prefetch ──────────────────────────────────────────────────────────────────
 
 pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
-    let current = ctx.state.lock().await.cached_images.len();
+    let current = ctx.state.lock().await.cached_guesses.len();
     let needed  = target.saturating_sub(current);
     if needed == 0 { return; }
 
@@ -1546,7 +1531,7 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
         match result {
             Ok(img) => {
                 let mut st = ctx.state.lock().await;
-                st.cached_images.push_back(img);
+                st.cached_guesses.push_back(img);
                 st.save(&ctx.state_path).await.ok();
             }
             Err(e) => warn!("GeoGuessr: prefetch failed ({source}): {e}"),
@@ -1618,7 +1603,7 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         st.save(&ctx.state_path).await.ok();
     }
 
-    let n            = ctx.config.schedule.images_per_round as usize;
+    let n            = ctx.config.schedule.guesses_per_round as usize;
     let triggered_by = "scheduler";
 
     if participants.is_empty() {
@@ -1642,7 +1627,7 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
                 ctx.dm_rooms.lock().await.insert(dm_room_id.clone(), uid.clone());
                 if let Some(dm_room) = client.get_room(&dm_room_id) {
                     dm_room.send(format::mentionify(
-                        "🌍 GeoGuessr is starting now! Here comes the first image…",
+                        "🌍 GeoGuessr is starting now! Here comes the first guess…",
                     )).await.ok();
                 }
                 dm_map.insert(uid.clone(), dm_room_id);
@@ -1652,7 +1637,7 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
     }
 
     let participant_list: Vec<String> = dm_map.keys()
-        .map(|u| u.localpart().to_owned())
+        .map(|u| u.to_string())
         .collect();
     room.send(format::mentionify(&format!(
         "🌍 GeoGuessr starting now! {} player{}: {}",
@@ -1682,13 +1667,13 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
     for i in 0..n {
         let img = {
             let mut st = ctx.state.lock().await;
-            match st.cached_images.pop_front() {
+            match st.cached_guesses.pop_front() {
                 Some(img) => {
                     st.save(&ctx.state_path).await.ok();
                     img
                 }
                 None => {
-                    warn!("resume_pending_join: image cache empty — skipping remaining");
+                    warn!("resume_pending_join: guess cache empty — skipping remaining");
                     break;
                 }
             }
@@ -1696,17 +1681,17 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
 
         if i > 0 {
             tokio::time::sleep(tokio::time::Duration::from_secs(
-                ctx.config.schedule.inter_image_secs,
+                ctx.config.schedule.inter_guess_secs,
             )).await;
         }
 
-        if let Err(e) = play_image_free_guess(
+        if let Err(e) = play_free_guess(
             &ctx, &client, &room,
             round_id, i as u32 + 1, n as u32,
             &img, &mut round_scores_free, &dm_map,
             pj.answer_timeout_secs,
         ).await {
-            error!("resume_pending_join: play_image_free_guess error: {e}");
+            error!("resume_pending_join: play_free_guess error: {e}");
         }
     }
 

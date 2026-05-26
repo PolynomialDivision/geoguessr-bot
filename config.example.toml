@@ -33,13 +33,13 @@ game_times = ["19:00"]
 # join_emoji = "👍"
 
 # How many images per round (default 5).
-images_per_round = 5
+guesses_per_round = 5
 
 # How long (seconds) to collect answers per image.
 answer_timeout_secs = 90
 
 # Pause in seconds between images (default 15).
-inter_image_secs = 15
+inter_guess_secs = 15
 
 # Seconds before game_time to post a "starting soon" reminder.
 # Set to 0 to disable.  Default: 300 (5 minutes).

@@ -57,8 +57,8 @@ async fn cmd_startgeo(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<S
     *ctx.round_abort.lock().await = Some(handle.abort_handle());
 
     Ok(Some(format!(
-        "🌍 GeoGuessr starting! {} images, {} per image.",
-        ctx.config.schedule.images_per_round,
+        "🌍 GeoGuessr starting! {} guesses, {} per guess.",
+        ctx.config.schedule.guesses_per_round,
         crate::game::format_duration(ctx.config.schedule.answer_timeout_secs),
     )))
 }
@@ -252,9 +252,9 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
 async fn cmd_prefetch(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<String>> {
     require_admin(ctx, sender)?;
 
-    let before = ctx.state.lock().await.cached_images.len();
+    let before = ctx.state.lock().await.cached_guesses.len();
     game::prefetch_if_needed(ctx, before + 5).await;
-    let after = ctx.state.lock().await.cached_images.len();
+    let after = ctx.state.lock().await.cached_guesses.len();
     Ok(Some(format!("✅ Image cache: {before} → {after}")))
 }
 
@@ -331,14 +331,14 @@ pub async fn build_alltime_leaderboard(ctx: &BotContext) -> Option<String> {
     const C: f64    = 10.0;
     const BAR_W: usize = 10;
 
-    let total_imgs: i64  = board.iter().map(|e| e.images_played).sum();
-    let total_pts:  i64  = board.iter().map(|e| e.total_score).sum();
-    let global_mean: f64 = if total_imgs > 0 {
-        total_pts as f64 / total_imgs as f64
+    let total_guesses: i64 = board.iter().map(|e| e.guesses_played).sum();
+    let total_pts:     i64 = board.iter().map(|e| e.total_score).sum();
+    let global_mean: f64 = if total_guesses > 0 {
+        total_pts as f64 / total_guesses as f64
     } else { 2000.0 };
 
     let bayesian = |e: &crate::db::ScoreLeaderboardEntry| -> f64 {
-        let n   = e.images_played as f64;
+        let n   = e.guesses_played as f64;
         let avg = if n > 0.0 { e.total_score as f64 / n } else { 0.0 };
         (C * global_mean + n * avg) / (C + n)
     };
@@ -353,18 +353,15 @@ pub async fn build_alltime_leaderboard(ctx: &BotContext) -> Option<String> {
 
     for (i, entry) in board.iter().enumerate() {
         let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
-        let name  = entry.user_id
-            .split(':').next().unwrap_or(&entry.user_id)
-            .trim_start_matches('@');
 
         let b_avg  = bayesian(entry);
         let filled = ((b_avg / 5000.0) * BAR_W as f64).round() as usize;
         let bar    = format!("{}{}", "█".repeat(filled.min(BAR_W)), "░".repeat(BAR_W - filled.min(BAR_W)));
-        let avg_dist  = if entry.images_played > 0 { format_dist(entry.avg_distance_km)  } else { "—".to_owned() };
-        let best_dist = if entry.images_played > 0 { format_dist(entry.best_distance_km) } else { "—".to_owned() };
+        let avg_dist  = if entry.guesses_played > 0 { format_dist(entry.avg_distance_km)  } else { "—".to_owned() };
+        let best_dist = if entry.guesses_played > 0 { format_dist(entry.best_distance_km) } else { "—".to_owned() };
 
-        lines.push(format!("{medal} {:>2}. {}  —  {} pts/img", i + 1, name, b_avg.round() as i64));
-        lines.push(format!("      {bar}  ⌀ {}  🏅 {}  ({} imgs)", avg_dist, best_dist, entry.images_played));
+        lines.push(format!("{medal} {:>2}. {}  —  {} pts/guess", i + 1, entry.user_id, b_avg.round() as i64));
+        lines.push(format!("      {bar}  ⌀ {}  🏅 {}  ({} guesses)", avg_dist, best_dist, entry.guesses_played));
     }
     Some(lines.join("\n"))
 }
@@ -422,14 +419,14 @@ async fn cmd_countries(ctx: &BotContext) -> Result<Option<String>> {
         }
     };
     if stats.is_empty() {
-        return Ok(Some("No images shown yet.".to_owned()));
+        return Ok(Some("No guesses yet.".to_owned()));
     }
 
     let total_q: i64     = stats.iter().map(|s| s.times_asked).sum();
     let max_asked: i64   = stats.iter().map(|s| s.times_asked).max().unwrap_or(1);
 
     let mut lines = vec![
-        format!("🗺️ Countries  ({} images shown)", total_q),
+        format!("🗺️ Countries  ({} guesses)", total_q),
         String::new(),
     ];
 
@@ -525,11 +522,11 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
          \n\
            🕐 **Daily game** at {times_str} ({tz}).{reminder_line}\n\
          \n\
-           🖼️ **{images}** image{plural} per round, **{timeout}** to answer each one.{photos_line}\n\
+           🖼️ **{images}** guess{plural} per round, **{timeout}** to answer each one.{photos_line}\n\
          \n\
          {mode_line}",
-        images  = s.images_per_round,
-        plural  = if s.images_per_round == 1 { "" } else { "s" },
+        images  = s.guesses_per_round,
+        plural  = if s.guesses_per_round == 1 { "" } else { "es" },
         timeout = game::format_duration(s.answer_timeout_secs),
     );
 

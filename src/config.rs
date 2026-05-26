@@ -38,15 +38,15 @@ pub struct ScheduleConfig {
     pub room_id: String,
     /// One or more "HH:MM" times (in the configured timezone) to run the game.
     pub game_times: Vec<String>,
-    /// Seconds to collect answers per image before revealing.
+    /// Seconds to collect answers per guess before revealing.
     #[serde(default = "default_answer_timeout")]
     pub answer_timeout_secs: u64,
-    /// Number of images per round.
-    #[serde(default = "default_images_per_round")]
-    pub images_per_round: u32,
-    /// Pause in seconds between images.
-    #[serde(default = "default_inter_image_secs")]
-    pub inter_image_secs: u64,
+    /// Number of guesses (puzzle units) per round.
+    #[serde(default = "default_guesses_per_round", alias = "images_per_round")]
+    pub guesses_per_round: u32,
+    /// Pause in seconds between guesses.
+    #[serde(default = "default_inter_guess_secs", alias = "inter_image_secs")]
+    pub inter_guess_secs: u64,
     /// Seconds before game_time to post a "starting soon" reminder. 0 = disabled.
     #[serde(default = "default_reminder_before_secs")]
     pub reminder_before_secs: u64,
@@ -78,8 +78,8 @@ impl ScheduleConfig {
 
 fn default_join_emoji()           -> String { "👍".to_owned() }
 fn default_answer_timeout()       -> u64 { 90 }
-fn default_images_per_round()     -> u32 { 5 }
-fn default_inter_image_secs()     -> u64 { 15 }
+fn default_guesses_per_round()    -> u32 { 5 }
+fn default_inter_guess_secs()     -> u64 { 15 }
 fn default_reminder_before_secs() -> u64 { 300 }
 fn default_timezone()             -> String { "UTC".to_owned() }
 fn default_photos_per_location()  -> usize { 1 }

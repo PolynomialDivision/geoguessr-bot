@@ -22,7 +22,7 @@ pub struct LeaderboardEntry {
 pub struct RoundStatsEntry {
     pub user_id:          String,
     pub total_score:      i64,
-    pub images_played:    i64,
+    pub guesses_played:   i64,
     pub avg_distance_km:  f64,
     pub best_distance_km: f64,
 }
@@ -31,8 +31,8 @@ pub struct ScoreLeaderboardEntry {
     pub user_id:          String,
     pub total_score:      i64,
     pub rounds_played:    i64,
-    /// Number of individual image guesses submitted.
-    pub images_played:    i64,
+    /// Number of individual guesses submitted (one per puzzle in a round).
+    pub guesses_played:   i64,
     /// Average Haversine distance across all guesses (km).
     pub avg_distance_km:  f64,
     /// Best (closest) single guess ever (km).
@@ -106,6 +106,30 @@ impl Db {
     }
 
     pub async fn migrate(&self) -> Result<()> {
+        // Step 1: rename old tables/columns if the DB was created before the
+        //         "images → guesses" rename.  All ALTER TABLE ops are idempotent:
+        //         we check sqlite_master first, so they only run once.
+        self.run(|conn| {
+            let has_images: bool = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='images'",
+                [],
+                |r| r.get::<_, i64>(0),
+            ).unwrap_or(0) > 0;
+
+            if has_images {
+                info!("DB migration: renaming 'images' table → 'guesses'");
+                conn.execute_batch("
+                    ALTER TABLE images  RENAME TO guesses;
+                    ALTER TABLE guesses RENAME COLUMN image_num  TO guess_num;
+                    ALTER TABLE answers RENAME COLUMN image_id   TO guess_id;
+                    ALTER TABLE rounds  RENAME COLUMN n_images   TO n_guesses;
+                ")?;
+            }
+            Ok(())
+        })
+        .await?;
+
+        // Step 2: apply the current schema (CREATE TABLE IF NOT EXISTS — safe to re-run).
         let schema = include_str!("../migrations/schema.sql");
         self.run(move |conn| {
             conn.execute_batch(schema).context("Applying schema")?;
@@ -122,15 +146,15 @@ impl Db {
     pub async fn start_round(
         &self,
         room_id:      &str,
-        n_images:     u32,
+        n_guesses:    u32,
         triggered_by: &str,
     ) -> Result<i64> {
         let room_id      = room_id.to_owned();
         let triggered_by = triggered_by.to_owned();
         self.run(move |conn| {
             conn.execute(
-                "INSERT INTO rounds (room_id, n_images, triggered_by) VALUES (?1, ?2, ?3)",
-                params![room_id, n_images, triggered_by],
+                "INSERT INTO rounds (room_id, n_guesses, triggered_by) VALUES (?1, ?2, ?3)",
+                params![room_id, n_guesses, triggered_by],
             )?;
             Ok(conn.last_insert_rowid())
         })
@@ -156,14 +180,14 @@ impl Db {
     }
 }
 
-// ── Image (question) lifecycle ────────────────────────────────────────────────
+// ── Guess lifecycle ───────────────────────────────────────────────────────────
 
 impl Db {
     #[allow(clippy::too_many_arguments)]
-    pub async fn start_image(
+    pub async fn start_guess(
         &self,
         round_id:     i64,
-        image_num:    u32,
+        guess_num:    u32,
         country:      &str,
         region:       &str,
         city:         Option<&str>,
@@ -183,12 +207,12 @@ impl Db {
         let choices_json = serde_json::to_string(choices)?;
         self.run(move |conn| {
             conn.execute(
-                "INSERT INTO images
-                   (round_id, image_num, country, region, city, source, attribution,
+                "INSERT INTO guesses
+                   (round_id, guess_num, country, region, city, source, attribution,
                     choices, correct_index, answer_timeout_secs, actual_lat, actual_lon)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
-                    round_id, image_num, country, region, city, source, attribution,
+                    round_id, guess_num, country, region, city, source, attribution,
                     choices_json, correct_idx as i64, timeout_secs as i64,
                     actual_lat, actual_lon,
                 ],
@@ -198,28 +222,28 @@ impl Db {
         .await
     }
 
-    pub async fn set_image_event_id(&self, image_id: i64, event_id: &str) -> Result<()> {
+    pub async fn set_guess_event_id(&self, guess_id: i64, event_id: &str) -> Result<()> {
         let event_id = event_id.to_owned();
         self.run(move |conn| {
             conn.execute(
-                "UPDATE images SET matrix_event_id = ?1 WHERE id = ?2",
-                params![event_id, image_id],
+                "UPDATE guesses SET matrix_event_id = ?1 WHERE id = ?2",
+                params![event_id, guess_id],
             )?;
             Ok(())
         })
         .await
     }
 
-    pub async fn finish_image(
+    pub async fn finish_guess(
         &self,
-        image_id:   i64,
-        n_answers:  usize,
-        n_correct:  usize,
+        guess_id:  i64,
+        n_answers: usize,
+        n_correct: usize,
     ) -> Result<()> {
         self.run(move |conn| {
             conn.execute(
-                "UPDATE images SET n_answers_received=?1, n_correct=?2 WHERE id=?3",
-                params![n_answers as i64, n_correct as i64, image_id],
+                "UPDATE guesses SET n_answers_received=?1, n_correct=?2 WHERE id=?3",
+                params![n_answers as i64, n_correct as i64, guess_id],
             )?;
             Ok(())
         })
@@ -231,7 +255,7 @@ impl Db {
         let country = country.to_owned();
         self.run(move |conn| {
             let n: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM images WHERE country = ?1",
+                "SELECT COUNT(*) FROM guesses WHERE country = ?1",
                 params![country],
                 |r| r.get(0),
             )?;
@@ -246,7 +270,7 @@ impl Db {
 impl Db {
     pub async fn record_answers(
         &self,
-        image_id:   i64,
+        guess_id:   i64,
         round_id:   i64,
         answers:    HashMap<String, AnswerRecord>,
         correct_idx: u8,
@@ -257,17 +281,17 @@ impl Db {
                 let is_correct = if rec.choice == correct_idx { 1i64 } else { 0 };
                 tx.execute(
                     "INSERT INTO answers
-                       (image_id, round_id, user_id, choice_index, is_correct,
+                       (guess_id, round_id, user_id, choice_index, is_correct,
                         source, submitted_at, changed_answer)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-                     ON CONFLICT(image_id, user_id) DO UPDATE SET
+                     ON CONFLICT(guess_id, user_id) DO UPDATE SET
                        choice_index   = excluded.choice_index,
                        is_correct     = excluded.is_correct,
                        source         = excluded.source,
                        submitted_at   = excluded.submitted_at,
                        changed_answer = excluded.changed_answer",
                     params![
-                        image_id, round_id, user_id,
+                        guess_id, round_id, user_id,
                         rec.choice as i64, is_correct,
                         rec.source, rec.submitted_at.to_rfc3339(),
                         if rec.changed_answer { 1i64 } else { 0 },
@@ -323,7 +347,7 @@ impl Db {
     /// Record free-guess answers (distance + score instead of correct/wrong).
     pub async fn record_free_guess_answers(
         &self,
-        image_id:  i64,
+        guess_id:  i64,
         round_id:  i64,
         guesses:   Vec<(String, String, f64, f64, f64, i64)>,
         // (user_id, guess_text, guess_lat, guess_lon, distance_km, score)
@@ -333,16 +357,16 @@ impl Db {
             for (user_id, guess_text, guess_lat, guess_lon, distance_km, score) in &guesses {
                 tx.execute(
                     "INSERT INTO answers
-                       (image_id, round_id, user_id, choice_index, is_correct, source,
+                       (guess_id, round_id, user_id, choice_index, is_correct, source,
                         guess_text, guess_lat, guess_lon, distance_km, score)
                      VALUES (?1,?2,?3,0,0,'free_guess',?4,?5,?6,?7,?8)
-                     ON CONFLICT(image_id, user_id) DO UPDATE SET
+                     ON CONFLICT(guess_id, user_id) DO UPDATE SET
                        guess_text   = excluded.guess_text,
                        guess_lat    = excluded.guess_lat,
                        guess_lon    = excluded.guess_lon,
                        distance_km  = excluded.distance_km,
                        score        = excluded.score",
-                    params![image_id, round_id, user_id, guess_text, guess_lat, guess_lon, distance_km, score],
+                    params![guess_id, round_id, user_id, guess_text, guess_lat, guess_lon, distance_km, score],
                 )?;
                 tx.execute(
                     "INSERT INTO players (user_id) VALUES (?1)
@@ -392,7 +416,7 @@ impl Db {
             let mut stmt = conn.prepare(
                 "SELECT user_id,
                         SUM(score)         AS total_score,
-                        COUNT(*)           AS images_played,
+                        COUNT(*)           AS guesses_played,
                         AVG(distance_km)   AS avg_distance_km,
                         MIN(distance_km)   AS best_distance_km
                    FROM answers
@@ -404,7 +428,7 @@ impl Db {
             let rows = stmt.query_map([round_id], |r| Ok(RoundStatsEntry {
                 user_id:          r.get(0)?,
                 total_score:      r.get(1)?,
-                images_played:    r.get(2)?,
+                guesses_played:   r.get(2)?,
                 avg_distance_km:  r.get(3)?,
                 best_distance_km: r.get(4)?,
             }))?;
@@ -417,15 +441,15 @@ impl Db {
         self.run(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT rs.user_id,
-                        SUM(rs.total_score)               AS total_score,
-                        COUNT(DISTINCT rs.round_id)       AS rounds_played,
-                        COALESCE(a.images_played, 0)      AS images_played,
-                        COALESCE(a.avg_distance_km, 0.0)  AS avg_distance_km,
-                        COALESCE(a.best_distance_km, 0.0) AS best_distance_km
+                        SUM(rs.total_score)                AS total_score,
+                        COUNT(DISTINCT rs.round_id)        AS rounds_played,
+                        COALESCE(a.guesses_played, 0)      AS guesses_played,
+                        COALESCE(a.avg_distance_km, 0.0)   AS avg_distance_km,
+                        COALESCE(a.best_distance_km, 0.0)  AS best_distance_km
                    FROM round_scores rs
                    LEFT JOIN (
                        SELECT user_id,
-                              COUNT(*)          AS images_played,
+                              COUNT(*)          AS guesses_played,
                               AVG(distance_km)  AS avg_distance_km,
                               MIN(distance_km)  AS best_distance_km
                          FROM answers
@@ -438,7 +462,7 @@ impl Db {
                 user_id:          r.get(0)?,
                 total_score:      r.get(1)?,
                 rounds_played:    r.get(2)?,
-                images_played:    r.get(3)?,
+                guesses_played:   r.get(3)?,
                 avg_distance_km:  r.get(4)?,
                 best_distance_km: r.get(5)?,
             }))?;
@@ -495,13 +519,13 @@ impl Db {
     pub async fn country_stats(&self) -> Result<Vec<CountryStat>> {
         self.run(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT i.country, i.region,
-                        COUNT(DISTINCT i.id)   AS times_asked,
+                "SELECT g.country, g.region,
+                        COUNT(DISTINCT g.id)   AS times_asked,
                         COUNT(a.id)            AS total_answers,
                         SUM(a.is_correct)      AS correct_answers
-                   FROM images i
-                   LEFT JOIN answers a ON a.image_id = i.id
-                  GROUP BY i.country
+                   FROM guesses g
+                   LEFT JOIN answers a ON a.guess_id = g.id
+                  GROUP BY g.country
                   ORDER BY times_asked DESC",
             )?;
             let rows = stmt.query_map([], |r| Ok(CountryStat {
@@ -520,11 +544,11 @@ impl Db {
         let user_id = user_id.to_owned();
         self.run(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT i.country, COUNT(*) AS answered, SUM(a.is_correct) AS correct
+                "SELECT g.country, COUNT(*) AS answered, SUM(a.is_correct) AS correct
                    FROM answers a
-                   JOIN images i ON i.id = a.image_id
+                   JOIN guesses g ON g.id = a.guess_id
                   WHERE a.user_id = ?1
-                  GROUP BY i.country
+                  GROUP BY g.country
                   ORDER BY (CAST(SUM(a.is_correct) AS REAL) / COUNT(*)) DESC",
             )?;
             let rows = stmt.query_map(params![user_id], |r| Ok(UserCountryStat {
@@ -542,12 +566,12 @@ impl Db {
             let mut stmt = conn.prepare(
                 "SELECT a.user_id,
                         AVG(CAST(
-                            (julianday(a.submitted_at) - julianday(i.asked_at))
+                            (julianday(a.submitted_at) - julianday(g.asked_at))
                             * 86400.0 AS REAL
                         )) AS avg_secs,
                         COUNT(*) AS sample_count
                    FROM answers a
-                   JOIN images i ON i.id = a.image_id
+                   JOIN guesses g ON g.id = a.guess_id
                   WHERE a.is_correct = 1
                   GROUP BY a.user_id
                  HAVING COUNT(*) >= 3
@@ -568,7 +592,7 @@ impl Db {
             conn.execute_batch(
                 "DELETE FROM answers;
                  DELETE FROM round_scores;
-                 DELETE FROM images;
+                 DELETE FROM guesses;
                  DELETE FROM rounds;
                  DELETE FROM players;",
             )?;

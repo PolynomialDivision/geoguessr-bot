@@ -9,16 +9,16 @@ CREATE TABLE IF NOT EXISTS players (
 CREATE TABLE IF NOT EXISTS rounds (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     room_id      TEXT NOT NULL,
-    n_images     INTEGER NOT NULL,
+    n_guesses    INTEGER NOT NULL,
     triggered_by TEXT NOT NULL,
     started_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     ended_at     TEXT
 );
 
-CREATE TABLE IF NOT EXISTS images (
+CREATE TABLE IF NOT EXISTS guesses (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     round_id            INTEGER NOT NULL REFERENCES rounds(id),
-    image_num           INTEGER NOT NULL,
+    guess_num           INTEGER NOT NULL,
     country             TEXT NOT NULL,
     region              TEXT NOT NULL,
     city                TEXT,
@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS images (
 
 CREATE TABLE IF NOT EXISTS answers (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    image_id      INTEGER NOT NULL REFERENCES images(id),
+    guess_id      INTEGER NOT NULL REFERENCES guesses(id),
     round_id      INTEGER NOT NULL REFERENCES rounds(id),
     user_id       TEXT NOT NULL,
     choice_index  INTEGER NOT NULL DEFAULT 0,
@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS answers (
     guess_lon     REAL,
     distance_km   REAL,
     score         INTEGER,
-    UNIQUE(image_id, user_id)
+    UNIQUE(guess_id, user_id)
 );
 
 CREATE TABLE IF NOT EXISTS round_scores (
