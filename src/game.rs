@@ -768,7 +768,7 @@ async fn post_reveal_free_guess(
         );
         let label = crate::geocode::reverse_geocode(guess.lat, guess.lon)
             .await
-            .unwrap_or_else(|| format!("{:.4}, {:.4}", guess.lat, guess.lon));
+            .unwrap_or_else(|| format!("{:.2}, {:.2}", guess.lat, guess.lon));
         guess_labels.push(format!("[{label}]({osm_url})"));
     }
 
