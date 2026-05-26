@@ -240,14 +240,6 @@ pub async fn start_round(
                         ctx.dm_rooms.lock().await
                             .insert(dm_room_id.clone(), uid.clone());
 
-                        // Game-start notice in the DM (brief — they got the full how-to on reaction).
-                        if let Some(dm_room) = client.get_room(&dm_room_id) {
-                            dm_room.send(format::mentionify(
-                                "🌍 Game starting · first guess incoming…",
-                            ))
-                            .await
-                            .ok();
-                        }
                         dm_map.insert(uid.clone(), dm_room_id);
                     }
                     Err(e) => warn!("Could not open DM with {uid}: {e}"),
@@ -274,11 +266,6 @@ pub async fn start_round(
             if !manual {
                 let reminder_secs = reminder_before_secs_cfg;
                 if reminder_secs > 0 {
-                    room.send(format::mentionify(&format!(
-                        "🌍 GeoGuessr starts in {} · get ready!",
-                        format_duration(reminder_secs),
-                    )))
-                    .await?;
                     tokio::time::sleep(tokio::time::Duration::from_secs(reminder_secs)).await;
                 }
             }
@@ -582,31 +569,22 @@ async fn play_free_guess(
 
     // Show the "can't find the chat?" hint only once per round, below the first batch of photos.
     // Plain variant: used in countdown edits (plain-text). HTML variant: used in the initial send.
-    let (dm_hint_plain, dm_hint_html) = if !dm_participants.is_empty() && guess_num == 1 {
-        let plain = "\n💬 Check your DMs.".to_owned();
-        let html  = format!(
-            "<br>💬 <a href=\"https://matrix.to/#/{bot_mxid}\">Open bot DM</a>"
-        );
-        (plain, html)
-    } else {
-        (String::new(), String::new())
-    };
-
     let q_event = if dm_participants.is_empty() {
         room.send(format::mentionify(&format!(
             "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}\n\
              📍 Where is this? Type: **!guess** city, country, or lat,lon",
         ))).await?
-    } else {
-        let plain = format!(
-            "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}\n\
-             Answers in private chat.{dm_hint_plain}"
-        );
-        let html = format!(
-            "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}<br>\
-             Answers in private chat.{dm_hint_html}"
+    } else if guess_num == 1 {
+        let plain = format!("🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str} | 💬 Open DM");
+        let html  = format!(
+            "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str} | \
+             💬 <a href=\"https://matrix.to/#/{bot_mxid}\">Open DM</a>"
         );
         room.send(RoomMessageEventContent::text_html(plain, html)).await?
+    } else {
+        room.send(format::mentionify(&format!(
+            "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}",
+        ))).await?
     };
     let q_event_id = q_event.response.event_id.clone();
 
@@ -630,9 +608,9 @@ async fn play_free_guess(
         if let Some(dm_room) = client.get_room(dm_room_id) {
             for (i, (mxc_uri, _mime)) in all_images.iter().enumerate() {
                 let label = if n_imgs == 1 {
-                    img.attribution.clone().unwrap_or_else(|| "📍 Where was this taken?".to_owned())
+                    "📍 Where is this?".to_owned()
                 } else {
-                    format!("📍 Photo {}/{}", i + 1, n_imgs)
+                    format!("📍 {}/{}", i + 1, n_imgs)
                 };
                 let dm_img = ImageMessageEventContent::plain(label, mxc_uri.clone());
                 dm_room.send(RoomMessageEventContent::new(MessageType::Image(dm_img))).await.ok();
@@ -668,16 +646,17 @@ async fn play_free_guess(
                 "🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar}\n\
                  📍 Where is this? Type: **!guess** city, country, or lat,lon",
             ))
-        } else {
-            let plain = format!(
-                "🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar}\n\
-                 Answers in private chat.{dm_hint_plain}"
-            );
-            let html = format!(
-                "🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar}<br>\
-                 Answers in private chat.{dm_hint_html}"
+        } else if guess_num == 1 {
+            let plain = format!("🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar} | 💬 Open DM");
+            let html  = format!(
+                "🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar} | \
+                 💬 <a href=\"https://matrix.to/#/{bot_mxid}\">Open DM</a>"
             );
             RoomMessageEventContent::text_html(plain, html)
+        } else {
+            format::mentionify(&format!(
+                "🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar}",
+            ))
         };
         if let Some(r) = client.get_room(&ctx.room_id) {
             let edit = edit_msg
@@ -789,7 +768,7 @@ async fn post_reveal_free_guess(
         .await
         {
             if let Ok(resp) = client.media().upload(&map_mime, png, None).await {
-                let label = format!("🥇 Best guess — {} away", format_dist(d));
+                let label = format!("🥇 Best guess · {} away", format_dist(d));
                 let img = ImageMessageEventContent::plain(label, resp.content_uri);
                 if let Some(r) = client.get_room(&ctx.room_id) {
                     r.send(RoomMessageEventContent::new(MessageType::Image(img))).await.ok();
@@ -1346,17 +1325,10 @@ fn build_question_text(
     let mut lines = vec![
         format!("🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar}"),
         String::new(),
-        "📍 Where is this?".to_owned(),
-        String::new(),
     ];
     for (i, choice) in choices.iter().enumerate() {
         lines.push(format!("{}  {}", CHOICE_EMOJIS[i], choice));
     }
-    lines.push(String::new());
-    lines.push(format!(
-        "React with {} to answer!",
-        CHOICE_EMOJIS[..choices.len()].join("  "),
-    ));
     lines.join("\n")
 }
 
@@ -1625,11 +1597,6 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         match get_or_create_dm(&client, uid).await {
             Ok(dm_room_id) => {
                 ctx.dm_rooms.lock().await.insert(dm_room_id.clone(), uid.clone());
-                if let Some(dm_room) = client.get_room(&dm_room_id) {
-                    dm_room.send(format::mentionify(
-                        "🌍 Game starting · first guess incoming…",
-                    )).await.ok();
-                }
                 dm_map.insert(uid.clone(), dm_room_id);
             }
             Err(e) => warn!("resume_pending_join: could not open DM with {uid}: {e}"),
