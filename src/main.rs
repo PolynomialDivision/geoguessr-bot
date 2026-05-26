@@ -23,6 +23,7 @@ use matrix_sdk::{
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
+mod avatar;
 mod commands;
 mod config;
 mod countries;

@@ -4,13 +4,15 @@
 //! All tile fetching is synchronous — call via `tokio::task::spawn_blocking`.
 
 use staticmap::{
-    tools::{CircleBuilder, Color, LineBuilder},
+    tools::{CircleBuilder, Color, IconBuilder, LineBuilder},
     StaticMapBuilder,
 };
+use crate::avatar::{PIN_ANCHOR_X, PIN_ANCHOR_Y};
 
 // ── Colour palette for multi-player round maps ────────────────────────────────
 // (R, G, B, chat_emoji)  — visually distinct, works on both light and dark maps.
-const PLAYER_COLORS: &[(u8, u8, u8, &str)] = &[
+// `pub` so game.rs can look up the colour for each player when rendering pins.
+pub const PLAYER_COLORS: &[(u8, u8, u8, &str)] = &[
     ( 50, 120, 255, "🔵"),  // blue
     (220,  60,  60, "🔴"),  // red
     ( 50, 195,  80, "🟢"),  // green
@@ -67,12 +69,16 @@ pub fn render_guess_map(
 
 /// Render a 700×500 PNG showing every player's guess and the actual location.
 ///
+/// `guesses` is `(display_name, lat, lon, avatar_pin_png)`.
+/// `avatar_pin_png` is a pre-rendered 40×52 PNG produced by
+/// `avatar::render_avatar_pin`.  Pass `None` to fall back to a plain circle.
+///
 /// Returns `(png_bytes, legend)` where `legend` is a `Vec<(display_name, emoji)>`
 /// in the same order as `guesses`, ready for posting as a chat message.
 ///
 /// The map auto-fits to contain all points (no manual zoom needed).
 pub fn render_round_map(
-    guesses:    &[(String, f64, f64)],   // (display_name, lat, lon)
+    guesses:    &[(String, f64, f64, Option<Vec<u8>>)],   // (name, lat, lon, pin_png)
     actual_lat: f64,
     actual_lon: f64,
 ) -> Option<(Vec<u8>, Vec<(String, &'static str)>)> {
@@ -84,17 +90,34 @@ pub fn render_round_map(
         .build()
         .ok()?;
 
-    // ── Lines first so they render behind the circles ─────────────────────────
-    for (idx, (_name, lat, lon)) in guesses.iter().enumerate() {
+    // ── Lines first so they render behind the markers ─────────────────────────
+    for (idx, (_name, lat, lon, _pin)) in guesses.iter().enumerate() {
         let (r, g, b, _) = PLAYER_COLORS[idx % PLAYER_COLORS.len()];
         add_line(&mut map, *lat, *lon, actual_lat, actual_lon, r, g, b);
     }
 
-    // ── Player circles ────────────────────────────────────────────────────────
+    // ── Player markers (avatar pin or plain circle fallback) ──────────────────
     let mut legend: Vec<(String, &'static str)> = Vec::new();
-    for (idx, (name, lat, lon)) in guesses.iter().enumerate() {
+    for (idx, (name, lat, lon, pin_png)) in guesses.iter().enumerate() {
         let (r, g, b, emoji) = PLAYER_COLORS[idx % PLAYER_COLORS.len()];
-        add_circle(&mut map, *lat, *lon, r, g, b);
+
+        let placed = pin_png.as_ref().and_then(|png| {
+            IconBuilder::new()
+                .lat_coordinate(*lat)
+                .lon_coordinate(*lon)
+                .x_offset(PIN_ANCHOR_X)
+                .y_offset(PIN_ANCHOR_Y)
+                .data(png.as_slice())
+                .and_then(|b| b.build())
+                .ok()
+        });
+
+        if let Some(icon) = placed {
+            map.add_tool(icon);
+        } else {
+            add_circle(&mut map, *lat, *lon, r, g, b);
+        }
+
         legend.push((name.clone(), emoji));
     }
 

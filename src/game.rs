@@ -9,6 +9,7 @@ use matrix_sdk::{
     ruma::{
         OwnedEventId, OwnedRoomId, OwnedUserId,
         events::{
+            Mentions,
             reaction::ReactionEventContent,
             relation::Annotation,
             room::message::{
@@ -150,7 +151,13 @@ pub async fn start_round(
                 format_duration(reminder_secs),
                 emoji,
             );
-            let join_event    = room.send(format::mentionify(&join_msg)).await?;
+            let mut join_content = format::mentionify(&join_msg);
+            join_content = join_content.add_mentions({
+                let mut m = Mentions::new();
+                m.room = true;
+                m
+            });
+            let join_event    = room.send(join_content).await?;
             let join_event_id = join_event.response.event_id.clone();
 
             // Bot reacts first (this "primes" the emoji so clients show it).
@@ -249,12 +256,16 @@ pub async fn start_round(
             let participant_list: Vec<String> = dm_map.keys()
                 .map(|u| u.to_string())
                 .collect();
-            room.send(format::mentionify(&format!(
-                "🌍 GeoGuessr starting now! {} player{}: {}",
-                dm_map.len(),
-                if dm_map.len() == 1 { "" } else { "s" },
-                participant_list.join(", "),
-            )))
+            let participant_ids: Vec<OwnedUserId> = dm_map.keys().cloned().collect();
+            room.send(
+                format::mentionify(&format!(
+                    "🌍 GeoGuessr starting now! {} player{}: {}",
+                    dm_map.len(),
+                    if dm_map.len() == 1 { "" } else { "s" },
+                    participant_list.join(", "),
+                ))
+                .add_mentions(Mentions::with_user_ids(participant_ids)),
+            )
             .await
             .ok();
 
@@ -439,7 +450,15 @@ async fn play_guess(
 
     let total_secs    = answer_timeout_secs;
     let question_text = build_question_text(guess_num, n_total, &choices, total_secs, total_secs);
-    let q_event       = room.send(format::mentionify(&question_text)).await?;
+    // @room on the first question of every round so people get a push notification.
+    // Subsequent questions in the same round don't need it — players are already watching.
+    let mut q_content = format::mentionify(&question_text);
+    if guess_num == 1 {
+        let mut m = Mentions::new();
+        m.room = true;
+        q_content = q_content.add_mentions(m);
+    }
+    let q_event       = room.send(q_content).await?;
     let q_event_id    = q_event.response.event_id.clone();
 
     ctx.db.set_guess_event_id(guess_id, q_event_id.as_str()).await.ok();
@@ -702,11 +721,12 @@ async fn play_free_guess(
     }
 
     let user_ids: Vec<&str> = scored.iter().map(|(uid, _, _, _)| uid.as_str()).collect();
-    let names = fetch_names(room, &user_ids).await;
+    let names        = fetch_names(room, &user_ids).await;
+    let raw_avatars  = crate::avatar::fetch_player_avatars(room, &user_ids).await;
     post_reveal_free_guess(
         ctx, client, img,
         actual_lat, actual_lon,
-        &scored, &names, dm_participants,
+        &scored, &names, &raw_avatars, dm_participants,
     )
     .await;
 
@@ -721,6 +741,7 @@ async fn post_reveal_free_guess(
     actual_lon:      f64,
     scored:          &[(String, FreeGuess, f64, i64)],
     names:           &HashMap<String, String>,
+    raw_avatars:     &HashMap<String, Vec<u8>>,
     dm_participants: &HashMap<OwnedUserId, OwnedRoomId>,
 ) {
     let location_str = match &img.city {
@@ -779,13 +800,31 @@ async fn post_reveal_free_guess(
 
     // 2. Combined round map — only when 2+ players guessed.
     if scored.len() >= 2 {
-        let guess_data: Vec<(String, f64, f64)> = scored
+        // Collect (name, lat, lon, raw_avatar_bytes) — avatar rendering happens
+        // inside spawn_blocking alongside the map rendering (both CPU-bound).
+        let guess_data_raw: Vec<(String, f64, f64, Option<Vec<u8>>)> = scored
             .iter()
-            .map(|(uid, guess, _, _)| (display_name(names, uid).to_owned(), guess.lat, guess.lon))
+            .map(|(uid, guess, _, _)| {
+                let raw = raw_avatars.get(uid.as_str()).cloned();
+                (display_name(names, uid).to_owned(), guess.lat, guess.lon, raw)
+            })
             .collect();
 
         if let Ok(Some((png, legend))) = tokio::task::spawn_blocking(move || {
-            crate::mapimage::render_round_map(&guess_data, actual_lat, actual_lon)
+            use crate::mapimage::PLAYER_COLORS;
+            // Render each avatar into a pin PNG, then build the round map.
+            let guess_pins: Vec<(String, f64, f64, Option<Vec<u8>>)> = guess_data_raw
+                .into_iter()
+                .enumerate()
+                .map(|(idx, (name, lat, lon, raw))| {
+                    let (pr, pg, pb, _) = PLAYER_COLORS[idx % PLAYER_COLORS.len()];
+                    let pin = crate::avatar::render_avatar_pin(
+                        raw.as_deref(), pr, pg, pb,
+                    );
+                    (name, lat, lon, pin)
+                })
+                .collect();
+            crate::mapimage::render_round_map(&guess_pins, actual_lat, actual_lon)
         })
         .await
         {
@@ -1606,12 +1645,16 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
     let participant_list: Vec<String> = dm_map.keys()
         .map(|u| u.to_string())
         .collect();
-    room.send(format::mentionify(&format!(
-        "🌍 GeoGuessr starting now! {} player{}: {}",
-        dm_map.len(),
-        if dm_map.len() == 1 { "" } else { "s" },
-        participant_list.join(", "),
-    ))).await.ok();
+    let participant_ids: Vec<OwnedUserId> = dm_map.keys().cloned().collect();
+    room.send(
+        format::mentionify(&format!(
+            "🌍 GeoGuessr starting now! {} player{}: {}",
+            dm_map.len(),
+            if dm_map.len() == 1 { "" } else { "s" },
+            participant_list.join(", "),
+        ))
+        .add_mentions(Mentions::with_user_ids(participant_ids)),
+    ).await.ok();
 
     // Pre-fetch and run images.
     prefetch_if_needed(&ctx, n + 2).await;
