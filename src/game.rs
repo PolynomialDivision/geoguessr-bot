@@ -736,10 +736,12 @@ async fn play_free_guess(
     let names        = fetch_names(room, &user_ids).await;
     let raw_avatars  = crate::avatar::fetch_player_avatars(room, &user_ids).await;
     let avatar_mxcs  = fetch_avatar_mxc_urls(room, &user_ids).await;
+    // Collect the MXC URIs of the location photos so reveal.html can show them.
+    let image_mxcs: Vec<String> = all_images.iter().map(|(mxc, _)| mxc.to_string()).collect();
     post_reveal_free_guess(
         ctx, client, img,
         actual_lat, actual_lon,
-        &scored, &names, &raw_avatars, &avatar_mxcs, dm_participants,
+        &scored, &names, &raw_avatars, &avatar_mxcs, &image_mxcs, dm_participants,
     )
     .await;
 
@@ -756,6 +758,7 @@ async fn post_reveal_free_guess(
     names:           &HashMap<String, String>,
     raw_avatars:     &HashMap<String, Vec<u8>>,
     avatar_mxcs:     &HashMap<String, String>,
+    image_mxcs:      &[String],
     dm_participants: &HashMap<OwnedUserId, OwnedRoomId>,
 ) {
     let location_str = match &img.city {
@@ -777,7 +780,7 @@ async fn post_reveal_free_guess(
         let mxc = avatar_mxcs.get(uid.as_str()).cloned().unwrap_or_default();
         let map_url = build_guess_map_url(
             guess.lat, guess.lon, actual_lat, actual_lon, r, g, b, "en",
-            &mxc, *score, *dist,
+            &mxc, *score, *dist, image_mxcs,
         );
         let label = crate::geocode::reverse_geocode(guess.lat, guess.lon, "en")
             .await
@@ -788,7 +791,7 @@ async fn post_reveal_free_guess(
 
     // ── Build "all guesses" overview map URL ──────────────────────────────────
     let overview_url = if !overview_entries.is_empty() {
-        build_all_guesses_map_url(&overview_entries, actual_lat, actual_lon, names)
+        build_all_guesses_map_url(&overview_entries, actual_lat, actual_lon, names, image_mxcs)
     } else {
         maps_url.clone()
     };
@@ -910,7 +913,7 @@ async fn post_reveal_free_guess(
         // Geocode the player's guess in their language + build an interactive map link.
         let (pr, pg, pb, _) = crate::mapimage::PLAYER_COLORS[rank_0 % crate::mapimage::PLAYER_COLORS.len()];
         let mxc = avatar_mxcs.get(uid.as_str()).map(|s| s.as_str()).unwrap_or("");
-        let guess_map_url = build_guess_map_url(guess.lat, guess.lon, actual_lat, actual_lon, pr, pg, pb, &lang, mxc, *score, *dist);
+        let guess_map_url = build_guess_map_url(guess.lat, guess.lon, actual_lat, actual_lon, pr, pg, pb, &lang, mxc, *score, *dist, image_mxcs);
         let guess_label = crate::geocode::reverse_geocode(guess.lat, guess.lon, &lang)
             .await
             .unwrap_or_else(|| format!("{:.2}, {:.2}", guess.lat, guess.lon));
@@ -1536,18 +1539,23 @@ fn build_guess_map_url(
     guess_lat:  f64, guess_lon:  f64,
     actual_lat: f64, actual_lon: f64,
     r: u8, g: u8, b: u8,
-    lang:    &str,
-    mxc:     &str,
-    score:   i64,
-    dist_km: f64,
+    lang:       &str,
+    mxc:        &str,
+    score:      i64,
+    dist_km:    f64,
+    image_mxcs: &[String],
 ) -> String {
     let mxc_enc = url_encode_component(mxc);
-    format!(
+    let mut url = format!(
         "https://polynomialdivision.github.io/geo-picker/reveal.html\
          ?lang={lang}&alat={actual_lat:.4}&alon={actual_lon:.4}\
          &glat={guess_lat:.4}&glon={guess_lon:.4}&color={r:02X}{g:02X}{b:02X}\
          &mxc={mxc_enc}&score={score}&dist={dist_km:.1}"
-    )
+    );
+    for img in image_mxcs {
+        url.push_str(&format!("&img={}", url_encode_component(img)));
+    }
+    url
 }
 
 /// Build a reveal.html URL showing every player's guess and the actual location.
@@ -1557,6 +1565,7 @@ fn build_all_guesses_map_url(
     actual_lat: f64,
     actual_lon: f64,
     names:      &HashMap<String, String>,
+    image_mxcs: &[String],
 ) -> String {
     let mut url = format!(
         "https://polynomialdivision.github.io/geo-picker/reveal.html\
@@ -1568,6 +1577,9 @@ fn build_all_guesses_map_url(
         url.push_str(&format!(
             "&g={name}|{lat:.4}|{lon:.4}|{r:02X}{g:02X}{b:02X}|{mxc_enc}|{score}|{dist:.1}"
         ));
+    }
+    for img in image_mxcs {
+        url.push_str(&format!("&img={}", url_encode_component(img)));
     }
     url
 }
