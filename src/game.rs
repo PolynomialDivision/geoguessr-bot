@@ -772,7 +772,7 @@ async fn post_reveal_free_guess(
     for (i, (uid, guess, _, _)) in scored.iter().enumerate() {
         let (r, g, b, _) = crate::mapimage::PLAYER_COLORS[i % crate::mapimage::PLAYER_COLORS.len()];
         let map_url = build_guess_map_url(
-            guess.lat, guess.lon, actual_lat, actual_lon, r, g, b,
+            guess.lat, guess.lon, actual_lat, actual_lon, r, g, b, "en",
         );
         let label = crate::geocode::reverse_geocode(guess.lat, guess.lon, "en")
             .await
@@ -904,7 +904,7 @@ async fn post_reveal_free_guess(
 
         // Geocode the player's guess in their language + build an interactive map link.
         let (pr, pg, pb, _) = crate::mapimage::PLAYER_COLORS[rank_0 % crate::mapimage::PLAYER_COLORS.len()];
-        let guess_map_url = build_guess_map_url(guess.lat, guess.lon, actual_lat, actual_lon, pr, pg, pb);
+        let guess_map_url = build_guess_map_url(guess.lat, guess.lon, actual_lat, actual_lon, pr, pg, pb, &lang);
         let guess_label = crate::geocode::reverse_geocode(guess.lat, guess.lon, &lang)
             .await
             .unwrap_or_else(|| format!("{:.2}, {:.2}", guess.lat, guess.lon));
@@ -1530,75 +1530,31 @@ fn build_guess_map_url(
     guess_lat:  f64, guess_lon:  f64,
     actual_lat: f64, actual_lon: f64,
     r: u8, g: u8, b: u8,
+    lang: &str,
 ) -> String {
-    let color = format!("#{r:02X}{g:02X}{b:02X}");
-    // GeoJSON coordinates are [longitude, latitude]
-    let geojson = serde_json::json!({
-        "type": "FeatureCollection",
-        "features": [
-            {
-                "type": "Feature",
-                "properties": { "name": "Guess", "marker-color": color },
-                "geometry": { "type": "Point", "coordinates": [guess_lon, guess_lat] }
-            },
-            {
-                "type": "Feature",
-                "properties": { "name": "Actual location", "marker-color": "#141414" },
-                "geometry": { "type": "Point", "coordinates": [actual_lon, actual_lat] }
-            },
-            {
-                "type": "Feature",
-                "properties": { "stroke": color, "stroke-width": 3 },
-                "geometry": {
-                    "type": "LineString",
-                    "coordinates": [[guess_lon, guess_lat], [actual_lon, actual_lat]]
-                }
-            }
-        ]
-    });
-    let encoded = url_encode_component(&geojson.to_string());
-    format!("https://geojson.io/#data=data:application/json,{encoded}")
+    format!(
+        "https://polynomialdivision.github.io/geo-picker/reveal.html\
+         ?lang={lang}&alat={actual_lat:.4}&alon={actual_lon:.4}\
+         &glat={guess_lat:.4}&glon={guess_lon:.4}&color={r:02X}{g:02X}{b:02X}"
+    )
 }
 
-/// Build a geojson.io URL showing every player's guess, the actual location,
-/// and a coloured line per player — the interactive equivalent of the round map PNG.
+/// Build a reveal.html URL showing every player's guess and the actual location.
 fn build_all_guesses_map_url(
     entries:    &[(&str, f64, f64, u8, u8, u8)],  // (uid, lat, lon, r, g, b)
     actual_lat: f64,
     actual_lon: f64,
     names:      &HashMap<String, String>,
 ) -> String {
-    let mut features: Vec<serde_json::Value> = Vec::new();
-
+    let mut url = format!(
+        "https://polynomialdivision.github.io/geo-picker/reveal.html\
+         ?lang=en&alat={actual_lat:.4}&alon={actual_lon:.4}"
+    );
     for (uid, lat, lon, r, g, b) in entries {
-        let color = format!("#{r:02X}{g:02X}{b:02X}");
-        let name  = display_name(names, uid);
-        // Line first so it renders below the markers
-        features.push(serde_json::json!({
-            "type": "Feature",
-            "properties": { "stroke": color, "stroke-width": 2 },
-            "geometry": {
-                "type": "LineString",
-                "coordinates": [[lon, lat], [actual_lon, actual_lat]]
-            }
-        }));
-        features.push(serde_json::json!({
-            "type": "Feature",
-            "properties": { "name": name, "marker-color": color },
-            "geometry": { "type": "Point", "coordinates": [lon, lat] }
-        }));
+        let name = url_encode_component(display_name(names, uid));
+        url.push_str(&format!("&g={name}|{lat:.4}|{lon:.4}|{r:02X}{g:02X}{b:02X}"));
     }
-
-    // Actual location on top
-    features.push(serde_json::json!({
-        "type": "Feature",
-        "properties": { "name": "Actual location", "marker-color": "#141414" },
-        "geometry": { "type": "Point", "coordinates": [actual_lon, actual_lat] }
-    }));
-
-    let geojson  = serde_json::json!({ "type": "FeatureCollection", "features": features });
-    let encoded  = url_encode_component(&geojson.to_string());
-    format!("https://geojson.io/#data=data:application/json,{encoded}")
+    url
 }
 
 /// Percent-encode using the RFC 3986 unreserved-character set
