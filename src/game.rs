@@ -761,15 +761,15 @@ async fn post_reveal_free_guess(
 
     // ── Reverse-geocode each guess for human-readable labels ─────────────────
     let mut guess_labels: Vec<String> = Vec::with_capacity(scored.len());
-    for (_, guess, _, _) in scored.iter() {
-        let osm_url = format!(
-            "https://www.openstreetmap.org/?mlat={:.5}&mlon={:.5}#map=10/{:.5}/{:.5}",
-            guess.lat, guess.lon, guess.lat, guess.lon,
+    for (i, (_, guess, _, _)) in scored.iter().enumerate() {
+        let (r, g, b, _) = crate::mapimage::PLAYER_COLORS[i % crate::mapimage::PLAYER_COLORS.len()];
+        let map_url = build_guess_map_url(
+            guess.lat, guess.lon, actual_lat, actual_lon, r, g, b,
         );
         let label = crate::geocode::reverse_geocode(guess.lat, guess.lon)
             .await
             .unwrap_or_else(|| format!("{:.2}, {:.2}", guess.lat, guess.lon));
-        guess_labels.push(format!("[{label}]({osm_url})"));
+        guess_labels.push(format!("[{label}]({map_url})"));
     }
 
     // ── Main-room reveal ──────────────────────────────────────────────────────
@@ -1412,6 +1412,62 @@ pub fn format_duration(secs: u64) -> String {
     } else {
         format!("{secs}s")
     }
+}
+
+/// Build a geojson.io URL that shows:
+///   • the player's guess marker in their assigned colour
+///   • the actual location marker in dark/black
+///   • a coloured line connecting the two
+///
+/// Everything is encoded in the URL fragment so no server state is needed.
+/// The base map on geojson.io uses OSM-based tiles.
+fn build_guess_map_url(
+    guess_lat:  f64, guess_lon:  f64,
+    actual_lat: f64, actual_lon: f64,
+    r: u8, g: u8, b: u8,
+) -> String {
+    let color = format!("#{r:02X}{g:02X}{b:02X}");
+    // GeoJSON coordinates are [longitude, latitude]
+    let geojson = serde_json::json!({
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": { "name": "Guess", "marker-color": color },
+                "geometry": { "type": "Point", "coordinates": [guess_lon, guess_lat] }
+            },
+            {
+                "type": "Feature",
+                "properties": { "name": "Actual location", "marker-color": "#141414" },
+                "geometry": { "type": "Point", "coordinates": [actual_lon, actual_lat] }
+            },
+            {
+                "type": "Feature",
+                "properties": { "stroke": color, "stroke-width": 3 },
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[guess_lon, guess_lat], [actual_lon, actual_lat]]
+                }
+            }
+        ]
+    });
+    let encoded = url_encode_component(&geojson.to_string());
+    format!("https://geojson.io/#data=data:application/json,{encoded}")
+}
+
+/// Percent-encode using the RFC 3986 unreserved-character set
+/// (equivalent to JavaScript's `encodeURIComponent`).
+fn url_encode_component(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => { let _ = write!(out, "%{b:02X}"); }
+        }
+    }
+    out
 }
 
 fn display_name<'a>(names: &'a HashMap<String, String>, uid: &'a str) -> &'a str {
