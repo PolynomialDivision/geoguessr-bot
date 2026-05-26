@@ -759,6 +759,19 @@ async fn post_reveal_free_guess(
         actual_lat, actual_lon, actual_lat, actual_lon,
     );
 
+    // ── Reverse-geocode each guess for human-readable labels ─────────────────
+    let mut guess_labels: Vec<String> = Vec::with_capacity(scored.len());
+    for (_, guess, _, _) in scored.iter() {
+        let osm_url = format!(
+            "https://www.openstreetmap.org/?mlat={:.5}&mlon={:.5}#map=10/{:.5}/{:.5}",
+            guess.lat, guess.lon, guess.lat, guess.lon,
+        );
+        let label = crate::geocode::reverse_geocode(guess.lat, guess.lon)
+            .await
+            .unwrap_or_else(|| format!("{:.4}, {:.4}", guess.lat, guess.lon));
+        guess_labels.push(format!("[{label}]({osm_url})"));
+    }
+
     // ── Main-room reveal ──────────────────────────────────────────────────────
     let mut lines = vec![
         format!("📍 **{}** [Map]({})", location_str, maps_url),
@@ -768,12 +781,14 @@ async fn post_reveal_free_guess(
     if scored.is_empty() {
         lines.push("Nobody guessed.".to_owned());
     } else {
-        for (i, (uid, guess, dist, score)) in scored.iter().enumerate() {
+        for (i, ((uid, _guess, dist, score), guess_link)) in
+            scored.iter().zip(guess_labels.iter()).enumerate()
+        {
             let medal    = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
             let dist_str = format_dist(*dist);
             lines.push(format!(
-                "{medal} {} · \"{}\" · {} · {} pts",
-                uid, guess.text, dist_str, score,
+                "{medal} {} · {guess_link} · {} · {} pts",
+                uid, dist_str, score,
             ));
         }
     }

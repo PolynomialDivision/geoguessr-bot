@@ -202,13 +202,14 @@ fn add_circle(
     }
 }
 
-/// Draw the "actual location" marker: large white ring + small dark fill.
+/// Draw the "actual location" marker: large white ring + dark fill.
+/// Uses the same style as `render_round_map` so both maps are consistent.
 fn add_actual_marker(map: &mut staticmap::StaticMap, lat: f64, lon: f64) {
     if let Ok(ring) = CircleBuilder::new()
         .lat_coordinate(lat)
         .lon_coordinate(lon)
         .color(Color::new(true, 255, 255, 255, 255))
-        .radius(11.0)
+        .radius(15.0)
         .build()
     {
         map.add_tool(ring);
@@ -216,8 +217,8 @@ fn add_actual_marker(map: &mut staticmap::StaticMap, lat: f64, lon: f64) {
     if let Ok(fill) = CircleBuilder::new()
         .lat_coordinate(lat)
         .lon_coordinate(lon)
-        .color(Color::new(true, 220, 50, 50, 255))
-        .radius(8.0)
+        .color(Color::new(true, 20, 20, 20, 255))
+        .radius(9.0)
         .build()
     {
         map.add_tool(fill);

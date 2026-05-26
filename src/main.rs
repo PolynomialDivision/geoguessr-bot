@@ -25,6 +25,7 @@ use tracing::{error, info, warn};
 
 mod avatar;
 mod commands;
+mod geocode;
 mod config;
 mod countries;
 mod db;
