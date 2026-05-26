@@ -146,7 +146,7 @@ pub async fn start_round(
 
             // Post the join-prompt message.
             let join_msg = format!(
-                "🌍 GeoGuessr starts in {}! React with {} to join.\n\
+                "🌍 GeoGuessr starts in {}! @room React with {} to join.\n\
                  I'll invite you to a private chat · answer there.",
                 format_duration(reminder_secs),
                 emoji,
@@ -452,7 +452,12 @@ async fn play_guess(
     let question_text = build_question_text(guess_num, n_total, &choices, total_secs, total_secs);
     // @room on the first question of every round so people get a push notification.
     // Subsequent questions in the same round don't need it — players are already watching.
-    let mut q_content = format::mentionify(&question_text);
+    let initial_text = if guess_num == 1 {
+        format!("@room\n{question_text}")
+    } else {
+        question_text
+    };
+    let mut q_content = format::mentionify(&initial_text);
     if guess_num == 1 {
         let mut m = Mentions::new();
         m.room = true;
