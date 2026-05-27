@@ -506,6 +506,12 @@ async fn play_guess(
         }
     }
     tokio::time::sleep(tokio::time::Duration::from_secs(remaining)).await;
+    if let Some(r) = client.get_room(&ctx.room_id) {
+        let updated = build_question_text(guess_num, n_total, &choices, 0, total_secs);
+        let edit = RoomMessageEventContent::text_plain(&updated)
+            .make_replacement(ReplacementMetadata::new(q_event_id.clone(), None));
+        r.send(edit).await.ok();
+    }
 
     let mut answers = {
         let mut ag = ctx.active_game.lock().await;
