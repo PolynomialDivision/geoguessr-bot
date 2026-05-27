@@ -362,7 +362,7 @@ async fn main() -> Result<()> {
                             }
                             if let Some(r) = client.get_room(&dm_room_id) {
                                 r.send(format::mentionify(&format!(
-                                    "✅ Guess recorded: \"{query}\"\nWaiting for the timer to end…"
+                                    "✅ Guess recorded: \"{query}\"\nWaiting for the others or the timer…"
                                 )))
                                 .await
                                 .ok();

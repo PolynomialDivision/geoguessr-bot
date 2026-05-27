@@ -665,13 +665,33 @@ async fn play_free_guess(
 
     // Smooth countdown in the main room — edits the prompt message with a time bar.
     // DMs are not updated (avoids spamming participants).
+    // Early-exit: after each tick, check if every DM participant has already submitted.
     let edit_interval = (total_secs / 20).clamp(15, 900);
     let mut remaining = total_secs;
-    while remaining > edit_interval {
-        tokio::time::sleep(tokio::time::Duration::from_secs(edit_interval)).await;
-        remaining -= edit_interval;
-        let bar       = time_bar(remaining, total_secs);
-        let time_str  = format_duration(remaining);
+    let mut all_in    = false;
+
+    loop {
+        let sleep_secs = remaining.min(edit_interval);
+        tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
+        remaining -= sleep_secs;
+
+        // Early-exit check: all DM participants have submitted a guess.
+        if !dm_participants.is_empty() {
+            let ag = ctx.active_game.lock().await;
+            if let Some(ActiveGame {
+                mode: ActiveGameMode::FreeGuess { ref guesses, .. }, ..
+            }) = *ag
+            {
+                if dm_participants.keys().all(|uid| guesses.contains_key(uid.as_str())) {
+                    all_in = true;
+                }
+            }
+        }
+
+        if all_in || remaining == 0 { break; }
+
+        let bar      = time_bar(remaining, total_secs);
+        let time_str = format_duration(remaining);
         let edit_msg = if dm_participants.is_empty() {
             format::mentionify(&format!(
                 "🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar}\n\
@@ -695,7 +715,21 @@ async fn play_free_guess(
             r.send(edit).await.ok();
         }
     }
-    tokio::time::sleep(tokio::time::Duration::from_secs(remaining)).await;
+
+    // If everyone answered before the timer ran out, update the message and ping DMs.
+    if all_in {
+        let final_msg = format!("🌍 Guess {guess_num}/{n_total} | ⚡ All guesses in!");
+        if let Some(r) = client.get_room(&ctx.room_id) {
+            let edit = RoomMessageEventContent::text_plain(&final_msg)
+                .make_replacement(ReplacementMetadata::new(q_event_id.clone(), None));
+            r.send(edit).await.ok();
+        }
+        for dm_room_id in dm_participants.values() {
+            if let Some(dm_room) = client.get_room(dm_room_id) {
+                dm_room.send(format::mentionify("⚡ All guesses in! Calculating results…")).await.ok();
+            }
+        }
+    }
 
     // Collect guesses.
     let guesses = {
