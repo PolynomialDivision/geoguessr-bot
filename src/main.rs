@@ -83,10 +83,14 @@ pub struct BotContext {
     pub round_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
-fn thread_reply(text: &str, root: matrix_sdk::ruma::OwnedEventId) -> matrix_sdk::ruma::events::room::message::RoomMessageEventContent {
+fn thread_reply(
+    text:     &str,
+    root:     matrix_sdk::ruma::OwnedEventId,
+    reply_to: matrix_sdk::ruma::OwnedEventId,
+) -> matrix_sdk::ruma::events::room::message::RoomMessageEventContent {
     use matrix_sdk::ruma::events::{relation::Thread, room::message::Relation};
     let mut content = format::mentionify(text);
-    content.relates_to = Some(Relation::Thread(Thread::reply(root.clone(), root)));
+    content.relates_to = Some(Relation::Thread(Thread::reply(root, reply_to)));
     content
 }
 
@@ -279,7 +283,7 @@ async fn main() -> Result<()> {
                 match commands::handle(&ctx, &ev.sender, body).await {
                     Ok(Some(reply)) => {
                         if let Some(r) = client.get_room(&ctx.room_id) {
-                            r.send(thread_reply(&reply, thread_root)).await.ok();
+                            r.send(thread_reply(&reply, thread_root, ev.event_id.clone())).await.ok();
                         }
                     }
                     Err(e) if e.to_string() == "__not_admin__" => {
@@ -287,6 +291,7 @@ async fn main() -> Result<()> {
                             r.send(thread_reply(
                                 "❌ This command requires admin privileges.",
                                 thread_root,
+                                ev.event_id.clone(),
                             ))
                             .await
                             .ok();
