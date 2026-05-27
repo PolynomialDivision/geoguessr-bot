@@ -56,6 +56,39 @@ pub async fn fetch_player_avatars(
     map
 }
 
+/// Convert raw avatar bytes (any format the `image` crate supports) into a
+/// tiny `data:image/jpeg;base64,…` URL suitable for embedding in a query string.
+///
+/// The image is centre-cropped to square, resized to 48 × 48, and JPEG-encoded
+/// at quality 55 (~0.5–1 KB).  This lets `reveal.html` show real player photos
+/// even when the homeserver requires authentication for media endpoints.
+///
+/// Returns `None` if the bytes can't be decoded.
+pub fn avatar_bytes_to_data_url(bytes: &[u8]) -> Option<String> {
+    use base64::Engine as _;
+
+    let img = image::load_from_memory(bytes).ok()?;
+
+    // Centre-crop to square.
+    let (w, h) = (img.width(), img.height());
+    let side = w.min(h);
+    let img = img.crop_imm((w - side) / 2, (h - side) / 2, side, side);
+
+    // Resize to 48 × 48 (fast, small enough for URL embedding).
+    let img = img.resize_exact(48, 48, image::imageops::FilterType::Triangle);
+    // JPEG doesn't support alpha — convert to RGB first.
+    let rgb = img.into_rgb8();
+
+    // JPEG-encode at quality 55.
+    let mut jpeg_buf = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg_buf, 55)
+        .encode_image(&rgb)
+        .ok()?;
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_buf);
+    Some(format!("data:image/jpeg;base64,{b64}"))
+}
+
 /// Render a 40×52 PNG map pin for one player.
 ///
 /// * `avatar_bytes` – raw image bytes in any format the `image` crate supports

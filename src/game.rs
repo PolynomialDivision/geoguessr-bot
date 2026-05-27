@@ -735,7 +735,14 @@ async fn play_free_guess(
     let user_ids: Vec<&str> = scored.iter().map(|(uid, _, _, _)| uid.as_str()).collect();
     let names        = fetch_names(room, &user_ids).await;
     let raw_avatars  = crate::avatar::fetch_player_avatars(room, &user_ids).await;
-    let avatar_mxcs  = fetch_avatar_mxc_urls(room, &user_ids).await;
+    // Build data: URLs from the already-downloaded avatar bytes so reveal.html
+    // can show real photos without needing authenticated media access.
+    let avatar_mxcs: HashMap<String, String> = raw_avatars.iter()
+        .filter_map(|(uid, bytes)| {
+            crate::avatar::avatar_bytes_to_data_url(bytes)
+                .map(|url| (uid.clone(), url))
+        })
+        .collect();
     post_reveal_free_guess(
         ctx, client, img,
         actual_lat, actual_lon,
@@ -1598,21 +1605,6 @@ fn display_name<'a>(names: &'a HashMap<String, String>, uid: &'a str) -> &'a str
     })
 }
 
-/// Fetch each player's Matrix avatar_url (mxc://…) from their room member state.
-/// Returns an empty string for users without an avatar.
-async fn fetch_avatar_mxc_urls(room: &Room, user_ids: &[&str]) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for &uid_str in user_ids {
-        if let Ok(uid) = matrix_sdk::ruma::OwnedUserId::try_from(uid_str) {
-            if let Ok(Some(member)) = room.get_member(&uid).await {
-                if let Some(mxc) = member.avatar_url() {
-                    map.insert(uid_str.to_owned(), mxc.to_string());
-                }
-            }
-        }
-    }
-    map
-}
 
 async fn fetch_names(room: &Room, user_ids: &[&str]) -> HashMap<String, String> {
     let mut map = HashMap::new();
