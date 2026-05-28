@@ -129,12 +129,15 @@ async fn cmd_cancelgeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Re
 // ── !schedulegeo ──────────────────────────────────────────────────────────────
 //
 // Usage:
-//   !schedulegeo                              — list pending one-time games
-//   !schedulegeo HH:MM                        — schedule with config defaults
-//   !schedulegeo HH:MM reminder=N             — override reminder window (seconds)
-//   !schedulegeo HH:MM timeout=N              — override answer timeout (seconds)
-//   !schedulegeo HH:MM guesses=N              — override number of images per round
+//   !schedulegeo                                  — list pending one-time games
+//   !schedulegeo HH:MM                            — schedule with config defaults
+//   !schedulegeo HH:MM reminder=N                 — join-window before game (seconds)
+//   !schedulegeo HH:MM timeout=N                  — answer timeout (seconds)
+//   !schedulegeo HH:MM guesses=N                  — images per round
 //   !schedulegeo HH:MM reminder=N timeout=N guesses=N
+//
+// Schedules for today if the game time is still in the future; tomorrow otherwise.
+// If the join window has already started but the game hasn't, the window is trimmed.
 
 async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
     require_admin(ctx, sender)?;
@@ -215,18 +218,31 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
         + local_now.minute() * 60
         + local_now.second()) as i64;
 
-    // If the fire moment has already passed today, schedule for tomorrow.
-    let date = if now_secs >= fire_secs {
-        local_now.date_naive() + chrono::Duration::days(1)
+    // If the game itself has already passed today → schedule for tomorrow.
+    // If only the join window has passed but the game is still future → schedule
+    // for today with a truncated reminder (fire as soon as possible).
+    let (date, effective_reminder_override, truncated) = if now_secs >= game_secs {
+        (local_now.date_naive() + chrono::Duration::days(1), reminder_override, false)
+    } else if now_secs >= fire_secs {
+        // Join window started already; trim reminder so fire_time ≥ now + 60s.
+        let secs_left = (game_secs - now_secs).max(60) as u64;
+        let trimmed   = secs_left.saturating_sub(60); // fire ~1 min from now
+        (local_now.date_naive(), Some(trimmed), trimmed < reminder)
     } else {
-        local_now.date_naive()
+        (local_now.date_naive(), reminder_override, false)
     };
+
+    let effective_reminder = effective_reminder_override
+        .unwrap_or(ctx.config.schedule.reminder_before_secs);
+    let eff_fire_secs = (game_secs - effective_reminder as i64).rem_euclid(86400);
+    let fire_hour = (eff_fire_secs / 3600) as u32;
+    let fire_min  = ((eff_fire_secs % 3600) / 60) as u32;
 
     let game_time = format!("{qh:02}:{qm:02}");
     let entry = ScheduledOnce {
-        game_time:           game_time.clone(),
+        game_time:            game_time.clone(),
         date,
-        reminder_before_secs: reminder_override,
+        reminder_before_secs: effective_reminder_override,
         answer_timeout_secs:  timeout_override,
         guesses_per_round:    guesses_override,
     };
@@ -242,13 +258,18 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
         state.save(&ctx.state_path).await?;
     }
 
-    let day_str   = if date == local_now.date_naive() { "today".to_owned() } else { "tomorrow".to_owned() };
-    let fire_hour = (fire_secs / 3600) as u32;
-    let fire_min  = ((fire_secs % 3600) / 60) as u32;
+    let day_str = if date == local_now.date_naive() { "today".to_owned() } else { "tomorrow".to_owned() };
 
     let mut detail = format!("✅ GeoGuessr: {day_str} at {game_time}");
-    if reminder > 0 {
-        detail.push_str(&format!(" (join {fire_hour:02}:{fire_min:02})"));
+    if effective_reminder > 0 {
+        detail.push_str(&format!(" (join ~{fire_hour:02}:{fire_min:02})"));
+    }
+    if truncated {
+        detail.push_str(&format!(
+            " ⚠️ join window trimmed to {} (was {})",
+            crate::game::format_duration(effective_reminder),
+            crate::game::format_duration(reminder),
+        ));
     }
     if let Some(t) = timeout_override {
         detail.push_str(&format!(", timeout {}", crate::game::format_duration(t)));
@@ -592,11 +613,12 @@ fn help_text() -> String {
   !help              · show this help
 
 **Admin:**
-  !startgeo          · start a round now
-  !cancelgeo         · abort current round
-  !cancelgeo HH:MM   · cancel a scheduled game
-  !schedulegeo HH:MM · schedule a one-time game
-  !prefetch          · fill the image cache
-  !resetstats confirm · wipe all history"
+  !startgeo                                  · start a round immediately (no join phase)
+  !cancelgeo                                 · abort current round
+  !cancelgeo HH:MM                           · cancel a scheduled game
+  !schedulegeo HH:MM [reminder=N] [timeout=N] [guesses=N]
+                                             · schedule a game (today if possible)
+  !prefetch                                  · fill the image cache
+  !resetstats confirm                        · wipe all history"
         .to_owned()
 }
