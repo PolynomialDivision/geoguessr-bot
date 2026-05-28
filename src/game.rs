@@ -40,6 +40,8 @@ pub struct GameOverrides {
     pub reminder_before_secs: Option<u64>,
     /// Override for how long players have to answer (seconds).
     pub answer_timeout_secs:  Option<u64>,
+    /// Override for how many images are played per round.
+    pub guesses_per_round:    Option<u32>,
 }
 
 pub const CHOICE_EMOJIS: [&str; 4] = ["🇦", "🇧", "🇨", "🇩"];
@@ -121,7 +123,9 @@ pub async fn start_round(
         }
     };
 
-    let n = ctx.config.schedule.guesses_per_round as usize;
+    let n = overrides.as_ref()
+        .and_then(|o| o.guesses_per_round)
+        .unwrap_or(ctx.config.schedule.guesses_per_round) as usize;
     let triggered_by = if manual { "manual" } else { "scheduler" };
 
     // Apply per-round overrides (from !schedulegeo).
@@ -863,8 +867,67 @@ async fn post_reveal_free_guess(
         }
     }
     let text = lines.join("\n");
+
+    // Matrix events have a 64 KB hard limit; body + formatted_body ≈ 2× text.
+    // Tiers:
+    //   1. Fits in one message → send as-is.
+    //   2. Too big → summary + all individual links in one second message.
+    //   3. Second message also too big → summary + one message per player.
+    // Last resort: if even the summary alone is too large (30+ players all with
+    // avatars), strip avatars from the overview URL.
+    const MATRIX_SPLIT_THRESHOLD: usize = 28_000;
     if let Some(r) = client.get_room(&ctx.room_id) {
-        r.send(format::mentionify(&text)).await.ok();
+        if text.len() <= MATRIX_SPLIT_THRESHOLD || scored.is_empty() {
+            r.send(format::mentionify(&text)).await.ok();
+        } else {
+            // Build summary (overview URL + scores, no per-player map links).
+            let make_summary = |ov: &str| -> String {
+                let mut sl = vec![
+                    format!("📍 **{}** [{header_map_label}]({})", location_str, ov),
+                    String::new(),
+                ];
+                for (i, (uid, _guess, dist, score)) in scored.iter().enumerate() {
+                    let medal    = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
+                    let dist_str = format_dist(*dist);
+                    sl.push(format!("{medal} {} · {} · {} pts", uid, dist_str, score));
+                }
+                sl.join("\n")
+            };
+            let summary = make_summary(&overview_url);
+            let summary = if summary.len() > MATRIX_SPLIT_THRESHOLD {
+                // Last resort: rebuild overview URL without avatars.
+                let stripped: Vec<(&str, f64, f64, u8, u8, u8, i64, f64, String)> = overview_entries
+                    .iter()
+                    .map(|(uid, lat, lon, r, g, b, score, dist, _)| {
+                        (*uid, *lat, *lon, *r, *g, *b, *score, *dist, String::new())
+                    })
+                    .collect();
+                let slim_url = build_all_guesses_map_url(&stripped, actual_lat, actual_lon, names);
+                make_summary(&slim_url)
+            } else {
+                summary
+            };
+            r.send(format::mentionify(&summary)).await.ok();
+
+            // Build all individual map links as one block of text.
+            let link_lines: Vec<String> = scored.iter().zip(guess_labels.iter())
+                .enumerate()
+                .map(|(i, ((uid, _guess, dist, score), guess_link))| {
+                    let medal    = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
+                    let dist_str = format_dist(*dist);
+                    format!("{medal} {} · {guess_link} · {} · {} pts", uid, dist_str, score)
+                })
+                .collect();
+            let links_text = link_lines.join("\n");
+
+            if links_text.len() <= MATRIX_SPLIT_THRESHOLD {
+                r.send(format::mentionify(&links_text)).await.ok();
+            } else {
+                for line in &link_lines {
+                    r.send(format::mentionify(line)).await.ok();
+                }
+            }
+        }
     }
 
     // ── Main-room map images ──────────────────────────────────────────────────

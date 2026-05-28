@@ -129,11 +129,12 @@ async fn cmd_cancelgeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Re
 // ── !schedulegeo ──────────────────────────────────────────────────────────────
 //
 // Usage:
-//   !schedulegeo                         — list pending one-time games
-//   !schedulegeo HH:MM                   — schedule with config defaults
-//   !schedulegeo HH:MM reminder=N        — override reminder window (seconds)
-//   !schedulegeo HH:MM timeout=N         — override answer timeout (seconds)
-//   !schedulegeo HH:MM reminder=N timeout=N
+//   !schedulegeo                              — list pending one-time games
+//   !schedulegeo HH:MM                        — schedule with config defaults
+//   !schedulegeo HH:MM reminder=N             — override reminder window (seconds)
+//   !schedulegeo HH:MM timeout=N              — override answer timeout (seconds)
+//   !schedulegeo HH:MM guesses=N              — override number of images per round
+//   !schedulegeo HH:MM reminder=N timeout=N guesses=N
 
 async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
     require_admin(ctx, sender)?;
@@ -157,7 +158,10 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
             let timeout_str = e.answer_timeout_secs
                 .map(|s| format!(", timeout {}", crate::game::format_duration(s)))
                 .unwrap_or_default();
-            lines.push(format!("  • {} on {}{reminder_str}{timeout_str}", e.game_time, e.date));
+            let guesses_str = e.guesses_per_round
+                .map(|n| format!(", {n} guess{}", if n == 1 { "" } else { "es" }))
+                .unwrap_or_default();
+            lines.push(format!("  • {} on {}{reminder_str}{timeout_str}{guesses_str}", e.game_time, e.date));
         }
         return Ok(Some(lines.join("\n")));
     }
@@ -174,6 +178,7 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
     // Parse optional key=value overrides.
     let mut reminder_override: Option<u64> = None;
     let mut timeout_override:  Option<u64> = None;
+    let mut guesses_override:  Option<u32> = None;
     for arg in &args[1..] {
         if let Some(v) = arg.strip_prefix("reminder=") {
             match v.parse::<u64>() {
@@ -185,9 +190,15 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
                 Ok(n)  => timeout_override = Some(n),
                 Err(_) => return Ok(Some(format!("❌ Invalid timeout \"{v}\" · must be seconds."))),
             }
+        } else if let Some(v) = arg.strip_prefix("guesses=") {
+            match v.parse::<u32>() {
+                Ok(n) if n >= 1 => guesses_override = Some(n),
+                Ok(_)  => return Ok(Some("❌ guesses must be at least 1.".to_owned())),
+                Err(_) => return Ok(Some(format!("❌ Invalid guesses \"{v}\" · must be a number."))),
+            }
         } else {
             return Ok(Some(format!(
-                "❌ Unknown argument \"{arg}\"\nUsage: !schedulegeo HH:MM [reminder=N] [timeout=N]"
+                "❌ Unknown argument \"{arg}\"\nUsage: !schedulegeo HH:MM [reminder=N] [timeout=N] [guesses=N]"
             )));
         }
     }
@@ -217,6 +228,7 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
         date,
         reminder_before_secs: reminder_override,
         answer_timeout_secs:  timeout_override,
+        guesses_per_round:    guesses_override,
     };
 
     {
@@ -239,7 +251,10 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
         detail.push_str(&format!(" (join {fire_hour:02}:{fire_min:02})"));
     }
     if let Some(t) = timeout_override {
-        detail.push_str(&format!(", {}", crate::game::format_duration(t)));
+        detail.push_str(&format!(", timeout {}", crate::game::format_duration(t)));
+    }
+    if let Some(g) = guesses_override {
+        detail.push_str(&format!(", {g} guess{}", if g == 1 { "" } else { "es" }));
     }
     detail.push_str(&format!("\nCancel: !cancelgeo {game_time}"));
     Ok(Some(detail))

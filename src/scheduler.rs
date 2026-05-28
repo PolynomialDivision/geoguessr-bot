@@ -119,6 +119,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         let overrides = GameOverrides {
             reminder_before_secs: entry.reminder_before_secs,
             answer_timeout_secs:  entry.answer_timeout_secs,
+            guesses_per_round:    entry.guesses_per_round,
         };
         let handle = tokio::spawn(async move {
             if let Err(e) = crate::game::start_round(ctx2, client2, false, None, Some(overrides)).await {

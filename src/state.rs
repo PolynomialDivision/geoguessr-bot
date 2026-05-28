@@ -65,6 +65,10 @@ pub struct ScheduledOnce {
     /// None → use the value from config.
     #[serde(default)]
     pub answer_timeout_secs: Option<u64>,
+    /// Override for how many images are played per round.
+    /// None → use the value from config.
+    #[serde(default)]
+    pub guesses_per_round: Option<u32>,
 }
 
 // ── I/O ───────────────────────────────────────────────────────────────────────
