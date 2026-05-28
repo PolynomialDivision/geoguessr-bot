@@ -823,6 +823,7 @@ async fn post_reveal_free_guess(
         let (r, g, b, _) = crate::mapimage::PLAYER_COLORS[i % crate::mapimage::PLAYER_COLORS.len()];
         let mxc = avatar_mxcs.get(uid.as_str()).cloned().unwrap_or_default();
         let map_url = build_guess_map_url(
+            display_name(names, uid),
             guess.lat, guess.lon, actual_lat, actual_lon, r, g, b, "en",
             &mxc, *score, *dist,
         );
@@ -960,7 +961,7 @@ async fn post_reveal_free_guess(
         // Geocode the player's guess in their language + build an interactive map link.
         let (pr, pg, pb, _) = crate::mapimage::PLAYER_COLORS[rank_0 % crate::mapimage::PLAYER_COLORS.len()];
         let mxc = avatar_mxcs.get(uid.as_str()).map(|s| s.as_str()).unwrap_or("");
-        let guess_map_url = build_guess_map_url(guess.lat, guess.lon, actual_lat, actual_lon, pr, pg, pb, &lang, mxc, *score, *dist);
+        let guess_map_url = build_guess_map_url(display_name(names, uid), guess.lat, guess.lon, actual_lat, actual_lon, pr, pg, pb, &lang, mxc, *score, *dist);
         let guess_label = crate::geocode::reverse_geocode(guess.lat, guess.lon, &lang)
             .await
             .unwrap_or_else(|| format!("{:.2}, {:.2}", guess.lat, guess.lon));
@@ -1584,7 +1585,31 @@ pub fn format_duration(secs: u64) -> String {
 ///
 /// Everything is encoded in the URL fragment so no server state is needed.
 /// The base map on geojson.io uses OSM-based tiles.
+/// Compress `params` with raw DEFLATE and return a `#z=<base64url>` hash fragment.
+///
+/// Using the URL hash means the browser never sends the payload to the server,
+/// so there is no length limit.  Raw DEFLATE (no zlib/gzip headers) matches the
+/// browser's `DecompressionStream('deflate-raw')` API.  Base64url (no padding)
+/// keeps the fragment URL-safe without further percent-encoding.
+fn compress_to_hash(params: &str) -> String {
+    use flate2::{Compression, write::DeflateEncoder};
+    use std::io::Write as _;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(params.as_bytes()).expect("deflate write");
+    let compressed = enc.finish().expect("deflate finish");
+    format!("#z={}", URL_SAFE_NO_PAD.encode(&compressed))
+}
+
+/// Build a compressed single-player reveal URL (used for per-player DM links).
+///
+/// Inside the compressed payload the `g=` multi-guess format is used so the
+/// browser parses it with the same code path as the overview map — no separate
+/// `glat`/`glon` handling needed.  The `mxc` data: URL is included raw (no
+/// percent-encoding) because it never contains `|` or `&`.
 fn build_guess_map_url(
+    name:       &str,
     guess_lat:  f64, guess_lon:  f64,
     actual_lat: f64, actual_lon: f64,
     r: u8, g: u8, b: u8,
@@ -1593,37 +1618,42 @@ fn build_guess_map_url(
     score:      i64,
     dist_km:    f64,
 ) -> String {
-    let mxc_enc = url_encode_component(mxc);
+    let enc_name = url_encode_component(name);
+    let params = format!(
+        "lang={lang}&alat={actual_lat:.4}&alon={actual_lon:.4}\
+         &g={enc_name}|{guess_lat:.4}|{guess_lon:.4}|{r:02X}{g:02X}{b:02X}|{mxc}|{score}|{dist_km:.1}"
+    );
     format!(
-        "https://polynomialdivision.github.io/geo-picker/reveal.html\
-         #lang={lang}&alat={actual_lat:.4}&alon={actual_lon:.4}\
-         &glat={guess_lat:.4}&glon={guess_lon:.4}&color={r:02X}{g:02X}{b:02X}\
-         &mxc={mxc_enc}&score={score}&dist={dist_km:.1}"
+        "https://polynomialdivision.github.io/geo-picker/reveal.html{}",
+        compress_to_hash(&params)
     )
 }
 
-/// Build a reveal.html URL showing every player's guess and the actual location.
-/// Parameters are placed in the URL hash so the browser never sends them to the
-/// server — no length limit, avatars always included.
-/// Entry tuple: (uid, lat, lon, r, g, b, score, dist_km, mxc_url)
+/// Build a compressed multi-player reveal URL.
+///
+/// Player entries are placed in the compressed payload using raw `|` separators
+/// (no `%7C` escaping needed inside the compressed buffer) and the `mxc` data:
+/// URL is included verbatim.  The structure text compresses well; the JPEG bytes
+/// inside the base64 avatar strings do not, but they are already small (48 × 48,
+/// JPEG q=55 ≈ 0.5–1 KB each).
+/// Entry tuple: (uid, lat, lon, r, g, b, score, dist_km, mxc_data_url)
 fn build_all_guesses_map_url(
     entries:    &[(&str, f64, f64, u8, u8, u8, i64, f64, String)],
     actual_lat: f64,
     actual_lon: f64,
     names:      &HashMap<String, String>,
 ) -> String {
-    let mut url = format!(
-        "https://polynomialdivision.github.io/geo-picker/reveal.html\
-         #lang=en&alat={actual_lat:.4}&alon={actual_lon:.4}"
-    );
+    let mut params = format!("lang=en&alat={actual_lat:.4}&alon={actual_lon:.4}");
     for (uid, lat, lon, r, g, b, score, dist, mxc) in entries {
-        let name    = url_encode_component(display_name(names, uid));
-        let mxc_enc = url_encode_component(mxc);
-        url.push_str(&format!(
-            "&g={name}%7C{lat:.4}%7C{lon:.4}%7C{r:02X}{g:02X}{b:02X}%7C{mxc_enc}%7C{score}%7C{dist:.1}"
+        let name = url_encode_component(display_name(names, uid));
+        params.push_str(&format!(
+            "&g={name}|{lat:.4}|{lon:.4}|{r:02X}{g:02X}{b:02X}|{mxc}|{score}|{dist:.1}"
         ));
     }
-    url
+    format!(
+        "https://polynomialdivision.github.io/geo-picker/reveal.html{}",
+        compress_to_hash(&params)
+    )
 }
 
 /// Percent-encode using the RFC 3986 unreserved-character set

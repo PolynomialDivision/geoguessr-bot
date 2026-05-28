@@ -1093,6 +1093,7 @@ dependencies = [
  "base64",
  "chrono",
  "chrono-tz",
+ "flate2",
  "image",
  "matrix-sdk",
  "mime",
