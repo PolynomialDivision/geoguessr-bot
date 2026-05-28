@@ -61,7 +61,7 @@ pub fn render_guess_map(
         .zoom(zoom)
         .lat_center(center_lat)
         .lon_center(center_lon)
-        .url_template("https://a.tile.osm.org/{z}/{x}/{y}.png")
+        .url_template("https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png")
         .build()
         .ok()?;
 
@@ -110,7 +110,7 @@ pub fn render_round_map(
         .width(700)
         .height(500)
         .padding((40, 40))
-        .url_template("https://a.tile.osm.org/{z}/{x}/{y}.png")
+        .url_template("https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png")
         .build()
         .ok()?;
 
