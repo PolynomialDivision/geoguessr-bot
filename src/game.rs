@@ -1596,13 +1596,15 @@ fn build_guess_map_url(
     let mxc_enc = url_encode_component(mxc);
     format!(
         "https://polynomialdivision.github.io/geo-picker/reveal.html\
-         ?lang={lang}&alat={actual_lat:.4}&alon={actual_lon:.4}\
+         #lang={lang}&alat={actual_lat:.4}&alon={actual_lon:.4}\
          &glat={guess_lat:.4}&glon={guess_lon:.4}&color={r:02X}{g:02X}{b:02X}\
          &mxc={mxc_enc}&score={score}&dist={dist_km:.1}"
     )
 }
 
 /// Build a reveal.html URL showing every player's guess and the actual location.
+/// Parameters are placed in the URL hash so the browser never sends them to the
+/// server — no length limit, avatars always included.
 /// Entry tuple: (uid, lat, lon, r, g, b, score, dist_km, mxc_url)
 fn build_all_guesses_map_url(
     entries:    &[(&str, f64, f64, u8, u8, u8, i64, f64, String)],
@@ -1612,13 +1614,13 @@ fn build_all_guesses_map_url(
 ) -> String {
     let mut url = format!(
         "https://polynomialdivision.github.io/geo-picker/reveal.html\
-         ?lang=en&alat={actual_lat:.4}&alon={actual_lon:.4}"
+         #lang=en&alat={actual_lat:.4}&alon={actual_lon:.4}"
     );
     for (uid, lat, lon, r, g, b, score, dist, mxc) in entries {
         let name    = url_encode_component(display_name(names, uid));
         let mxc_enc = url_encode_component(mxc);
         url.push_str(&format!(
-            "&g={name}|{lat:.4}|{lon:.4}|{r:02X}{g:02X}{b:02X}|{mxc_enc}|{score}|{dist:.1}"
+            "&g={name}%7C{lat:.4}%7C{lon:.4}%7C{r:02X}{g:02X}{b:02X}%7C{mxc_enc}%7C{score}%7C{dist:.1}"
         ));
     }
     url
