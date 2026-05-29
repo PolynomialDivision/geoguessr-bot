@@ -243,21 +243,6 @@ async fn main() -> Result<()> {
                     _                         => ev.event_id.clone(),
                 };
 
-                // Multiple-choice answer shorthand: !a / !b / !c / !d
-                let answer_index: Option<u8> = match body.to_lowercase().as_str() {
-                    "!a" => Some(0), "!b" => Some(1),
-                    "!c" => Some(2), "!d" => Some(3),
-                    _    => None,
-                };
-                if let Some(choice_index) = answer_index {
-                    let user = ev.sender.as_str().to_owned();
-                    let mut ag = ctx.active_game.lock().await;
-                    if let Some(g) = ag.as_mut() {
-                        g.record_mc_answer(user, choice_index, "text");
-                    }
-                    return;
-                }
-
                 // Free-guess answer: !guess <location>  (fallback for main room)
                 if body.to_lowercase().starts_with("!guess ") {
                     let query = body["!guess ".len()..].trim().to_owned();
@@ -388,6 +373,16 @@ async fn main() -> Result<()> {
                                 .await
                                 .ok();
                             }
+                            // Mark as acked in persistent state so recovery skips this player.
+                            {
+                                let mut st = ctx.state.lock().await;
+                                if let Some(ref mut ar) = st.active_round {
+                                    if let Some(p) = ar.dm_participants.get_mut(user_id.as_str()) {
+                                        p.answer_acked = true;
+                                    }
+                                }
+                                st.save(&ctx.state_path).await.ok();
+                            }
                         }
                         None => {
                             if let Some(r) = client.get_room(&dm_room_id) {
@@ -458,18 +453,6 @@ async fn main() -> Result<()> {
                             });
                         }
                         return;
-                    }
-                }
-
-                // Otherwise treat as a multiple-choice game answer.
-                let choice_index = match key.as_str() {
-                    "🇦" => 0u8, "🇧" => 1, "🇨" => 2, "🇩" => 3, _ => return,
-                };
-                let user = ev.sender.as_str().to_owned();
-                let mut ag = ctx.active_game.lock().await;
-                if let Some(game) = ag.as_mut() {
-                    if game.event_id.as_str() == reacted_to {
-                        game.record_mc_answer(user, choice_index, "reaction");
                     }
                 }
             }
@@ -548,6 +531,23 @@ async fn main() -> Result<()> {
                 st.pending_join = None;
                 st.save(&ctx.state_path).await.ok();
             }
+        }
+    }
+
+    // Resume an active round interrupted by a restart.
+    {
+        let active = ctx.state.lock().await.active_round.clone();
+        if let Some(ar) = active {
+            info!(
+                "Resuming active round {} (guess {}/{})",
+                ar.round_id, ar.guess_num, ar.total_guesses
+            );
+            let ctx2    = ctx.clone();
+            let client2 = client.clone();
+            let handle  = tokio::spawn(async move {
+                game::resume_active_round(ctx2, client2, ar).await;
+            });
+            *ctx.round_abort.lock().await = Some(handle.abort_handle());
         }
     }
 

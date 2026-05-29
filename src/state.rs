@@ -5,6 +5,30 @@ use std::{collections::{HashMap, VecDeque}, path::Path};
 
 use crate::sources::GeoImage;
 
+/// Persisted state for a round that is currently in progress.
+/// Saved before each guess so the bot can resume after a restart.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ActiveRoundState {
+    pub round_id:            i64,
+    pub guess_num:           u32,   // 1-based: the guess currently being played
+    pub total_guesses:       u32,
+    pub current_image:       GeoImage,
+    pub remaining_images:    VecDeque<GeoImage>,  // images not yet started
+    pub guess_started_at:    DateTime<Utc>,
+    pub answer_timeout_secs: u64,
+    pub dm_participants:     HashMap<String, ActiveDmParticipant>,
+    pub round_scores:        HashMap<String, i64>,  // accumulated scores so far
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ActiveDmParticipant {
+    pub dm_room_id:       String,
+    /// Event ID of the "Guess N/N" prompt message posted in this DM room.
+    pub prompt_event_id:  Option<String>,
+    /// True once the bot has sent "✅ Guess recorded" to this player.
+    pub answer_acked:     bool,
+}
+
 // ── Persistent state (operational, not analytics) ─────────────────────────────
 //
 // Analytics data lives in SQLite (geo.db via db.rs).  This file holds only
@@ -35,6 +59,10 @@ pub struct State {
     /// Runtime overrides for the recurring schedule, set via `!setschedule`.
     #[serde(default)]
     pub schedule_overrides: ScheduleOverrides,
+    /// State of the round currently in progress, if any.
+    /// Cleared when the round finishes; used to resume after a restart.
+    #[serde(default)]
+    pub active_round: Option<ActiveRoundState>,
 }
 
 /// State saved when the "who wants to play?" message is posted.

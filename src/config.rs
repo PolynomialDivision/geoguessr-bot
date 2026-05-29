@@ -20,19 +20,6 @@ pub struct SecurityConfig {
     pub encryption_strategy: EncryptionStrategy,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Debug)]
-#[serde(rename_all = "snake_case")]
-pub enum GameMode {
-    /// Classic multiple-choice: 4 country options, react or type !a–!d.
-    MultipleChoice,
-    /// Free-guess: players type !guess <location>, scored by distance.
-    FreeGuess,
-}
-
-impl Default for GameMode {
-    fn default() -> Self { GameMode::MultipleChoice }
-}
-
 #[derive(Deserialize)]
 pub struct ScheduleConfig {
     pub room_id: String,
@@ -53,9 +40,6 @@ pub struct ScheduleConfig {
     /// IANA timezone (e.g. "Europe/Berlin").
     #[serde(default = "default_timezone")]
     pub timezone: String,
-    /// Game mode: "multiple_choice" (default) or "free_guess".
-    #[serde(default)]
-    pub game_mode: GameMode,
     /// Emoji the bot reacts with on the join-prompt message.
     /// Any other user who reacts with the same emoji opts in to play via DM.
     /// Only used when game_mode = "free_guess" and reminder_before_secs > 0.

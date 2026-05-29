@@ -399,36 +399,7 @@ async fn cmd_resetstats(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> R
 // ── !scores / !leaderboard ────────────────────────────────────────────────────
 
 async fn cmd_scores(ctx: &BotContext) -> Result<Option<String>> {
-    if ctx.config.schedule.game_mode == crate::config::GameMode::FreeGuess {
-        return cmd_scores_free_guess(ctx).await;
-    }
-
-    // Multiple-choice mode — correct/total ranking.
-    let board = match ctx.db.leaderboard().await {
-        Ok(b)  => b,
-        Err(e) => {
-            error!("DB leaderboard error: {e}");
-            return Ok(Some("❌ Could not read leaderboard from database.".to_owned()));
-        }
-    };
-    if board.is_empty() {
-        return Ok(Some("No scores yet.".to_owned()));
-    }
-
-    let round_count = ctx.db.round_count().await.unwrap_or(0);
-    let mut lines = vec![format!("🏆 **Leaderboard** · {} round(s)", round_count)];
-    lines.push(String::new());
-    for (i, entry) in board.iter().enumerate() {
-        let pct   = if entry.total_questions > 0 {
-            entry.total_correct * 100 / entry.total_questions
-        } else { 0 };
-        let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
-        lines.push(format!(
-            "{medal} {:>2}. {} : {}/{} ({}%)",
-            i + 1, entry.user_id, entry.total_correct, entry.total_questions, pct,
-        ));
-    }
-    Ok(Some(lines.join("\n")))
+    cmd_scores_free_guess(ctx).await
 }
 
 async fn cmd_scores_free_guess(ctx: &BotContext) -> Result<Option<String>> {
@@ -615,14 +586,8 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
         String::new()
     };
 
-    let mode_line = match s.game_mode {
-        crate::config::GameMode::MultipleChoice =>
-            "🗺️ Multiple choice · pick from 4 countries\n\
-             React with 🇦 🇧 🇨 🇩 or type **!a** / **!b** / **!c** / **!d**".to_owned(),
-        crate::config::GameMode::FreeGuess =>
-            "🗺️ Free guess · type a location in private chat\n\
-             City, country, full address, or lat,lon · scored by distance".to_owned(),
-    };
+    let mode_line = "🗺️ Free guess · type a location in private chat\n\
+                     City, country, full address, or lat,lon · scored by distance";
 
     let photos_line = if s.photos_per_location > 1 {
         format!("\n📸 {} photos per guess", s.photos_per_location)

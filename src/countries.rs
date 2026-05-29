@@ -109,6 +109,7 @@ pub fn all_names() -> Vec<&'static str> {
 /// Pick `n` distractor country names, preferring the same region as `correct`
 /// (to make the game harder) but filling from other regions if needed.
 /// The correct answer is excluded from the result.
+#[allow(dead_code)]
 pub fn pick_distractors(correct: &str, correct_region: &str, n: usize) -> Vec<String> {
     let mut rng = rand::thread_rng();
 

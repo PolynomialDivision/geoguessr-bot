@@ -1,6 +1,6 @@
 //! Round and image game logic.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::Context as _;
 use chrono_tz::Tz;
@@ -17,6 +17,7 @@ use matrix_sdk::{
                 ReplacementMetadata, RoomMessageEventContent,
             },
         },
+        // (ReactionEventContent and Annotation kept for join-phase reactions)
     },
 };
 use rand::seq::SliceRandom;
@@ -24,12 +25,10 @@ use tracing::{error, info, warn};
 
 use crate::{
     BotContext,
-    config::GameMode,
     countries,
-    db::AnswerRecord,
     format,
     sources::GeoImage,
-    state::PendingJoin,
+    state::{ActiveDmParticipant, ActiveRoundState, PendingJoin},
 };
 
 // ── Per-round overrides ───────────────────────────────────────────────────────
@@ -43,8 +42,6 @@ pub struct GameOverrides {
     /// Override for how many guesses (locations) per round.
     pub guesses_per_round:    Option<u32>,
 }
-
-pub const CHOICE_EMOJIS: [&str; 4] = ["🇦", "🇧", "🇨", "🇩"];
 
 // ── Free-guess answer ─────────────────────────────────────────────────────────
 
@@ -66,10 +63,6 @@ pub struct ActiveGame {
 
 #[derive(Clone, Debug)]
 pub enum ActiveGameMode {
-    MultipleChoice {
-        answers:       HashMap<String, AnswerRecord>,
-        correct_index: u8,
-    },
     FreeGuess {
         guesses:    HashMap<String, FreeGuess>,
         actual_lat: f64,
@@ -78,31 +71,9 @@ pub enum ActiveGameMode {
 }
 
 impl ActiveGame {
-    pub fn record_mc_answer(&mut self, user_id: String, choice: u8, source: &'static str) {
-        let now = chrono::Utc::now();
-        if let ActiveGameMode::MultipleChoice { ref mut answers, .. } = self.mode {
-            answers
-                .entry(user_id)
-                .and_modify(|r| {
-                    let changed = r.choice != choice;
-                    r.choice       = choice;
-                    r.source       = source;
-                    r.submitted_at = now;
-                    if changed { r.changed_answer = true; }
-                })
-                .or_insert(AnswerRecord {
-                    choice,
-                    source,
-                    submitted_at:   now,
-                    changed_answer: false,
-                });
-        }
-    }
-
     pub fn record_free_guess(&mut self, user_id: String, guess: FreeGuess) {
-        if let ActiveGameMode::FreeGuess { ref mut guesses, .. } = self.mode {
-            guesses.insert(user_id, guess);
-        }
+        let ActiveGameMode::FreeGuess { ref mut guesses, .. } = self.mode;
+        guesses.insert(user_id, guess);
     }
 }
 
@@ -137,15 +108,11 @@ pub async fn start_round(
         .and_then(|o| o.answer_timeout_secs)
         .unwrap_or(ctx.config.schedule.answer_timeout_secs);
 
-    // ── Join phase (free-guess + scheduled only) ──────────────────────────────
-    // When reminder_before_secs > 0 and game_mode == FreeGuess, post a
-    // "who wants to play?" message, react to it, wait for participants,
-    // then open a DM with each opt-in player.
+    // ── Join phase (scheduled only) ───────────────────────────────────────────
+    // When reminder_before_secs > 0, post a "who wants to play?" message,
+    // react to it, wait for participants, then open a DM with each opt-in player.
     let dm_participants: HashMap<OwnedUserId, OwnedRoomId> =
-        if !manual
-            && ctx.config.schedule.game_mode == GameMode::FreeGuess
-            && reminder_before_secs_cfg > 0
-        {
+        if !manual && reminder_before_secs_cfg > 0 {
             let reminder_secs = reminder_before_secs_cfg;
             let emoji         = ctx.config.schedule.join_emoji.clone();
 
@@ -281,18 +248,10 @@ pub async fn start_round(
             dm_map
 
         } else {
-            // Scheduled with reminder but not free-guess, or manual game:
-            // classic main-room flow with the old "starting soon" message.
-            if !manual {
-                let reminder_secs = reminder_before_secs_cfg;
-                if reminder_secs > 0 {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(reminder_secs)).await;
-                }
-            }
             HashMap::new()
         };
 
-    // ── Pre-fetch images ──────────────────────────────────────────────────────
+    // ── Pre-fetch + pop images upfront ────────────────────────────────────────
     prefetch_if_needed(&ctx, n).await;
 
     let round_id = ctx.db
@@ -301,74 +260,74 @@ pub async fn start_round(
 
     info!("GeoGuessr round {round_id} started ({n} images, triggered_by={triggered_by})");
 
-    let mut round_results: HashMap<String, Vec<bool>> = HashMap::new();
-    let mut round_scores_free: HashMap<String, i64>   = HashMap::new();
-
-    for i in 0..n {
-        let img = {
-            let mut st = ctx.state.lock().await;
+    // Pop all images from the cache at once so we can persist them for recovery.
+    let mut image_queue: VecDeque<GeoImage> = {
+        let mut st = ctx.state.lock().await;
+        let mut q  = VecDeque::new();
+        for _ in 0..n {
             match st.cached_guesses.pop_front() {
-                Some(img) => {
-                    st.save(&ctx.state_path).await.ok();
-                    img
-                }
-                None => {
-                    warn!("GeoGuessr: guess cache empty — skipping remaining");
-                    break;
-                }
-            }
-        };
-
-        // Background refill.
-        {
-            let remaining = ctx.state.lock().await.cached_guesses.len();
-            if remaining < 3 {
-                let ctx2 = ctx.clone();
-                tokio::spawn(async move {
-                    prefetch_if_needed(&ctx2, 3).await;
-                });
+                Some(img) => q.push_back(img),
+                None      => { warn!("GeoGuessr: guess cache empty — truncating round"); break; }
             }
         }
+        st.save(&ctx.state_path).await.ok();
+        q
+    };
 
-        if i > 0 {
+    // Background refill now that we've consumed from the cache.
+    {
+        let ctx2 = ctx.clone();
+        tokio::spawn(async move { prefetch_if_needed(&ctx2, n + 2).await; });
+    }
+
+    let mut round_scores_free: HashMap<String, i64> = HashMap::new();
+
+    let mut first_guess = true;
+    while let Some(img) = image_queue.pop_front() {
+        let guess_num = (n - image_queue.len()) as u32; // 1-based after pop
+
+        // Save active round state so a restart can resume.
+        {
+            let mut st = ctx.state.lock().await;
+            let dm_state = dm_participants.iter().map(|(uid, dm_room_id)| {
+                (uid.to_string(), ActiveDmParticipant {
+                    dm_room_id:      dm_room_id.to_string(),
+                    prompt_event_id: None,
+                    answer_acked:    false,
+                })
+            }).collect();
+            st.active_round = Some(ActiveRoundState {
+                round_id,
+                guess_num,
+                total_guesses:       n as u32,
+                current_image:       img.clone(),
+                remaining_images:    image_queue.clone(),
+                guess_started_at:    chrono::Utc::now(),
+                answer_timeout_secs: answer_timeout_secs_cfg,
+                dm_participants:     dm_state,
+                round_scores:        round_scores_free.clone(),
+            });
+            st.save(&ctx.state_path).await.ok();
+        }
+
+        if !first_guess {
             tokio::time::sleep(tokio::time::Duration::from_secs(
                 ctx.config.schedule.inter_guess_secs,
-            ))
-            .await;
+            )).await;
         }
+        first_guess = false;
 
-        match ctx.config.schedule.game_mode {
-            GameMode::MultipleChoice => {
-                play_guess(
-                    &ctx, &client, &room,
-                    round_id, i as u32 + 1, n as u32,
-                    &img, &mut round_results,
-                    answer_timeout_secs_cfg,
-                )
-                .await?;
-            }
-            GameMode::FreeGuess => {
-                play_free_guess(
-                    &ctx, &client, &room,
-                    round_id, i as u32 + 1, n as u32,
-                    &img, &mut round_scores_free, &dm_participants,
-                    answer_timeout_secs_cfg,
-                )
-                .await?;
-            }
-        }
+        play_free_guess(
+            &ctx, &client, &room,
+            round_id, guess_num, n as u32,
+            &img, &mut round_scores_free, &dm_participants,
+            answer_timeout_secs_cfg,
+        ).await?;
     }
 
     // ── Finalise round ────────────────────────────────────────────────────────
     ctx.db.finish_round(round_id).await?;
-    match ctx.config.schedule.game_mode {
-        GameMode::MultipleChoice => {
-            ctx.db.upsert_round_scores(round_id, &round_results).await?;
-        }
-        GameMode::FreeGuess => {
-            ctx.db.upsert_round_scores_free_guess(round_id, &round_scores_free).await?;
-        }
-    }
+    ctx.db.upsert_round_scores_free_guess(round_id, &round_scores_free).await?;
 
     if let Some(slot) = slot {
         let tz: Tz = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
@@ -378,22 +337,17 @@ pub async fn start_round(
         st.save(&ctx.state_path).await.ok();
     }
 
-    // Post round summary.
-    match ctx.config.schedule.game_mode {
-        GameMode::MultipleChoice => {
-            post_round_summary(&ctx, &client, &room, round_id, &round_results).await;
-        }
-        GameMode::FreeGuess => {
-            post_round_summary_free_guess(
-                &ctx, &client, &room,
-                round_id, &round_scores_free, &dm_participants,
-            )
-            .await;
-        }
-    }
+    post_round_summary_free_guess(
+        &ctx, &client, &room,
+        round_id, &round_scores_free, &dm_participants,
+    ).await;
 
-    // Clear DM-room mappings after the round ends so stale rooms don't
-    // absorb future messages.
+    // Clear active_round and DM-room mappings now that the round is complete.
+    {
+        let mut st = ctx.state.lock().await;
+        st.active_round = None;
+        st.save(&ctx.state_path).await.ok();
+    }
     if !dm_participants.is_empty() {
         let dm_room_ids: Vec<OwnedRoomId> = dm_participants.values().cloned().collect();
         let mut dm_rooms = ctx.dm_rooms.lock().await;
@@ -402,145 +356,6 @@ pub async fn start_round(
         }
     }
 
-    Ok(())
-}
-
-// ── Single image — multiple choice ───────────────────────────────────────────
-
-async fn play_guess(
-    ctx:                &BotContext,
-    client:             &Client,
-    room:               &Room,
-    round_id:           i64,
-    guess_num:          u32,
-    n_total:            u32,
-    img:                &GeoImage,
-    round_results:      &mut HashMap<String, Vec<bool>>,
-    answer_timeout_secs: u64,
-) -> anyhow::Result<()> {
-    let mut distractors = countries::pick_distractors(&img.country, &img.region, 3);
-    distractors.push(img.country.clone());
-    distractors.shuffle(&mut rand::thread_rng());
-    let correct_index = distractors
-        .iter()
-        .position(|c| c == &img.country)
-        .unwrap_or(0) as u8;
-    let choices = distractors;
-
-    let guess_id = ctx.db
-        .start_guess(
-            round_id, guess_num,
-            &img.country, &img.region, img.city.as_deref(),
-            &img.source, img.attribution.as_deref(),
-            &choices, correct_index,
-            answer_timeout_secs,
-            img.lat, img.lon,
-        )
-        .await?;
-
-    let all_images = match upload_all_images(client, img).await {
-        Ok(v)  => v,
-        Err(e) => {
-            error!("GeoGuessr: failed to upload image: {e}");
-            return Ok(());
-        }
-    };
-
-    let n_imgs = all_images.len();
-    for (i, (mxc_uri, _mime)) in all_images.into_iter().enumerate() {
-        let label = if n_imgs == 1 {
-            "📍 Where is this?".to_owned()
-        } else {
-            format!("📍 {}/{}", i + 1, n_imgs)
-        };
-        let image_content = ImageMessageEventContent::plain(label, mxc_uri);
-        room.send(RoomMessageEventContent::new(MessageType::Image(image_content))).await?;
-    }
-
-    let total_secs    = answer_timeout_secs;
-    let question_text = build_question_text(guess_num, n_total, &choices, total_secs, total_secs);
-    // @room on the first question of every round so people get a push notification.
-    // Subsequent questions in the same round don't need it — players are already watching.
-    let initial_text = if guess_num == 1 {
-        format!("@room\n{question_text}")
-    } else {
-        question_text
-    };
-    let mut q_content = format::mentionify(&initial_text);
-    if guess_num == 1 {
-        let mut m = Mentions::new();
-        m.room = true;
-        q_content = q_content.add_mentions(m);
-    }
-    let q_event       = room.send(q_content).await?;
-    let q_event_id    = q_event.response.event_id.clone();
-
-    ctx.db.set_guess_event_id(guess_id, q_event_id.as_str()).await.ok();
-
-    for emoji in &CHOICE_EMOJIS[..choices.len()] {
-        room.send(ReactionEventContent::new(Annotation::new(
-            q_event_id.clone(),
-            emoji.to_string(),
-        )))
-        .await
-        .ok();
-    }
-
-    {
-        let mut ag = ctx.active_game.lock().await;
-        *ag = Some(ActiveGame {
-            event_id: q_event_id.clone(),
-            mode: ActiveGameMode::MultipleChoice {
-                answers:       HashMap::new(),
-                correct_index,
-            },
-        });
-    }
-
-    // Smooth countdown: divide the total into ~20 ticks, min 15 s, max 15 min.
-    let edit_interval = (total_secs / 20).clamp(15, 900);
-    let mut remaining = total_secs;
-    while remaining > edit_interval {
-        tokio::time::sleep(tokio::time::Duration::from_secs(edit_interval)).await;
-        remaining -= edit_interval;
-        let updated = build_question_text(guess_num, n_total, &choices, remaining, total_secs);
-        if let Some(r) = client.get_room(&ctx.room_id) {
-            let edit = RoomMessageEventContent::text_plain(&updated)
-                .make_replacement(ReplacementMetadata::new(q_event_id.clone(), None));
-            r.send(edit).await.ok();
-        }
-    }
-    tokio::time::sleep(tokio::time::Duration::from_secs(remaining)).await;
-    if let Some(r) = client.get_room(&ctx.room_id) {
-        let updated = build_question_text(guess_num, n_total, &choices, 0, total_secs);
-        let edit = RoomMessageEventContent::text_plain(&updated)
-            .make_replacement(ReplacementMetadata::new(q_event_id.clone(), None));
-        r.send(edit).await.ok();
-    }
-
-    let mut answers = {
-        let mut ag = ctx.active_game.lock().await;
-        match ag.take().map(|g| g.mode) {
-            Some(ActiveGameMode::MultipleChoice { answers, .. }) => answers,
-            _ => HashMap::new(),
-        }
-    };
-    reconcile_reactions(client, room, &q_event_id, &mut answers).await;
-
-    let n_correct = answers.values().filter(|r| r.choice == correct_index).count();
-    let n_total_a = answers.len();
-
-    ctx.db.record_answers(guess_id, round_id, answers.clone(), correct_index).await?;
-    ctx.db.finish_guess(guess_id, n_total_a, n_correct).await?;
-
-    for (user_id, rec) in &answers {
-        round_results
-            .entry(user_id.clone())
-            .or_default()
-            .push(rec.choice == correct_index);
-    }
-
-    post_reveal(ctx, client, room, img, &choices, correct_index, &answers, n_correct).await;
     Ok(())
 }
 
@@ -657,7 +472,16 @@ async fn play_free_guess(
                  <a href=\"https://polynomialdivision.github.io/geo-picker/?lang={lang}\">pick on map</a><br>\
                  ↩️ <a href=\"https://matrix.to/#/{room_id_str}\">Main room</a>"
             );
-            dm_room.send(RoomMessageEventContent::text_html(&dm_prompt_plain, &dm_prompt_html)).await.ok();
+            if let Ok(resp) = dm_room.send(RoomMessageEventContent::text_html(&dm_prompt_plain, &dm_prompt_html)).await {
+                // Persist the prompt event ID so we can recover answers after a restart.
+                let mut st = ctx.state.lock().await;
+                if let Some(ref mut ar) = st.active_round {
+                    if let Some(p) = ar.dm_participants.get_mut(uid.as_str()) {
+                        p.prompt_event_id = Some(resp.response.event_id.to_string());
+                    }
+                }
+                st.save(&ctx.state_path).await.ok();
+            }
         }
     }
 
@@ -1426,109 +1250,6 @@ async fn reconcile_join_reactions(
     }
 }
 
-// ── Reveal message — multiple choice ─────────────────────────────────────────
-
-async fn post_reveal(
-    ctx:           &BotContext,
-    client:        &Client,
-    _room:         &Room,
-    img:           &GeoImage,
-    choices:       &[String],
-    correct_index: u8,
-    answers:       &HashMap<String, AnswerRecord>,
-    n_correct:     usize,
-) {
-    let location_str = match &img.city {
-        Some(city) => format!("{}, {}", city, img.country),
-        None       => img.country.clone(),
-    };
-
-    let correct_emoji = CHOICE_EMOJIS[correct_index as usize];
-    let correct_name  = &choices[correct_index as usize];
-
-    let mut lines = vec![
-        format!("📍 **{}** {} {}", location_str, correct_emoji, correct_name),
-        String::new(),
-    ];
-
-    if answers.is_empty() {
-        lines.push("Nobody answered.".to_owned());
-    } else {
-        let n_total = answers.len();
-        lines.push(format!("{n_correct}/{n_total} correct"));
-        lines.push(String::new());
-
-        let mut correct_users: Vec<(&str, &AnswerRecord)> = answers
-            .iter()
-            .filter(|(_, r)| r.choice == correct_index)
-            .map(|(id, r)| (id.as_str(), r))
-            .collect();
-        correct_users.sort_by_key(|(_, r)| r.submitted_at);
-
-        for (uid, _rec) in &correct_users {
-            lines.push(format!("✅ {}", uid));
-        }
-
-        let wrong: Vec<&str> = answers
-            .iter()
-            .filter(|(_, r)| r.choice != correct_index)
-            .map(|(id, _)| id.as_str())
-            .collect();
-        if !wrong.is_empty() {
-            lines.push(String::new());
-            for uid in wrong {
-                lines.push(format!("❌ {}", uid));
-            }
-        }
-    }
-
-    let text = lines.join("\n");
-    if let Some(r) = client.get_room(&ctx.room_id) {
-        r.send(format::mentionify(&text)).await.ok();
-    }
-}
-
-// ── Round summary — multiple choice ──────────────────────────────────────────
-
-async fn post_round_summary(
-    ctx:           &BotContext,
-    client:        &Client,
-    _room:         &Room,
-    _round_id:     i64,
-    round_results: &HashMap<String, Vec<bool>>,
-) {
-    if round_results.is_empty() {
-        if let Some(r) = client.get_room(&ctx.room_id) {
-            r.send(format::mentionify("🌍 Round over · nobody played.")).await.ok();
-        }
-        return;
-    }
-
-    let mut scores: Vec<(&str, usize, usize)> = round_results
-        .iter()
-        .map(|(uid, results)| {
-            let correct = results.iter().filter(|&&c| c).count();
-            let total   = results.len();
-            (uid.as_str(), correct, total)
-        })
-        .collect();
-    scores.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
-
-    let n_guesses = ctx.effective_guesses_per_round().await;
-    let mut lines = vec![format!("🌍 **Round over!** {} guess(es):", n_guesses)];
-    lines.push(String::new());
-
-    for (i, (uid, correct, total)) in scores.iter().enumerate() {
-        let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
-        lines.push(format!("{medal} {} : {}/{}", uid, correct, total));
-    }
-
-    let text = lines.join("\n");
-    if let Some(r) = client.get_room(&ctx.room_id) {
-        r.send(format::mentionify(&text)).await.ok();
-    }
-}
-
 // ── Image upload ──────────────────────────────────────────────────────────────
 
 /// Upload the primary image and all extra images.
@@ -1599,25 +1320,6 @@ fn detect_mime(data: &[u8]) -> mime::Mime {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn build_question_text(
-    guess_num: u32,
-    n_total:   u32,
-    choices:   &[String],
-    remaining: u64,
-    total:     u64,
-) -> String {
-    let bar      = time_bar(remaining, total);
-    let time_str = format_duration(remaining);
-    let mut lines = vec![
-        format!("🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar}"),
-        String::new(),
-    ];
-    for (i, choice) in choices.iter().enumerate() {
-        lines.push(format!("{}  {}", CHOICE_EMOJIS[i], choice));
-    }
-    lines.join("\n")
-}
 
 fn time_bar(remaining: u64, total: u64) -> String {
     const W: usize = 10;
@@ -1758,66 +1460,6 @@ async fn fetch_names(room: &Room, user_ids: &[&str]) -> HashMap<String, String> 
     map
 }
 
-async fn reconcile_reactions(
-    client:     &Client,
-    room:       &Room,
-    q_event_id: &OwnedEventId,
-    answers:    &mut HashMap<String, AnswerRecord>,
-) {
-    use matrix_sdk::ruma::{
-        api::client::relations::get_relating_events_with_rel_type_and_event_type::v1 as api,
-        events::{AnyMessageLikeEvent, TimelineEventType, relation::RelationType},
-    };
-
-    let mut server_answers: HashMap<String, u8> = HashMap::new();
-    let mut from: Option<String> = None;
-    let mut ok = false;
-
-    loop {
-        let mut req = api::Request::new(
-            room.room_id().to_owned(),
-            q_event_id.clone(),
-            RelationType::Annotation,
-            TimelineEventType::from("m.reaction"),
-        );
-        req.from = from.clone();
-        match client.send(req).await {
-            Ok(resp) => {
-                ok = true;
-                for raw in &resp.chunk {
-                    let Ok(AnyMessageLikeEvent::Reaction(ev)) = raw.deserialize() else { continue };
-                    let Some(orig) = ev.as_original() else { continue };
-                    if client.user_id().map(|id| id == orig.sender).unwrap_or(false) { continue; }
-                    let choice = match orig.content.relates_to.key.as_str() {
-                        "🇦" => 0u8, "🇧" => 1, "🇨" => 2, "🇩" => 3, _ => continue,
-                    };
-                    server_answers.entry(orig.sender.as_str().to_owned()).or_insert(choice);
-                }
-                match resp.next_batch {
-                    Some(t) => from = Some(t),
-                    None    => break,
-                }
-            }
-            Err(e) => {
-                warn!("GeoGuessr: reaction reconciliation failed: {e}");
-                break;
-            }
-        }
-    }
-
-    if !ok { return; }
-
-    let now = chrono::Utc::now();
-    for (uid, choice) in server_answers {
-        answers.entry(uid).or_insert(AnswerRecord {
-            choice,
-            source:         "reconciled",
-            submitted_at:   now,
-            changed_answer: false,
-        });
-    }
-}
-
 // ── Prefetch ──────────────────────────────────────────────────────────────────
 
 pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
@@ -1897,6 +1539,330 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
 /// Called on startup when a join phase was in progress at shutdown time.
 /// Waits until the game-start instant, re-reads reactions to rebuild the
 /// participant list, then runs the game exactly as `start_round` would.
+// ── Restart recovery — active round ──────────────────────────────────────────
+
+/// Fetch messages backward from a DM room and find the player's answer
+/// sent between the bot's prompt message and the bot's ack message.
+/// Returns `None` if the answer was already acked or not yet submitted.
+async fn recover_dm_answer(
+    client:          &Client,
+    dm_room_id:      &OwnedRoomId,
+    player_id:       &OwnedUserId,
+    prompt_event_id: &str,
+) -> Option<String> {
+    use matrix_sdk::{
+        room::MessagesOptions,
+        ruma::{
+            events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, room::message::MessageType},
+            uint,
+        },
+    };
+
+    let room = client.get_room(dm_room_id)?;
+
+    // Fetch recent messages backward (newest first), enough to cover one guess window.
+    let mut options = MessagesOptions::backward();
+    options.limit   = uint!(100);
+    let batch       = room.messages(options).await.ok()?;
+
+    let mut player_answer: Option<String> = None;
+    let mut found_ack    = false;
+    let mut found_prompt = false;
+
+    for timeline_event in &batch.chunk {
+        let Ok(AnySyncTimelineEvent::MessageLike(ml)) = timeline_event.raw().deserialize() else { continue };
+
+        // Stop once we hit the prompt — everything before is from prior guesses.
+        if ml.event_id() == prompt_event_id {
+            found_prompt = true;
+            break;
+        }
+
+        let AnySyncMessageLikeEvent::RoomMessage(msg) = ml else { continue };
+        let Some(orig) = msg.as_original() else { continue };
+        let MessageType::Text(ref text) = orig.content.msgtype else { continue };
+        let body = text.body.trim();
+
+        if orig.sender == *player_id {
+            if player_answer.is_none() {
+                player_answer = Some(body.to_owned());
+            }
+        } else if body.starts_with("✅ Guess recorded") {
+            found_ack = true;
+            break;
+        }
+    }
+
+    if found_ack || !found_prompt {
+        None
+    } else {
+        player_answer
+    }
+}
+
+/// Resume a round that was interrupted by a restart.
+/// Recovers the current guess from DM history, then continues normally.
+pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoundState) {
+    info!(
+        "Resuming active round {} (guess {}/{})",
+        ar.round_id, ar.guess_num, ar.total_guesses
+    );
+
+    let room = match client.get_room(&ctx.room_id) {
+        Some(r) => r,
+        None    => {
+            warn!("resume_active_round: main room not joined");
+            return;
+        }
+    };
+
+    // Restore DM routing so new answers arriving after restart are handled.
+    for (uid_str, participant) in &ar.dm_participants {
+        if let (Ok(uid), Ok(dm_room_id)) = (
+            uid_str.parse::<OwnedUserId>(),
+            participant.dm_room_id.parse::<OwnedRoomId>(),
+        ) {
+            ctx.dm_rooms.lock().await.insert(dm_room_id, uid);
+        }
+    }
+
+    // Rebuild the dm_participants map (OwnedUserId → OwnedRoomId).
+    let dm_participants: HashMap<OwnedUserId, OwnedRoomId> = ar.dm_participants
+        .iter()
+        .filter_map(|(uid_str, p)| {
+            let uid       = uid_str.parse::<OwnedUserId>().ok()?;
+            let dm_room_id = p.dm_room_id.parse::<OwnedRoomId>().ok()?;
+            Some((uid, dm_room_id))
+        })
+        .collect();
+
+    // ── Recover the current guess ─────────────────────────────────────────────
+
+    let (actual_lat, actual_lon) = match (ar.current_image.lat, ar.current_image.lon) {
+        (Some(lat), Some(lon)) => (lat, lon),
+        _ => countries::COUNTRIES.iter()
+            .find(|c| c.name == ar.current_image.country)
+            .map(|c| (c.lat, c.lon))
+            .unwrap_or((0.0, 0.0)),
+    };
+
+    // Recover already-submitted answers from DM history.
+    let mut recovered: HashMap<String, FreeGuess> = HashMap::new();
+    for (uid_str, participant) in &ar.dm_participants {
+        if participant.answer_acked { continue; }
+        let Some(ref prompt_id) = participant.prompt_event_id else { continue };
+        let Ok(uid)       = uid_str.parse::<OwnedUserId>() else { continue };
+        let Ok(dm_room_id) = participant.dm_room_id.parse::<OwnedRoomId>() else { continue };
+
+        if let Some(answer_text) = recover_dm_answer(&client, &dm_room_id, &uid, prompt_id).await {
+            info!("Recovered answer from {uid_str}: \"{answer_text}\"");
+            if let Some((lat, lon)) = geocode(&answer_text).await {
+                // Send the ack and mark as acked in state.
+                if let Some(dm_room) = client.get_room(&dm_room_id) {
+                    dm_room.send(format::mentionify(&format!(
+                        "✅ Guess recorded: \"{answer_text}\"\nWaiting for the others or the timer…"
+                    ))).await.ok();
+                }
+                {
+                    let mut st = ctx.state.lock().await;
+                    if let Some(ref mut active) = st.active_round {
+                        if let Some(p) = active.dm_participants.get_mut(uid_str) {
+                            p.answer_acked = true;
+                        }
+                    }
+                    st.save(&ctx.state_path).await.ok();
+                }
+                recovered.insert(uid_str.clone(), FreeGuess {
+                    text:         answer_text,
+                    lat,
+                    lon,
+                    submitted_at: chrono::Utc::now(),
+                });
+            }
+        }
+    }
+
+    // Seed the in-memory active game with recovered answers.
+    {
+        let mut ag = ctx.active_game.lock().await;
+        let guess_event_id = {
+            // Use a placeholder event ID — the actual one is already in the DB.
+            OwnedEventId::try_from("$placeholder:recovery").unwrap_or_else(|_| {
+                OwnedEventId::try_from(format!("$recovery_{}:{}", ar.round_id, ar.guess_num)).unwrap()
+            })
+        };
+        *ag = Some(ActiveGame {
+            event_id: guess_event_id,
+            mode: ActiveGameMode::FreeGuess {
+                guesses: recovered,
+                actual_lat,
+                actual_lon,
+            },
+        });
+    }
+
+    // Post a restart notice to the main room.
+    room.send(format::mentionify(&format!(
+        "⚠️ Bot restarted mid-round — resuming guess {}/{} ({})",
+        ar.guess_num, ar.total_guesses,
+        format_duration(ar.answer_timeout_secs),
+    ))).await.ok();
+    for (_, dm_room_id) in &dm_participants {
+        if let Some(dm_room) = client.get_room(dm_room_id) {
+            dm_room.send(format::mentionify("⚠️ Bot restarted — your guess window is still open."))
+                .await.ok();
+        }
+    }
+
+    // Compute remaining timeout.
+    let elapsed_secs = chrono::Utc::now()
+        .signed_duration_since(ar.guess_started_at)
+        .num_seconds()
+        .max(0) as u64;
+    let remaining_secs = ar.answer_timeout_secs.saturating_sub(elapsed_secs);
+
+    // Wait out the remaining time (reusing the countdown logic inline).
+    if remaining_secs > 0 {
+        let edit_interval = (remaining_secs / 20).clamp(15, 900);
+        let mut remaining = remaining_secs;
+        loop {
+            let sleep_secs = remaining.min(edit_interval);
+            tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
+            remaining -= sleep_secs;
+
+            if !dm_participants.is_empty() {
+                let ag = ctx.active_game.lock().await;
+                if let Some(ActiveGame { mode: ActiveGameMode::FreeGuess { ref guesses, .. }, .. }) = *ag {
+                    if dm_participants.keys().all(|uid| guesses.contains_key(uid.as_str())) {
+                        break;
+                    }
+                }
+            }
+            if remaining == 0 { break; }
+        }
+    }
+
+    // Collect and score guesses — re-use the DB guess_id from the existing row if possible,
+    // otherwise create a new one (fallback only; the DB row should already exist).
+    let guess_id = ctx.db
+        .start_guess(
+            ar.round_id, ar.guess_num,
+            &ar.current_image.country, &ar.current_image.region,
+            ar.current_image.city.as_deref(),
+            &ar.current_image.source, ar.current_image.attribution.as_deref(),
+            &[], 0,
+            ar.answer_timeout_secs,
+            Some(actual_lat), Some(actual_lon),
+        ).await.unwrap_or(-1);
+
+    let guesses = {
+        let mut ag = ctx.active_game.lock().await;
+        match ag.take().map(|g| g.mode) {
+            Some(ActiveGameMode::FreeGuess { guesses, .. }) => guesses,
+            _ => HashMap::new(),
+        }
+    };
+
+    let mut scored: Vec<(String, FreeGuess, f64, i64)> = guesses
+        .into_iter()
+        .map(|(uid, guess)| {
+            let dist  = haversine_km(guess.lat, guess.lon, actual_lat, actual_lon);
+            let score = distance_score(dist);
+            (uid, guess, dist, score)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.3.cmp(&a.3));
+
+    let n_answers = scored.len();
+    let db_rows: Vec<(String, String, f64, f64, f64, i64)> = scored.iter()
+        .map(|(uid, g, dist, score)| (uid.clone(), g.text.clone(), g.lat, g.lon, *dist, *score))
+        .collect();
+    if guess_id > 0 {
+        ctx.db.record_free_guess_answers(guess_id, ar.round_id, db_rows).await.ok();
+        ctx.db.finish_guess(guess_id, n_answers, 0).await.ok();
+    }
+
+    let mut round_scores_free: HashMap<String, i64> = ar.round_scores.clone();
+    for (uid, _, _, score) in &scored {
+        *round_scores_free.entry(uid.clone()).or_insert(0) += score;
+    }
+
+    let user_ids: Vec<&str>     = scored.iter().map(|(uid, _, _, _)| uid.as_str()).collect();
+    let names                   = fetch_names(&room, &user_ids).await;
+    let raw_avatars             = crate::avatar::fetch_player_avatars(&room, &user_ids).await;
+    let avatar_mxcs: HashMap<String, String> = raw_avatars.iter()
+        .filter_map(|(uid, bytes)| crate::avatar::avatar_bytes_to_data_url(bytes).map(|u| (uid.clone(), u)))
+        .collect();
+    post_reveal_free_guess(
+        &ctx, &client, &ar.current_image,
+        actual_lat, actual_lon,
+        &scored, &names, &raw_avatars, &avatar_mxcs, &dm_participants,
+    ).await;
+
+    // ── Continue with remaining guesses ───────────────────────────────────────
+    let mut image_queue = ar.remaining_images.clone();
+
+    while let Some(img) = image_queue.pop_front() {
+        let guess_num = ar.guess_num + (ar.remaining_images.len() - image_queue.len()) as u32;
+
+        // Update active_round state.
+        {
+            let mut st = ctx.state.lock().await;
+            let dm_state = dm_participants.iter().map(|(uid, dm_room_id)| {
+                (uid.to_string(), ActiveDmParticipant {
+                    dm_room_id:      dm_room_id.to_string(),
+                    prompt_event_id: None,
+                    answer_acked:    false,
+                })
+            }).collect();
+            st.active_round = Some(ActiveRoundState {
+                round_id:            ar.round_id,
+                guess_num,
+                total_guesses:       ar.total_guesses,
+                current_image:       img.clone(),
+                remaining_images:    image_queue.clone(),
+                guess_started_at:    chrono::Utc::now(),
+                answer_timeout_secs: ar.answer_timeout_secs,
+                dm_participants:     dm_state,
+                round_scores:        round_scores_free.clone(),
+            });
+            st.save(&ctx.state_path).await.ok();
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            ctx.config.schedule.inter_guess_secs,
+        )).await;
+
+        if let Err(e) = play_free_guess(
+            &ctx, &client, &room,
+            ar.round_id, guess_num, ar.total_guesses,
+            &img, &mut round_scores_free, &dm_participants,
+            ar.answer_timeout_secs,
+        ).await {
+            error!("resume_active_round: play_free_guess error: {e}");
+        }
+    }
+
+    // Finalise.
+    ctx.db.finish_round(ar.round_id).await.ok();
+    ctx.db.upsert_round_scores_free_guess(ar.round_id, &round_scores_free).await.ok();
+
+    post_round_summary_free_guess(&ctx, &client, &room, ar.round_id, &round_scores_free, &dm_participants).await;
+
+    // Clear state.
+    {
+        let mut st = ctx.state.lock().await;
+        st.active_round = None;
+        st.save(&ctx.state_path).await.ok();
+    }
+    {
+        let dm_room_ids: Vec<OwnedRoomId> = dm_participants.values().cloned().collect();
+        let mut dm_rooms = ctx.dm_rooms.lock().await;
+        for id in &dm_room_ids { dm_rooms.remove(id); }
+    }
+    *ctx.round_abort.lock().await = None;
+}
+
 pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoin) {
     // Wait until game_at_utc.
     let now_utc   = chrono::Utc::now();
