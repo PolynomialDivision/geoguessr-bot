@@ -42,8 +42,12 @@ pub fn render_guess_map(
     player_pin: Option<Vec<u8>>,
     r: u8, g: u8, b: u8,
 ) -> Option<Vec<u8>> {
+    // Normalize lons so the line takes the shorter arc (fixes antimeridian crossings).
+    let norm = normalize_lons(&[guess_lon, actual_lon]);
+    let (n_guess_lon, n_actual_lon) = (norm[0], norm[1]);
+
     let center_lat = (guess_lat + actual_lat) / 2.0;
-    let center_lon = (guess_lon + actual_lon) / 2.0;
+    let center_lon = (n_guess_lon + n_actual_lon) / 2.0;
 
     let zoom: u8 = match dist_km as u32 {
         0..=20      => 11,
@@ -65,13 +69,13 @@ pub fn render_guess_map(
         .build()
         .ok()?;
 
-    add_line(&mut map, guess_lat, guess_lon, actual_lat, actual_lon, r, g, b);
+    add_line(&mut map, guess_lat, n_guess_lon, actual_lat, n_actual_lon, r, g, b);
 
     // Avatar pin if available; plain circle as fallback.
     let placed = player_pin.and_then(|png| {
         IconBuilder::new()
             .lat_coordinate(guess_lat)
-            .lon_coordinate(guess_lon)
+            .lon_coordinate(n_guess_lon)
             .x_offset(PIN_ANCHOR_X)
             .y_offset(PIN_ANCHOR_Y)
             .data(png.as_slice())
@@ -81,10 +85,10 @@ pub fn render_guess_map(
     if let Some(icon) = placed {
         map.add_tool(icon);
     } else {
-        add_circle(&mut map, guess_lat, guess_lon, r, g, b);
+        add_circle(&mut map, guess_lat, n_guess_lon, r, g, b);
     }
 
-    add_actual_marker(&mut map, actual_lat, actual_lon);
+    add_actual_marker(&mut map, actual_lat, n_actual_lon);
 
     map.encode_png().ok()
 }
@@ -106,6 +110,16 @@ pub fn render_round_map(
     actual_lat: f64,
     actual_lon: f64,
 ) -> Option<(Vec<u8>, Vec<(String, &'static str)>)> {
+    // Normalize all guess lons relative to actual_lon so the shortest arcs are
+    // used and the auto-fit bounding box covers the correct region.
+    let raw_lons: Vec<f64> = std::iter::once(actual_lon)
+        .chain(guesses.iter().map(|(_, _, lon, _)| *lon))
+        .collect();
+    let norm_lons = normalize_lons(&raw_lons);
+    // norm_lons[0] = actual (unchanged); norm_lons[1..] = guess lons
+    let n_actual_lon = norm_lons[0];
+    let norm_guess_lons: Vec<f64> = norm_lons[1..].to_vec();
+
     let mut map = StaticMapBuilder::new()
         .width(700)
         .height(500)
@@ -115,20 +129,22 @@ pub fn render_round_map(
         .ok()?;
 
     // ── Lines first so they render behind the markers ─────────────────────────
-    for (idx, (_name, lat, lon, _pin)) in guesses.iter().enumerate() {
+    for (idx, (_name, lat, _lon, _pin)) in guesses.iter().enumerate() {
+        let n_lon = norm_guess_lons[idx];
         let (r, g, b, _) = PLAYER_COLORS[idx % PLAYER_COLORS.len()];
-        add_line(&mut map, *lat, *lon, actual_lat, actual_lon, r, g, b);
+        add_line(&mut map, *lat, n_lon, actual_lat, n_actual_lon, r, g, b);
     }
 
     // ── Player markers (avatar pin or plain circle fallback) ──────────────────
     let mut legend: Vec<(String, &'static str)> = Vec::new();
-    for (idx, (name, lat, lon, pin_png)) in guesses.iter().enumerate() {
+    for (idx, (name, lat, _lon, pin_png)) in guesses.iter().enumerate() {
+        let n_lon = norm_guess_lons[idx];
         let (r, g, b, emoji) = PLAYER_COLORS[idx % PLAYER_COLORS.len()];
 
         let placed = pin_png.as_ref().and_then(|png| {
             IconBuilder::new()
                 .lat_coordinate(*lat)
-                .lon_coordinate(*lon)
+                .lon_coordinate(n_lon)
                 .x_offset(PIN_ANCHOR_X)
                 .y_offset(PIN_ANCHOR_Y)
                 .data(png.as_slice())
@@ -139,7 +155,7 @@ pub fn render_round_map(
         if let Some(icon) = placed {
             map.add_tool(icon);
         } else {
-            add_circle(&mut map, *lat, *lon, r, g, b);
+            add_circle(&mut map, *lat, n_lon, r, g, b);
         }
 
         legend.push((name.clone(), emoji));
@@ -148,7 +164,7 @@ pub fn render_round_map(
     // ── Actual location: large white ring + dark fill (stands out from players)
     if let Ok(ring) = CircleBuilder::new()
         .lat_coordinate(actual_lat)
-        .lon_coordinate(actual_lon)
+        .lon_coordinate(n_actual_lon)
         .color(Color::new(true, 255, 255, 255, 255))
         .radius(15.0)
         .build()
@@ -157,7 +173,7 @@ pub fn render_round_map(
     }
     if let Ok(fill) = CircleBuilder::new()
         .lat_coordinate(actual_lat)
-        .lon_coordinate(actual_lon)
+        .lon_coordinate(n_actual_lon)
         .color(Color::new(true, 20, 20, 20, 255))
         .radius(9.0)
         .build()
@@ -170,6 +186,19 @@ pub fn render_round_map(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Normalize longitudes so they're all within 180° of the first element,
+/// ensuring the shortest-arc path is used for lines and bounding boxes.
+fn normalize_lons(lons: &[f64]) -> Vec<f64> {
+    if lons.is_empty() { return vec![]; }
+    let reference = lons[0];
+    lons.iter().map(|&lon| {
+        let mut l = lon;
+        while l - reference >  180.0 { l -= 360.0; }
+        while l - reference < -180.0 { l += 360.0; }
+        l
+    }).collect()
+}
 
 /// Draw a white-underlined coloured line between two points.
 fn add_line(
