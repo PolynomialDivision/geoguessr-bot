@@ -40,7 +40,7 @@ pub struct GameOverrides {
     pub reminder_before_secs: Option<u64>,
     /// Override for how long players have to answer (seconds).
     pub answer_timeout_secs:  Option<u64>,
-    /// Override for how many images are played per round.
+    /// Override for how many guesses (locations) per round.
     pub guesses_per_round:    Option<u32>,
 }
 
@@ -125,7 +125,8 @@ pub async fn start_round(
 
     let n = overrides.as_ref()
         .and_then(|o| o.guesses_per_round)
-        .unwrap_or(ctx.config.schedule.guesses_per_round) as usize;
+        .map(|v| v as usize)
+        .unwrap_or(ctx.effective_guesses_per_round().await);
     let triggered_by = if manual { "manual" } else { "scheduler" };
 
     // Apply per-round overrides (from !schedulegeo).
@@ -1110,8 +1111,8 @@ async fn post_round_summary_free_guess(
     }
 
     // ── Round results (this round only) ──────────────────────────────────────
-    let n_guesses = ctx.config.schedule.guesses_per_round as usize;
-    let max_pts  = 5000i64 * n_guesses as i64;
+    let n_guesses = ctx.effective_guesses_per_round().await;
+    let max_pts   = 5000i64 * n_guesses as i64;
 
     // Fetch per-user stats for this round from DB.
     let round_stats = ctx.db.round_stats(round_id).await.unwrap_or_default();
@@ -1513,7 +1514,7 @@ async fn post_round_summary(
         .collect();
     scores.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
 
-    let n_guesses = ctx.config.schedule.guesses_per_round as usize;
+    let n_guesses = ctx.effective_guesses_per_round().await;
     let mut lines = vec![format!("🌍 **Round over!** {} guess(es):", n_guesses)];
     lines.push(String::new());
 
@@ -1848,7 +1849,7 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
             sources.choose(&mut rng).map(|s| s.as_str()).unwrap_or("wikimedia").to_owned()
         };
 
-        let n_photos = ctx.config.schedule.photos_per_location;
+        let n_photos = ctx.effective_photos_per_location().await;
         let result = match source.as_str() {
             "mapillary" => {
                 crate::sources::mapillary::fetch(
@@ -1954,7 +1955,7 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         st.save(&ctx.state_path).await.ok();
     }
 
-    let n            = ctx.config.schedule.guesses_per_round as usize;
+    let n            = ctx.effective_guesses_per_round().await;
     let triggered_by = "scheduler";
 
     if participants.is_empty() {

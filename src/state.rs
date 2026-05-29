@@ -32,6 +32,9 @@ pub struct State {
     /// Used for reverse-geocoding guess labels. Defaults to "en" when absent.
     #[serde(default)]
     pub user_langs: HashMap<String, String>,
+    /// Runtime overrides for the recurring schedule, set via `!setschedule`.
+    #[serde(default)]
+    pub schedule_overrides: ScheduleOverrides,
 }
 
 /// State saved when the "who wants to play?" message is posted.
@@ -65,10 +68,19 @@ pub struct ScheduledOnce {
     /// None → use the value from config.
     #[serde(default)]
     pub answer_timeout_secs: Option<u64>,
-    /// Override for how many images are played per round.
-    /// None → use the value from config.
+    /// Override for how many guesses (locations) per round.
+    /// None → use the value from config or schedule_overrides.
     #[serde(default)]
     pub guesses_per_round: Option<u32>,
+}
+
+/// Runtime overrides for the recurring daily schedule, set via `!setschedule`.
+/// These sit between per-game overrides (ScheduledOnce) and the static config.
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct ScheduleOverrides {
+    pub guesses_per_round: Option<u32>,
+    pub answer_timeout_secs: Option<u64>,
+    pub photos_per_location: Option<usize>,
 }
 
 // ── I/O ───────────────────────────────────────────────────────────────────────

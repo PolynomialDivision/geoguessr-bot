@@ -41,10 +41,10 @@ pub struct ScheduleConfig {
     /// Seconds to collect answers per guess before revealing.
     #[serde(default = "default_answer_timeout")]
     pub answer_timeout_secs: u64,
-    /// Number of guesses (puzzle units) per round.
+    /// Number of guesses (locations) per round.
     #[serde(default = "default_guesses_per_round", alias = "images_per_round")]
     pub guesses_per_round: u32,
-    /// Pause in seconds between guesses.
+    /// Pause in seconds between pictures.
     #[serde(default = "default_inter_guess_secs", alias = "inter_image_secs")]
     pub inter_guess_secs: u64,
     /// Seconds before game_time to post a "starting soon" reminder. 0 = disabled.
@@ -61,7 +61,7 @@ pub struct ScheduleConfig {
     /// Only used when game_mode = "free_guess" and reminder_before_secs > 0.
     #[serde(default = "default_join_emoji")]
     pub join_emoji: String,
-    /// How many photos to show per question (from nearby locations).
+    /// How many photos to post for a single guess location.
     /// Default 1 (classic single-photo). Increase to give players more visual context.
     #[serde(default = "default_photos_per_location")]
     pub photos_per_location: usize,

@@ -83,6 +83,27 @@ pub struct BotContext {
     pub round_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
 }
 
+impl BotContext {
+    /// Effective guesses-per-round: schedule_overrides beats static config.
+    /// Per-game overrides (ScheduledOnce) are handled at the call site.
+    pub async fn effective_guesses_per_round(&self) -> usize {
+        let ov = self.state.lock().await.schedule_overrides.guesses_per_round;
+        ov.unwrap_or(self.config.schedule.guesses_per_round) as usize
+    }
+
+    /// Effective answer timeout: schedule_overrides beats static config.
+    pub async fn effective_answer_timeout(&self) -> u64 {
+        let ov = self.state.lock().await.schedule_overrides.answer_timeout_secs;
+        ov.unwrap_or(self.config.schedule.answer_timeout_secs)
+    }
+
+    /// Effective photos per guess location: schedule_overrides beats static config.
+    pub async fn effective_photos_per_location(&self) -> usize {
+        let ov = self.state.lock().await.schedule_overrides.photos_per_location;
+        ov.unwrap_or(self.config.schedule.photos_per_location)
+    }
+}
+
 fn thread_reply(
     text:     &str,
     root:     matrix_sdk::ruma::OwnedEventId,

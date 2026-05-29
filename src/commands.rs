@@ -14,6 +14,7 @@ pub async fn handle(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Resul
         | "!geoguessr"   => cmd_startgeo(ctx, sender).await,
         "!cancelgeo"     => cmd_cancelgeo(ctx, sender, body).await,
         "!schedulegeo"   => cmd_schedulegeo(ctx, sender, body).await,
+        "!setschedule"   => cmd_setschedule(ctx, sender, body).await,
         "!prefetch"      => cmd_prefetch(ctx, sender).await,
         "!resetstats"    => cmd_resetstats(ctx, sender, body).await,
         "!scores"
@@ -58,9 +59,9 @@ async fn cmd_startgeo(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<S
     *ctx.round_abort.lock().await = Some(handle.abort_handle());
 
     Ok(Some(format!(
-        "🌍 Starting! {} guesses · {} each.",
-        ctx.config.schedule.guesses_per_round,
-        crate::game::format_duration(ctx.config.schedule.answer_timeout_secs),
+        "🌍 Starting! {} guess(es) · {} each.",
+        ctx.effective_guesses_per_round().await,
+        crate::game::format_duration(ctx.effective_answer_timeout().await),
     )))
 }
 
@@ -133,7 +134,7 @@ async fn cmd_cancelgeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Re
 //   !schedulegeo HH:MM                            — schedule with config defaults
 //   !schedulegeo HH:MM reminder=N                 — join-window before game (seconds)
 //   !schedulegeo HH:MM timeout=N                  — answer timeout (seconds)
-//   !schedulegeo HH:MM guesses=N                  — images per round
+//   !schedulegeo HH:MM guesses=N                  — locations per round
 //   !schedulegeo HH:MM reminder=N timeout=N guesses=N
 //
 // Schedules for today if the game time is still in the future; tomorrow otherwise.
@@ -181,7 +182,7 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
     // Parse optional key=value overrides.
     let mut reminder_override: Option<u64> = None;
     let mut timeout_override:  Option<u64> = None;
-    let mut guesses_override:  Option<u32> = None;
+    let mut guesses_override: Option<u32> = None;
     for arg in &args[1..] {
         if let Some(v) = arg.strip_prefix("reminder=") {
             match v.parse::<u64>() {
@@ -290,6 +291,88 @@ async fn cmd_prefetch(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<S
     game::prefetch_if_needed(ctx, before + 5).await;
     let after = ctx.state.lock().await.cached_guesses.len();
     Ok(Some(format!("✅ Image cache: {before} → {after}")))
+}
+
+// ── !setschedule ──────────────────────────────────────────────────────────────
+//
+// Usage:
+//   !setschedule                          — show current runtime overrides
+//   !setschedule guesses=N               — override guesses per round
+//   !setschedule photos=N                — override photos per guess location
+//   !setschedule timeout=N               — override answer timeout (seconds)
+//   !setschedule reset                   — clear all runtime overrides
+
+async fn cmd_setschedule(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
+    require_admin(ctx, sender)?;
+
+    let args: Vec<&str> = body.split_whitespace().skip(1).collect();
+
+    if args.is_empty() {
+        let ov = ctx.state.lock().await.schedule_overrides.clone();
+        let guesses = ov.guesses_per_round
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("{} (config)", ctx.config.schedule.guesses_per_round));
+        let photos = ov.photos_per_location
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("{} (config)", ctx.config.schedule.photos_per_location));
+        let timeout = ov.answer_timeout_secs
+            .map(|s| crate::game::format_duration(s))
+            .unwrap_or_else(|| format!("{} (config)", crate::game::format_duration(ctx.config.schedule.answer_timeout_secs)));
+        return Ok(Some(format!(
+            "📅 Schedule overrides:\n· guesses: {guesses}\n· photos/guess: {photos}\n· timeout: {timeout}\nChange: !setschedule [guesses=N] [photos=N] [timeout=N] | !setschedule reset"
+        )));
+    }
+
+    if args == ["reset"] {
+        {
+            let mut st = ctx.state.lock().await;
+            st.schedule_overrides = Default::default();
+            st.save(&ctx.state_path).await?;
+        }
+        return Ok(Some("✅ Schedule overrides cleared — using config defaults.".to_owned()));
+    }
+
+    let mut guesses_override: Option<u32>  = None;
+    let mut photos_override:  Option<usize> = None;
+    let mut timeout_override: Option<u64>  = None;
+    for arg in &args {
+        if let Some(v) = arg.strip_prefix("guesses=") {
+            match v.parse::<u32>() {
+                Ok(n) if n >= 1 => guesses_override = Some(n),
+                Ok(_)  => return Ok(Some("❌ guesses must be at least 1.".to_owned())),
+                Err(_) => return Ok(Some(format!("❌ Invalid guesses \"{v}\" · must be a number."))),
+            }
+        } else if let Some(v) = arg.strip_prefix("photos=") {
+            match v.parse::<usize>() {
+                Ok(n) if n >= 1 => photos_override = Some(n),
+                Ok(_)  => return Ok(Some("❌ photos must be at least 1.".to_owned())),
+                Err(_) => return Ok(Some(format!("❌ Invalid photos \"{v}\" · must be a number."))),
+            }
+        } else if let Some(v) = arg.strip_prefix("timeout=") {
+            match v.parse::<u64>() {
+                Ok(n)  => timeout_override = Some(n),
+                Err(_) => return Ok(Some(format!("❌ Invalid timeout \"{v}\" · must be seconds."))),
+            }
+        } else {
+            return Ok(Some(format!(
+                "❌ Unknown argument \"{arg}\"\nUsage: !setschedule [guesses=N] [photos=N] [timeout=N] | reset"
+            )));
+        }
+    }
+
+    {
+        let mut st = ctx.state.lock().await;
+        if let Some(n) = guesses_override { st.schedule_overrides.guesses_per_round = Some(n); }
+        if let Some(n) = photos_override  { st.schedule_overrides.photos_per_location = Some(n); }
+        if let Some(n) = timeout_override { st.schedule_overrides.answer_timeout_secs = Some(n); }
+        st.save(&ctx.state_path).await?;
+    }
+
+    let mut parts = Vec::new();
+    if let Some(n) = guesses_override { parts.push(format!("{n} guess{}", if n == 1 { "" } else { "es" })); }
+    if let Some(n) = photos_override  { parts.push(format!("{n} photo{}/guess", if n == 1 { "" } else { "s" })); }
+    if let Some(n) = timeout_override { parts.push(format!("timeout {}", crate::game::format_duration(n))); }
+    Ok(Some(format!("✅ Schedule updated: {}", parts.join(", "))))
 }
 
 // ── !resetstats ───────────────────────────────────────────────────────────────
@@ -542,7 +625,7 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
     };
 
     let photos_line = if s.photos_per_location > 1 {
-        format!("\n📸 {} photos per location", s.photos_per_location)
+        format!("\n📸 {} photos per guess", s.photos_per_location)
     } else {
         String::new()
     };
@@ -618,6 +701,8 @@ fn help_text() -> String {
   !cancelgeo HH:MM                           · cancel a scheduled game
   !schedulegeo HH:MM [reminder=N] [timeout=N] [guesses=N]
                                              · schedule a game (today if possible)
+  !setschedule [guesses=N] [photos=N] [timeout=N]  · override daily schedule defaults
+  !setschedule reset                         · clear overrides, use config values
   !prefetch                                  · fill the image cache
   !resetstats confirm                        · wipe all history"
         .to_owned()
