@@ -7,14 +7,17 @@ use chrono_tz::Tz;
 use matrix_sdk::{
     Client, Room,
     ruma::{
-        OwnedEventId, OwnedRoomId, OwnedUserId,
+        OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, UInt,
         events::{
             Mentions,
             reaction::ReactionEventContent,
             relation::Annotation,
-            room::message::{
-                ImageMessageEventContent, MessageType,
-                ReplacementMetadata, RoomMessageEventContent,
+            room::{
+                ImageInfo,
+                message::{
+                    ImageMessageEventContent, MessageType,
+                    ReplacementMetadata, RoomMessageEventContent,
+                },
             },
         },
         // (ReactionEventContent and Annotation kept for join-phase reactions)
@@ -30,6 +33,15 @@ use crate::{
     sources::GeoImage,
     state::{ActiveDmParticipant, ActiveRoundState, PendingJoin},
 };
+
+/// Metadata about an image that has been uploaded to the Matrix media store.
+struct UploadedMedia {
+    uri:  OwnedMxcUri,
+    mime: mime::Mime,
+    w:    u32,
+    h:    u32,
+    size: usize,
+}
 
 // ── Per-round overrides ───────────────────────────────────────────────────────
 
@@ -406,14 +418,13 @@ async fn play_free_guess(
     let n_imgs = all_images.len();
 
     // Post all images to the main room.
-    for (i, (mxc_uri, _mime)) in all_images.iter().enumerate() {
+    for (i, media) in all_images.iter().enumerate() {
         let label = if n_imgs == 1 {
             "📍 Where is this?".to_owned()
         } else {
             format!("📍 {}/{}", i + 1, n_imgs)
         };
-        let image_content = ImageMessageEventContent::plain(label, mxc_uri.clone());
-        room.send(RoomMessageEventContent::new(MessageType::Image(image_content))).await?;
+        room.send(image_content_with_info(label, media.uri.clone(), &media.mime, media.w, media.h, media.size)).await?;
     }
 
     let total_secs  = answer_timeout_secs;
@@ -453,14 +464,13 @@ async fn play_free_guess(
     );
     for (uid, dm_room_id) in dm_participants.iter() {
         if let Some(dm_room) = client.get_room(dm_room_id) {
-            for (i, (mxc_uri, _mime)) in all_images.iter().enumerate() {
+            for (i, media) in all_images.iter().enumerate() {
                 let label = if n_imgs == 1 {
                     "📍 Where is this?".to_owned()
                 } else {
                     format!("📍 {}/{}", i + 1, n_imgs)
                 };
-                let dm_img = ImageMessageEventContent::plain(label, mxc_uri.clone());
-                dm_room.send(RoomMessageEventContent::new(MessageType::Image(dm_img))).await.ok();
+                dm_room.send(image_content_with_info(label, media.uri.clone(), &media.mime, media.w, media.h, media.size)).await.ok();
             }
             let lang = ctx.state.lock().await
                 .user_langs.get(uid.as_str()).cloned()
@@ -769,11 +779,12 @@ async fn post_reveal_free_guess(
         })
         .await
         {
+            let (w, h) = image_dimensions(&png);
+            let size = png.len();
             if let Ok(resp) = client.media().upload(&map_mime, png, None).await {
                 let label = format!("🥇 Best guess · {} away", format_dist(d));
-                let img = ImageMessageEventContent::plain(label, resp.content_uri);
                 if let Some(r) = client.get_room(&ctx.room_id) {
-                    r.send(RoomMessageEventContent::new(MessageType::Image(img))).await.ok();
+                    r.send(image_content_with_info(label, resp.content_uri, &map_mime, w, h, size)).await.ok();
                 }
             }
         }
@@ -809,11 +820,12 @@ async fn post_reveal_free_guess(
         })
         .await
         {
+            let (w, h) = image_dimensions(&png);
+            let size = png.len();
             if let Ok(resp) = client.media().upload(&map_mime, png, None).await {
                 let label = format!("🗺️ All {} guesses this round", scored.len());
-                let img = ImageMessageEventContent::plain(label, resp.content_uri);
                 if let Some(r) = client.get_room(&ctx.room_id) {
-                    r.send(RoomMessageEventContent::new(MessageType::Image(img))).await.ok();
+                    r.send(image_content_with_info(label, resp.content_uri, &map_mime, w, h, size)).await.ok();
 
                     // Legend: 🔵 @alice:s  🔴 @bob:s  ⬛ actual
                     let mut parts: Vec<String> = scored
@@ -881,11 +893,12 @@ async fn post_reveal_free_guess(
                 .await
                 {
                     let map_mime: mime::Mime = "image/png".parse().unwrap();
+                    let (w, h) = image_dimensions(&png);
+                    let size = png.len();
                     if let Ok(resp) = client.media().upload(&map_mime, png, None).await {
                         let label = format!("📍 {} away", format_dist(dist_val));
-                        let img = ImageMessageEventContent::plain(label, resp.content_uri);
                         dm_room
-                            .send(RoomMessageEventContent::new(MessageType::Image(img)))
+                            .send(image_content_with_info(label, resp.content_uri, &map_mime, w, h, size))
                             .await
                             .ok();
                     }
@@ -1253,12 +1266,12 @@ async fn reconcile_join_reactions(
 // ── Image upload ──────────────────────────────────────────────────────────────
 
 /// Upload the primary image and all extra images.
-/// Returns a vec of `(mxc_uri, mime)` pairs — primary first.
+/// Returns a vec of `UploadedMedia` — primary first.
 /// Extra images that fail to upload are silently skipped (logged as warnings).
 async fn upload_all_images(
     client: &Client,
     img:    &GeoImage,
-) -> anyhow::Result<Vec<(matrix_sdk::ruma::OwnedMxcUri, mime::Mime)>> {
+) -> anyhow::Result<Vec<UploadedMedia>> {
     let primary = upload_image(client, img).await?;
     let mut results = vec![primary];
 
@@ -1275,7 +1288,7 @@ async fn upload_all_images(
 async fn upload_http_url(
     client: &Client,
     url:    &str,
-) -> anyhow::Result<(matrix_sdk::ruma::OwnedMxcUri, mime::Mime)> {
+) -> anyhow::Result<UploadedMedia> {
     let resp = reqwest::Client::builder()
         .user_agent("geoguessr-bot/0.1")
         .build()?
@@ -1294,20 +1307,24 @@ async fn upload_http_url(
         .to_owned();
     let mime: mime::Mime = mime_str.parse().unwrap_or(mime::IMAGE_JPEG);
     let data = resp.bytes().await?.to_vec();
+    let (w, h) = image_dimensions(&data);
+    let size = data.len();
     let response = client.media().upload(&mime, data, None).await?;
-    Ok((response.content_uri, mime))
+    Ok(UploadedMedia { uri: response.content_uri, mime, w, h, size })
 }
 
 async fn upload_image(
     client: &Client,
     img:    &GeoImage,
-) -> anyhow::Result<(matrix_sdk::ruma::OwnedMxcUri, mime::Mime)> {
+) -> anyhow::Result<UploadedMedia> {
     if img.image_url.starts_with('/') || img.image_url.starts_with("file://") {
         let path = img.image_url.trim_start_matches("file://");
         let data = tokio::fs::read(path).await?;
         let mime = detect_mime(&data);
+        let (w, h) = image_dimensions(&data);
+        let size = data.len();
         let response = client.media().upload(&mime, data, None).await?;
-        Ok((response.content_uri, mime))
+        Ok(UploadedMedia { uri: response.content_uri, mime, w, h, size })
     } else {
         upload_http_url(client, &img.image_url).await
     }
@@ -1317,6 +1334,38 @@ fn detect_mime(data: &[u8]) -> mime::Mime {
     if data.starts_with(b"\x89PNG")     { mime::IMAGE_PNG }
     else if data.starts_with(b"\xff\xd8\xff") { mime::IMAGE_JPEG }
     else                                { mime::IMAGE_JPEG }
+}
+
+/// Extract pixel dimensions from image bytes without full decode.
+/// Returns (0, 0) if the format is unrecognised or the header is truncated.
+fn image_dimensions(data: &[u8]) -> (u32, u32) {
+    use std::io::Cursor;
+    image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .ok()
+        .and_then(|r| r.into_dimensions().ok())
+        .unwrap_or((0, 0))
+}
+
+/// Build a spec-compliant `m.image` event with a populated `info` block.
+/// Clients (especially Element X / Rust SDK) require `info.mimetype` to route
+/// the event to the image renderer; without it they fall back to plain text body.
+fn image_content_with_info(
+    label: String,
+    uri:   OwnedMxcUri,
+    mime:  &mime::Mime,
+    w:     u32,
+    h:     u32,
+    size:  usize,
+) -> RoomMessageEventContent {
+    let mut info = ImageInfo::new();
+    info.mimetype = Some(mime.to_string());
+    info.width    = if w > 0    { UInt::new(w as u64)    } else { None };
+    info.height   = if h > 0    { UInt::new(h as u64)    } else { None };
+    info.size     = if size > 0 { UInt::new(size as u64) } else { None };
+    let mut content = ImageMessageEventContent::plain(label, uri);
+    content.info = Some(Box::new(info));
+    RoomMessageEventContent::new(MessageType::Image(content))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
