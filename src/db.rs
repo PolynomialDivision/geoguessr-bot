@@ -472,6 +472,27 @@ impl Db {
     }
 }
 
+// ── Location history (dedup) ──────────────────────────────────────────────────
+
+impl Db {
+    /// Return the coordinates of all played locations so the prefetcher can
+    /// exclude nearby areas (within MIN_DISTANCE_KM).
+    pub async fn recent_played_coords(&self) -> Result<Vec<(f64, f64)>> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT actual_lat, actual_lon FROM guesses
+                 WHERE actual_lat IS NOT NULL AND actual_lon IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .context("reading played coords")
+        })
+        .await
+    }
+}
+
 // ── Leaderboard + stats ───────────────────────────────────────────────────────
 
 impl Db {

@@ -1521,8 +1521,8 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
     let sources = &ctx.config.sources.enabled;
 
     // Collect existing coordinates and sequence IDs so each fetch in this
-    // batch avoids duplicating locations already in the cache or fetched
-    // earlier in the same batch.
+    // batch avoids duplicating locations already in the cache, fetched
+    // earlier in the same batch, or played in recent rounds.
     let (mut existing_coords, mut existing_seqs): (Vec<(f64, f64)>, Vec<Option<String>>) = {
         let st = ctx.state.lock().await;
         st.cached_guesses.iter()
@@ -1533,6 +1533,15 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
             .filter_map(|(coord, seq)| coord.map(|c| (c, seq)))
             .unzip()
     };
+    // Extend with recently played coordinates from the DB so the dedup check
+    // survives restarts and persists beyond the pending-cache window.
+    if let Ok(played) = ctx.db.recent_played_coords().await {
+        for coord in played {
+            if !existing_coords.contains(&coord) {
+                existing_coords.push(coord);
+            }
+        }
+    }
 
     for _ in 0..needed {
         let source = {
