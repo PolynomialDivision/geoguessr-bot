@@ -1358,12 +1358,19 @@ fn image_content_with_info(
     h:     u32,
     size:  usize,
 ) -> RoomMessageEventContent {
+    // Sanitize: derive extension from MIME type and produce a safe filename.
+    let ext = match mime.subtype().as_str() {
+        "jpeg" => ".jpg",
+        sub    => if matches!(sub, "png" | "webp" | "gif") { &format!(".{sub}") } else { "" },
+    };
+    let safe_body = crate::format::sanitize_filename(&format!("{label}{ext}"));
+
     let mut info = ImageInfo::new();
     info.mimetype = Some(mime.to_string());
     info.width    = if w > 0    { UInt::new(w as u64)    } else { None };
     info.height   = if h > 0    { UInt::new(h as u64)    } else { None };
     info.size     = if size > 0 { UInt::new(size as u64) } else { None };
-    let mut content = ImageMessageEventContent::plain(label, uri);
+    let mut content = ImageMessageEventContent::plain(safe_body, uri);
     content.info = Some(Box::new(info));
     RoomMessageEventContent::new(MessageType::Image(content))
 }
