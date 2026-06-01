@@ -45,6 +45,8 @@ pub fn render_guess_map(
 ) -> Option<Vec<u8>> {
     let center_lat = (guess_lat + actual_lat) / 2.0;
     let (center_lon, arc_span) = minimum_lon_arc(&[guess_lon, actual_lon]);
+    let guess_lon  = normalize_lon(guess_lon,  center_lon);
+    let actual_lon = normalize_lon(actual_lon, center_lon);
 
     // Base zoom from distance; cap further if the shorter arc is narrow enough
     // that both points would fall off-screen at the default zoom.
@@ -126,6 +128,7 @@ pub fn render_round_map(
         .collect();
 
     let (center_lon, lon_span) = minimum_lon_arc(&all_lons);
+    let actual_lon = normalize_lon(actual_lon, center_lon);
     let lat_min = all_lats.iter().cloned().fold(f64::INFINITY,     f64::min);
     let lat_max = all_lats.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let center_lat = (lat_min + lat_max) / 2.0;
@@ -157,19 +160,21 @@ pub fn render_round_map(
 
     // ── Lines first so they render behind the markers ─────────────────────────
     for (idx, (_name, lat, lon, _pin)) in guesses.iter().enumerate() {
+        let lon_n = normalize_lon(*lon, center_lon);
         let (r, g, b, _) = PLAYER_COLORS[idx % PLAYER_COLORS.len()];
-        add_line_shorter_arc(&mut map, *lat, *lon, actual_lat, actual_lon, r, g, b);
+        add_line_shorter_arc(&mut map, *lat, lon_n, actual_lat, actual_lon, r, g, b);
     }
 
     // ── Player markers (avatar pin or plain circle fallback) ──────────────────
     let mut legend: Vec<(String, &'static str)> = Vec::new();
     for (idx, (name, lat, lon, pin_png)) in guesses.iter().enumerate() {
+        let lon_n = normalize_lon(*lon, center_lon);
         let (r, g, b, emoji) = PLAYER_COLORS[idx % PLAYER_COLORS.len()];
 
         let placed = pin_png.as_ref().and_then(|png| {
             IconBuilder::new()
                 .lat_coordinate(*lat)
-                .lon_coordinate(*lon)
+                .lon_coordinate(lon_n)
                 .x_offset(PIN_ANCHOR_X)
                 .y_offset(PIN_ANCHOR_Y)
                 .data(png.as_slice())
@@ -180,7 +185,7 @@ pub fn render_round_map(
         if let Some(icon) = placed {
             map.add_tool(icon);
         } else {
-            add_circle(&mut map, *lat, *lon, r, g, b);
+            add_circle(&mut map, *lat, lon_n, r, g, b);
         }
 
         legend.push((name.clone(), emoji));
@@ -211,6 +216,16 @@ pub fn render_round_map(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Normalize `lon` to be within 180° of `center_lon`.
+/// May return values outside [-180, 180]; staticmap's tile arithmetic handles
+/// that correctly for pixel placement even though tile fetching wraps separately.
+fn normalize_lon(lon: f64, center_lon: f64) -> f64 {
+    let mut l = lon;
+    while l - center_lon >  180.0 { l -= 360.0; }
+    while l - center_lon < -180.0 { l += 360.0; }
+    l
+}
 
 /// Returns `(center_lon, arc_span_degrees)` for the minimum-width arc
 /// containing all given longitudes.  Handles antimeridian wrapping correctly.
