@@ -23,6 +23,14 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
     let now_minute = local_now.minute();
     let offset     = ctx.config.schedule.reminder_before_secs as i64;
 
+    // Guard: at most one round may be spawned per tick.
+    //
+    // active_game is only set inside play_free_guess (after the join-phase wait),
+    // so checking it here is not sufficient to prevent two concurrent spawns within
+    // the same tick — e.g. a recurring slot and a one-time slot resolving to the
+    // same wall-clock minute.  This flag closes that window.
+    let mut round_spawned = false;
+
     // ── Recurring slots from config ───────────────────────────────────────────
     for time_str in &ctx.config.schedule.game_times {
         let (qh, qm) = match ScheduleConfig::parse_game_time(time_str) {
@@ -57,7 +65,22 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
             }
         }
 
+        if round_spawned {
+            warn!("Scheduler: fire time for {time_str} skipped — another round was already spawned this tick");
+            continue;
+        }
+
+        // Mark the slot as done *before* spawning so the next tick (60 s later)
+        // doesn't re-fire it if the round is still in its join phase and
+        // active_game has not been set yet.
+        {
+            let mut state = ctx.state.lock().await;
+            state.last_game_dates.insert(time_str.clone(), local_date);
+            state.save(&ctx.state_path).await.ok();
+        }
+
         info!("Scheduled game firing for slot {time_str}");
+        round_spawned = true;
         let ctx2    = ctx.clone();
         let client2 = client.clone();
         let slot    = time_str.clone();
@@ -113,7 +136,16 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
             }
         }
 
+        if round_spawned {
+            warn!(
+                "One-time game at {} dropped — another round was already spawned this tick",
+                entry.game_time,
+            );
+            continue;
+        }
+
         info!("One-time game firing for {} (fire at {fire_hour}:{fire_min:02})", entry.game_time);
+        round_spawned = true;
         let ctx2    = ctx.clone();
         let client2 = client.clone();
         let overrides = GameOverrides {

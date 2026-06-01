@@ -54,7 +54,7 @@ where
 // ── Diversity helpers ─────────────────────────────────────────────────────────
 
 /// Minimum distance (km) between any two accepted locations.
-pub(super) const MIN_DISTANCE_KM: f64 = 75.0;
+pub const MIN_DISTANCE_KM: f64 = 75.0;
 
 /// Haversine great-circle distance in kilometres.
 pub(super) fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
@@ -68,7 +68,7 @@ pub(super) fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 
 /// Minimum distance from `(lat, lon)` to any point in `existing` (km).
 /// Returns `f64::INFINITY` when `existing` is empty (first fetch — always accepted).
-pub(super) fn min_dist_to_existing(lat: f64, lon: f64, existing: &[(f64, f64)]) -> f64 {
+pub fn min_dist_to_existing(lat: f64, lon: f64, existing: &[(f64, f64)]) -> f64 {
     existing
         .iter()
         .map(|&(elat, elon)| haversine_km(lat, lon, elat, elon))

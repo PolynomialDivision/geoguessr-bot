@@ -272,25 +272,45 @@ pub async fn start_round(
 
     info!("GeoGuessr round {round_id} started ({n} images, triggered_by={triggered_by})");
 
-    // Pop all images from the cache at once so we can persist them for recovery.
+    // Pop images from the cache with a final dedup gate.
+    //
+    // We re-read played coords here rather than relying solely on the eviction
+    // pass inside prefetch_if_needed, because a concurrent background refill
+    // (spawned at the end of the *previous* round) may have added a stale entry
+    // between that eviction and this pop.
+    let pop_db_coords = ctx.db.recent_played_coords().await.unwrap_or_default();
     let mut image_queue: VecDeque<GeoImage> = {
-        let mut st = ctx.state.lock().await;
-        let mut q  = VecDeque::new();
-        for _ in 0..n {
-            match st.cached_guesses.pop_front() {
-                Some(img) => q.push_back(img),
-                None      => { warn!("GeoGuessr: guess cache empty — truncating round"); break; }
+        let mut st    = ctx.state.lock().await;
+        let mut q     = VecDeque::new();
+        let limit     = st.cached_guesses.len();
+        let mut checked = 0;
+        while q.len() < n && checked < limit {
+            let img = st.cached_guesses.pop_front().expect("bounded by limit");
+            checked += 1;
+            let valid = img.lat.zip(img.lon)
+                .map(|(la, lo)| {
+                    crate::sources::min_dist_to_existing(la, lo, &pop_db_coords)
+                        >= crate::sources::MIN_DISTANCE_KM
+                })
+                .unwrap_or(true); // no coords → can't check, accept
+            if valid {
+                q.push_back(img);
+            } else {
+                warn!(
+                    "GeoGuessr: pop-time dedup: discarded {} (too close to a played location)",
+                    img.country
+                );
             }
+        }
+        if q.len() < n {
+            warn!(
+                "GeoGuessr: round will use {} image(s) instead of {n} after pop-time dedup",
+                q.len()
+            );
         }
         st.save(&ctx.state_path).await.ok();
         q
     };
-
-    // Background refill now that we've consumed from the cache.
-    {
-        let ctx2 = ctx.clone();
-        tokio::spawn(async move { prefetch_if_needed(&ctx2, n + 2).await; });
-    }
 
     let mut round_scores_free: HashMap<String, i64> = HashMap::new();
 
@@ -340,6 +360,16 @@ pub async fn start_round(
     // ── Finalise round ────────────────────────────────────────────────────────
     ctx.db.finish_round(round_id).await?;
     ctx.db.upsert_round_scores_free_guess(round_id, &round_scores_free).await?;
+
+    // Background refill — placed here so all DB writes for this round (including
+    // every start_guess call) are committed before recent_played_coords() is read
+    // inside the next prefetch_if_needed.  Previously this was spawned right after
+    // the pop, which created a window where the refill snapshot was missing the
+    // current round's locations.
+    {
+        let ctx2 = ctx.clone();
+        tokio::spawn(async move { prefetch_if_needed(&ctx2, n + 2).await; });
+    }
 
     if let Some(slot) = slot {
         let tz: Tz = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
@@ -1519,6 +1549,30 @@ async fn fetch_names(room: &Room, user_ids: &[&str]) -> HashMap<String, String> 
 // ── Prefetch ──────────────────────────────────────────────────────────────────
 
 pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
+    // Load played coords once — used for both cache eviction and new-image dedup.
+    let db_coords: Vec<(f64, f64)> = ctx.db.recent_played_coords().await.unwrap_or_default();
+
+    // Evict cached images that are now within MIN_DISTANCE_KM of a played location.
+    // This prevents a location cached before a nearby round was played from
+    // appearing again in a subsequent round.
+    {
+        let mut st = ctx.state.lock().await;
+        let before = st.cached_guesses.len();
+        st.cached_guesses.retain(|img| {
+            match img.lat.zip(img.lon) {
+                None => true,
+                Some((lat, lon)) =>
+                    crate::sources::min_dist_to_existing(lat, lon, &db_coords)
+                        >= crate::sources::MIN_DISTANCE_KM,
+            }
+        });
+        let evicted = before - st.cached_guesses.len();
+        if evicted > 0 {
+            warn!("GeoGuessr: evicted {evicted} stale cached image(s) too close to a played location");
+            st.save(&ctx.state_path).await.ok();
+        }
+    }
+
     let current = ctx.state.lock().await.cached_guesses.len();
     let needed  = target.saturating_sub(current);
     if needed == 0 { return; }
@@ -1540,13 +1594,10 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
             .filter_map(|(coord, seq)| coord.map(|c| (c, seq)))
             .unzip()
     };
-    // Extend with recently played coordinates from the DB so the dedup check
-    // survives restarts and persists beyond the pending-cache window.
-    if let Ok(played) = ctx.db.recent_played_coords().await {
-        for coord in played {
-            if !existing_coords.contains(&coord) {
-                existing_coords.push(coord);
-            }
+    // Merge in DB coords (deduplicating against cache coords already included).
+    for coord in db_coords {
+        if !existing_coords.contains(&coord) {
+            existing_coords.push(coord);
         }
     }
 
