@@ -45,6 +45,17 @@ struct MapillaryImage {
     /// same capture run on the same road/trail.
     #[serde(default)]
     sequence:        Option<String>,
+    /// Capture time as Unix milliseconds (used for freshness scoring).
+    #[serde(default)]
+    captured_at:     Option<i64>,
+    /// Original image dimensions (used for resolution scoring).
+    #[serde(default)]
+    width:           Option<u32>,
+    #[serde(default)]
+    height:          Option<u32>,
+    /// Camera heading in degrees [0, 360) — used for sequence heading stability.
+    #[serde(default)]
+    compass_angle:   Option<f32>,
 }
 
 /// GeoJSON Point geometry — coordinates are [longitude, latitude].
@@ -74,6 +85,7 @@ pub async fn fetch(
     n_photos:      usize,
     existing:      &[(f64, f64)],
     existing_seqs: &[Option<String>],
+    filter:        &mut super::quality_filter::FilterState,
 ) -> Result<GeoImage> {
     let n_photos = n_photos.max(1);
     if cfg.access_token.is_empty() {
@@ -105,8 +117,8 @@ pub async fn fetch(
     };
 
     for seed in candidates.iter().take(10) {
-        match try_seed(&client, seed, cfg, n_photos, existing, existing_seqs).await {
-            Ok(img) => {
+        match try_seed(&client, seed, cfg, n_photos, existing, existing_seqs, filter).await {
+            Ok(Some(img)) => {
                 info!(
                     "Mapillary: found {} photo(s) for {} ({}) — nearest existing {:.0} km",
                     1 + img.extra_image_urls.len(),
@@ -117,7 +129,8 @@ pub async fn fetch(
                 );
                 return Ok(img);
             }
-            Err(e) => warn!("Mapillary: seed {} failed: {e}", seed.name),
+            Ok(None)   => {} // quality filter rejected all candidates for this seed
+            Err(e)     => warn!("Mapillary: seed {} failed: {e}", seed.name),
         }
     }
 
@@ -133,11 +146,12 @@ async fn try_seed(
     n_photos:      usize,
     existing:      &[(f64, f64)],
     existing_seqs: &[Option<String>],
-) -> Result<GeoImage> {
+    filter:        &mut super::quality_filter::FilterState,
+) -> Result<Option<GeoImage>> {
     let radius_km = (cfg.search_radius / 1000).clamp(1, 50);
     let url = format!(
         "{API}?access_token={token}\
-         &fields=id,geometry,thumb_1024_url,creator,sequence\
+         &fields=id,geometry,thumb_1024_url,creator,sequence,captured_at,width,height,compass_angle\
          &lat={lat}&lng={lon}\
          &radius={radius}\
          &limit=50",
@@ -153,7 +167,10 @@ async fn try_seed(
         bail!("no images found near {} within {}km", seed.name, radius_km);
     }
 
-    // Shuffle, then filter to images that have a thumbnail URL.
+    // Save for density scoring before resp.data is moved.
+    let area_image_count = resp.data.len();
+
+    // Shuffle, then retain only images that have a thumbnail URL.
     let mut candidates: Vec<MapillaryImage> = {
         let mut rng  = rand::thread_rng();
         let mut data = resp.data;
@@ -167,72 +184,128 @@ async fn try_seed(
         bail!("no images with thumbnail URL near {}", seed.name);
     }
 
-    // ── Find a primary image that passes diversity checks ─────────────────────
-    let primary_idx = candidates.iter().position(|img| {
-        let lon = img.geometry.coordinates[0];
-        let lat = img.geometry.coordinates[1];
-
-        // Distance check: reject if too close to any existing location.
-        let dist = min_dist_to_existing(lat, lon, existing);
-        if dist < MIN_DISTANCE_KM {
-            return false;
-        }
-
-        // Sequence check: reject if same capture run as any existing location.
-        if let Some(ref seq) = img.sequence {
-            if existing_seqs.iter().any(|es| es.as_deref() == Some(seq.as_str())) {
+    // ── Collect all diversity-passing candidate indices ───────────────────────
+    let passing: Vec<usize> = (0..candidates.len())
+        .filter(|&i| {
+            let img = &candidates[i];
+            let lon = img.geometry.coordinates[0];
+            let lat = img.geometry.coordinates[1];
+            if min_dist_to_existing(lat, lon, existing) < MIN_DISTANCE_KM {
                 return false;
             }
-        }
+            if let Some(ref seq) = img.sequence {
+                if existing_seqs.iter().any(|es| es.as_deref() == Some(seq.as_str())) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
 
-        true
-    });
-
-    let primary_idx = match primary_idx {
-        Some(i) => i,
-        None    => bail!(
+    if passing.is_empty() {
+        bail!(
             "all {} candidates near {} are within {MIN_DISTANCE_KM:.0} km of an existing \
              location or share a sequence",
             candidates.len(), seed.name
-        ),
-    };
+        );
+    }
 
-    let primary = candidates.remove(primary_idx);
+    // ── Try each diversity-passing candidate through the quality filter ────────
+    // Iterating over indices lets us remove and return the first one that passes
+    // without cloning the whole struct up front.
+    for primary_idx in passing {
+        let seq_score = sequence_score_for(&candidates, primary_idx);
+        let qr = filter.evaluate(&super::quality_filter::QualityInput {
+            width:               candidates[primary_idx].width.unwrap_or(0),
+            height:              candidates[primary_idx].height.unwrap_or(0),
+            captured_at_ms:      candidates[primary_idx].captured_at,
+            area_image_count,
+            search_radius_km:    radius_km as f64,
+            gps_jitter_m:        None, // not exposed by Mapillary v4 API
+            sequence_continuity: seq_score,
+        });
 
-    let lon = primary.geometry.coordinates[0];
-    let lat = primary.geometry.coordinates[1];
+        if qr.decision == super::quality_filter::Decision::Reject {
+            warn!(
+                "Mapillary: quality filter: {} score={:.2} ({})",
+                seed.name, qr.score, qr.reason,
+            );
+            continue; // try next candidate in this seed area
+        }
 
-    let attribution = primary
-        .creator
-        .as_ref()
-        .and_then(|c| c.username.as_deref())
-        .map(|u| format!("© {u} on Mapillary (CC BY-SA)"))
-        .unwrap_or_else(|| "© Mapillary contributors (CC BY-SA)".to_owned());
+        info!("Mapillary: quality {:.2} ({}) for {}", qr.score, qr.reason, seed.name);
 
-    // ── Extra photos: different sequence from primary ─────────────────────────
-    // For multi-photo guesses we still want nearby images for visual context,
-    // but avoid showing frames from the exact same capture run as the primary.
-    let primary_seq = primary.sequence.as_deref();
-    let extra_image_urls: Vec<String> = candidates
+        let primary = candidates.remove(primary_idx);
+        let lon = primary.geometry.coordinates[0];
+        let lat = primary.geometry.coordinates[1];
+
+        let attribution = primary
+            .creator
+            .as_ref()
+            .and_then(|c| c.username.as_deref())
+            .map(|u| format!("© {u} on Mapillary (CC BY-SA)"))
+            .unwrap_or_else(|| "© Mapillary contributors (CC BY-SA)".to_owned());
+
+        // Extra photos: from the remaining pool, different sequence from primary.
+        let primary_seq = primary.sequence.as_deref();
+        let extra_image_urls: Vec<String> = candidates
+            .iter()
+            .filter(|img| img.sequence.as_deref() != primary_seq || primary_seq.is_none())
+            .filter_map(|img| img.thumb_1024_url.clone())
+            .take(n_photos.saturating_sub(1))
+            .collect();
+
+        return Ok(Some(GeoImage {
+            country:         seed.name.to_owned(),
+            region:          seed.region.to_owned(),
+            city:            None,
+            image_url:       primary.thumb_1024_url.unwrap(), // safe: filtered above
+            source:          "mapillary".to_owned(),
+            attribution:     Some(attribution),
+            lat:             Some(lat),
+            lon:             Some(lon),
+            sequence:        primary.sequence,
+            extra_image_urls,
+        }));
+    }
+
+    // All diversity-passing candidates in this seed area failed quality check.
+    Ok(None)
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Build a sequence-continuity score for the candidate at `primary_idx` by
+/// collecting all images from the same sequence ID in `candidates`, sorting
+/// them by capture time, and running the sequence scorer.
+///
+/// Returns `None` when the candidate has no sequence ID (isolated frame
+/// without attribution to a traversal), allowing the quality filter to exclude
+/// the axis and redistribute its weight rather than blindly penalising.
+fn sequence_score_for(
+    candidates: &[MapillaryImage],
+    primary_idx: usize,
+) -> Option<f32> {
+    let seq_id = candidates[primary_idx].sequence.as_deref()?;
+
+    let mut frames: Vec<super::quality_filter::SequenceFrame> = candidates
         .iter()
-        .filter(|img| {
-            // Different sequence than primary (or sequence unknown).
-            img.sequence.as_deref() != primary_seq || primary_seq.is_none()
+        .filter(|img| img.sequence.as_deref() == Some(seq_id))
+        .map(|img| super::quality_filter::SequenceFrame {
+            lat:            img.geometry.coordinates[1],
+            lon:            img.geometry.coordinates[0],
+            captured_at_ms: img.captured_at,
+            compass_angle:  img.compass_angle,
         })
-        .filter_map(|img| img.thumb_1024_url.clone())
-        .take(n_photos.saturating_sub(1))
         .collect();
 
-    Ok(GeoImage {
-        country:  seed.name.to_owned(),
-        region:   seed.region.to_owned(),
-        city:     None,
-        image_url: primary.thumb_1024_url.unwrap(), // safe: filtered above
-        source:   "mapillary".to_owned(),
-        attribution: Some(attribution),
-        lat:      Some(lat),
-        lon:      Some(lon),
-        sequence: primary.sequence,
-        extra_image_urls,
-    })
+    // Sort into traversal order.  Frames without a timestamp keep their
+    // original (shuffled) position via a stable sort, which is better than
+    // silently placing them at time-0.
+    frames.sort_by(|a, b| {
+        a.captured_at_ms.unwrap_or(i64::MAX)
+            .cmp(&b.captured_at_ms.unwrap_or(i64::MAX))
+    });
+
+    Some(super::quality_filter::score_sequence_continuity(&frames))
 }

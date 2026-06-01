@@ -1601,6 +1601,11 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
         }
     }
 
+    // Restore the anti-starvation streak so it survives between prefetch batches.
+    let mut filter = crate::sources::quality_filter::FilterState::with_streak(
+        ctx.prefetch_streak.load(std::sync::atomic::Ordering::Relaxed),
+    );
+
     for _ in 0..needed {
         let source = {
             let mut rng = rand::thread_rng();
@@ -1615,6 +1620,7 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
                     n_photos,
                     &existing_coords,
                     &existing_seqs,
+                    &mut filter,
                 ).await
             }
             "local" => {
@@ -1635,6 +1641,8 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
 
         match result {
             Ok(img) => {
+                // A successful fetch (any source) resets the starvation streak.
+                filter = crate::sources::quality_filter::FilterState::new();
                 // Update the local diversity lists so the next iteration in
                 // this batch also respects the location we just fetched.
                 if let Some(coord) = img.lat.zip(img.lon) {
@@ -1648,6 +1656,9 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
             Err(e) => warn!("GeoGuessr: prefetch failed ({source}): {e}"),
         }
     }
+
+    // Persist the rejection streak for the next prefetch batch.
+    ctx.prefetch_streak.store(filter.streak(), std::sync::atomic::Ordering::Relaxed);
 }
 
 // ── Resume after restart ──────────────────────────────────────────────────────

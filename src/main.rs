@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc};
+use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::{Arc, atomic::AtomicU32}};
 
 use anyhow::{Context, Result};
 use matrix_sdk::{
@@ -81,6 +81,9 @@ pub struct BotContext {
     /// Abort handle for the currently running round task (join phase or active game).
     /// Set when a round is spawned; cleared when it finishes.
     pub round_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
+    /// Consecutive Mapillary quality-filter rejections across prefetch sessions.
+    /// Persists the anti-starvation streak so it survives between prefetch calls.
+    pub prefetch_streak: Arc<AtomicU32>,
 }
 
 impl BotContext {
@@ -187,8 +190,9 @@ async fn main() -> Result<()> {
         client:      client.clone(),
         db,
         join_state,
-        dm_rooms:    Arc::new(Mutex::new(HashMap::new())),
-        round_abort: Arc::new(Mutex::new(None)),
+        dm_rooms:        Arc::new(Mutex::new(HashMap::new())),
+        round_abort:     Arc::new(Mutex::new(None)),
+        prefetch_streak: Arc::new(AtomicU32::new(0)),
     };
 
     // ── Invite handler ────────────────────────────────────────────────────────
