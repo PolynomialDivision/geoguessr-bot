@@ -83,9 +83,15 @@ pub enum ActiveGameMode {
 }
 
 impl ActiveGame {
-    pub fn record_free_guess(&mut self, user_id: String, guess: FreeGuess) {
+    /// Record a guess for `user_id`.  Returns `true` if accepted, `false` if
+    /// the player has already guessed and `max_guesses` > 0.
+    pub fn record_free_guess(&mut self, user_id: String, guess: FreeGuess, max_guesses: u32) -> bool {
         let ActiveGameMode::FreeGuess { ref mut guesses, .. } = self.mode;
+        if max_guesses > 0 && guesses.contains_key(&user_id) {
+            return false;
+        }
         guesses.insert(user_id, guess);
+        true
     }
 }
 

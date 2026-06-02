@@ -49,6 +49,11 @@ pub struct ScheduleConfig {
     /// Default 1 (classic single-photo). Increase to give players more visual context.
     #[serde(default = "default_photos_per_location")]
     pub photos_per_location: usize,
+    /// Maximum guesses a player may submit per image.
+    /// 0 (default) = unlimited — each new guess overwrites the previous one.
+    /// 1 = only the first guess counts; subsequent attempts are rejected.
+    #[serde(default)]
+    pub max_guesses_per_player: u32,
 }
 
 impl ScheduleConfig {

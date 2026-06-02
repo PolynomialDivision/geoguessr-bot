@@ -259,24 +259,28 @@ async fn main() -> Result<()> {
                         let sender = ev.sender.clone();
                         let room2  = client.get_room(&ctx.room_id).clone();
                         tokio::spawn(async move {
-                            let user = sender.as_str().to_owned();
+                            let user      = sender.as_str().to_owned();
+                            let max_g     = ctx2.config.schedule.max_guesses_per_player;
                             match game::geocode(&query).await {
                                 Some((lat, lon)) => {
-                                    let mut ag = ctx2.active_game.lock().await;
-                                    if let Some(g) = ag.as_mut() {
-                                        g.record_free_guess(user, game::FreeGuess {
-                                            text:         query.clone(),
-                                            lat,
-                                            lon,
-                                            submitted_at: chrono::Utc::now(),
-                                        });
-                                    }
+                                    let accepted = {
+                                        let mut ag = ctx2.active_game.lock().await;
+                                        ag.as_mut().map_or(false, |g| {
+                                            g.record_free_guess(user, game::FreeGuess {
+                                                text:         query.clone(),
+                                                lat,
+                                                lon,
+                                                submitted_at: chrono::Utc::now(),
+                                            }, max_g)
+                                        })
+                                    };
                                     if let Some(r) = room2 {
-                                        r.send(format::mentionify(&format!(
-                                            "✅ {sender} — guess recorded for \"{query}\""
-                                        )))
-                                        .await
-                                        .ok();
+                                        let msg = if accepted {
+                                            format!("✅ {sender} — guess recorded for \"{query}\"")
+                                        } else {
+                                            format!("❌ {sender} — you already submitted a guess")
+                                        };
+                                        r.send(format::mentionify(&msg)).await.ok();
                                     }
                                 }
                                 None => {
@@ -358,11 +362,12 @@ async fn main() -> Result<()> {
                 if !is_free_guess { return; }
 
                 tokio::spawn(async move {
+                    let max_g = ctx.config.schedule.max_guesses_per_player;
                     match game::geocode(&query).await {
                         Some((lat, lon)) => {
-                            {
+                            let accepted = {
                                 let mut ag = ctx.active_game.lock().await;
-                                if let Some(g) = ag.as_mut() {
+                                ag.as_mut().map_or(false, |g| {
                                     g.record_free_guess(
                                         user_id.as_str().to_owned(),
                                         game::FreeGuess {
@@ -371,18 +376,20 @@ async fn main() -> Result<()> {
                                             lon,
                                             submitted_at: chrono::Utc::now(),
                                         },
-                                    );
-                                }
-                            }
+                                        max_g,
+                                    )
+                                })
+                            };
                             if let Some(r) = client.get_room(&dm_room_id) {
-                                r.send(format::mentionify(&format!(
-                                    "✅ Guess recorded: \"{query}\"\nWaiting for the others or the timer…"
-                                )))
-                                .await
-                                .ok();
+                                let msg = if accepted {
+                                    format!("✅ Guess recorded: \"{query}\"\nWaiting for the others or the timer…")
+                                } else {
+                                    "❌ You already submitted a guess for this round.".to_owned()
+                                };
+                                r.send(format::mentionify(&msg)).await.ok();
                             }
-                            // Mark as acked in persistent state so recovery skips this player.
-                            {
+                            // Mark as acked only when the guess was accepted.
+                            if accepted {
                                 let mut st = ctx.state.lock().await;
                                 if let Some(ref mut ar) = st.active_round {
                                     if let Some(p) = ar.dm_participants.get_mut(user_id.as_str()) {
