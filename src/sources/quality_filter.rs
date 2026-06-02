@@ -10,11 +10,12 @@
 //! | Density             |    20%  | images / km²               |
 //! | GPS stability       |    15%  | jitter metres              |
 //! | Server quality      |    15%  | Mapillary quality_score    |
+//! | Overlay cleanliness |    15%  | Sobel + variance heuristic |
 //! | Freshness           |    10%  | capture age                |
 //!
-//! Nominal weights sum to 135 % because sharpness and server quality are
-//! optional; absent axes are excluded and the remaining weights renormalise
-//! to 1.0, so a missing signal never silently biases the score.
+//! Nominal weights sum to 150 % because sharpness, server quality, and
+//! overlay are optional; absent axes are excluded and the remaining weights
+//! renormalise to 1.0, so a missing signal never silently biases the score.
 //!
 //! An anti-starvation mechanism progressively relaxes the rejection threshold
 //! when too many consecutive candidates are rejected, ensuring the prefetch
@@ -168,6 +169,9 @@ pub struct QualityInput {
     pub server_quality:       Option<f32>,
     /// Image sharpness from Laplacian variance, normalized [0.0, 1.0] (None = not computed).
     pub sharpness:            Option<f32>,
+    /// Overlay cleanliness score [0.0, 1.0]: 1.0 = no UI overlay, 0.0 = severe overlay.
+    /// Already sequence-adjusted by the caller.  None = not computed.
+    pub overlay:              Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +203,8 @@ pub struct SubScores {
     pub server_quality:      Option<f32>,
     /// `None` when sharpness was not computed (thumbnail not downloaded).
     pub sharpness:           Option<f32>,
+    /// `None` when overlay detection was not run.
+    pub overlay:             Option<f32>,
 }
 
 // ── Filter state (anti-starvation) ────────────────────────────────────────────
@@ -255,6 +261,7 @@ fn sub_scores(input: &QualityInput) -> SubScores {
         sequence_continuity: input.sequence_continuity,
         server_quality:      input.server_quality.map(score_server_quality),
         sharpness:           input.sharpness,
+        overlay:             input.overlay,
     }
 }
 
@@ -324,6 +331,7 @@ const W_SEQ: f32 = 0.20;
 const W_DEN: f32 = 0.20;
 const W_STA: f32 = 0.15;
 const W_SQU: f32 = 0.15; // server quality (Mapillary)
+const W_OVL: f32 = 0.15; // overlay cleanliness
 const W_FRE: f32 = 0.10;
 
 /// Weighted sum with dynamic renormalisation.
@@ -333,7 +341,7 @@ const W_FRE: f32 = 0.10;
 /// This avoids phantom 0.5 fillers corrupting the score.
 fn aggregate(s: &SubScores) -> f32 {
     // Build the list of (score, weight) pairs for available axes only.
-    let mut pairs: [(f32, f32); 7] = [
+    let mut pairs: [(f32, f32); 8] = [
         (s.resolution, W_RES),
         (s.density,    W_DEN),
         (s.freshness,  W_FRE),
@@ -341,6 +349,7 @@ fn aggregate(s: &SubScores) -> f32 {
         (s.sequence_continuity.unwrap_or(0.0), if s.sequence_continuity.is_some() { W_SEQ } else { 0.0 }),
         (s.server_quality.unwrap_or(0.0),      if s.server_quality.is_some()      { W_SQU } else { 0.0 }),
         (s.sharpness.unwrap_or(0.0),           if s.sharpness.is_some()           { W_SHA } else { 0.0 }),
+        (s.overlay.unwrap_or(0.0),             if s.overlay.is_some()             { W_OVL } else { 0.0 }),
     ];
 
     let total_weight: f32 = pairs.iter().map(|(_, w)| *w).sum();
@@ -401,6 +410,7 @@ fn weakest_axis(sub: &SubScores) -> &'static str {
         (sub.freshness                               * W_FRE, "stale imagery"),
         (sub.server_quality.unwrap_or(0.5)           * W_SQU, "low server quality"),
         (sub.sharpness.unwrap_or(0.5)                * W_SHA, "motion blur"),
+        (sub.overlay.unwrap_or(0.5)                  * W_OVL, "ui overlay"),
     ];
     contributions
         .iter()
@@ -430,6 +440,7 @@ mod tests {
             sequence_continuity: None,
             server_quality:      None,
             sharpness:           None,
+            overlay:             None,
         }
     }
 
@@ -468,7 +479,7 @@ mod tests {
     fn stability_excluded_when_unknown() {
         let no_gps = SubScores { resolution: 0.8, freshness: 0.9, density: 0.7,
                                  stability: None, sequence_continuity: None,
-                                 server_quality: None, sharpness: None };
+                                 server_quality: None, sharpness: None, overlay: None };
         let with_gps = SubScores { stability: Some(0.5), ..no_gps };
         assert!(aggregate(&no_gps) > aggregate(&with_gps),
             "no_gps={:.3} with_gps={:.3}", aggregate(&no_gps), aggregate(&with_gps));
@@ -605,6 +616,7 @@ mod tests {
             sequence_continuity: None,
             server_quality:      None,
             sharpness:           Some(0.0),
+            overlay:             None,
         };
         let mut f = FilterState::new();
         let r = f.evaluate(&input);
@@ -621,6 +633,47 @@ mod tests {
         assert!(f.evaluate(&good).score > f.evaluate(&bad).score);
     }
 
+    // ── Overlay detection ─────────────────────────────────────────────────────
+
+    #[test]
+    fn overlay_penalises_score() {
+        let base      = input_with_age(1920, 1080, 180, 20, 5.0);
+        let clean     = QualityInput { overlay: Some(1.0), ..base.clone() };
+        let overlayed = QualityInput { overlay: Some(0.0), ..base.clone() };
+        let mut f = FilterState::new();
+        assert!(f.evaluate(&clean).score > f.evaluate(&overlayed).score);
+    }
+
+    #[test]
+    fn overlay_excluded_redistributes_weight() {
+        let base         = input_with_age(1920, 1080, 180, 20, 5.0);
+        let with_overlay = QualityInput { overlay: Some(0.8), ..base.clone() };
+        let without      = QualityInput { overlay: None,      ..base.clone() };
+        let mut f = FilterState::new();
+        // Overlay-present image with high score should beat the no-overlay base.
+        assert!(f.evaluate(&with_overlay).score > f.evaluate(&without).score);
+    }
+
+    #[test]
+    fn severe_overlay_reported_as_weakest() {
+        let input = QualityInput {
+            width: 1280, height: 720,
+            captured_at_ms:      Some(now_ms() - 800 * 86_400_000),
+            area_image_count:    15,
+            search_radius_km:    5.0,
+            gps_jitter_m:        None,
+            sequence_continuity: None,
+            server_quality:      None,
+            sharpness:           Some(0.5),
+            overlay:             Some(0.0),
+        };
+        let mut f = FilterState::new();
+        let r = f.evaluate(&input);
+        if r.decision == Decision::Reject {
+            assert_eq!(r.reason, "ui overlay");
+        }
+    }
+
     #[test]
     fn sequence_excluded_redistributes_weight() {
         // When sequence_continuity is None, score should still be well-formed
@@ -628,7 +681,7 @@ mod tests {
         let sub = SubScores {
             resolution: 0.7, freshness: 0.8, density: 0.5,
             stability: None, sequence_continuity: None,
-            server_quality: None, sharpness: None,
+            server_quality: None, sharpness: None, overlay: None,
         };
         let score = aggregate(&sub);
         assert!(score > 0.0 && score < 1.0, "score out of range: {score:.3}");

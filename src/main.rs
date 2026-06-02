@@ -84,9 +84,10 @@ pub struct BotContext {
     /// Consecutive Mapillary quality-filter rejections across prefetch sessions.
     /// Persists the anti-starvation streak so it survives between prefetch calls.
     pub prefetch_streak: Arc<AtomicU32>,
-    /// Per-image-ID Laplacian sharpness cache — avoids re-downloading thumbnails
-    /// across prefetch sessions.  Bounded at 1000 entries; cleared on overflow.
-    pub blur_cache: Arc<std::sync::Mutex<HashMap<String, Option<f32>>>>,
+    /// Per-image-ID thumbnail metrics cache — avoids re-downloading thumbnails
+    /// across prefetch sessions.  Stores (sharpness, overlay_penalty).
+    /// Bounded at 1000 entries; cleared on overflow.
+    pub blur_cache: Arc<std::sync::Mutex<HashMap<String, crate::sources::mapillary::ImageMetrics>>>,
 }
 
 impl BotContext {

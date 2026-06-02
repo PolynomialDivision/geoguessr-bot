@@ -87,13 +87,18 @@ struct Creator {
 /// sharing a sequence with any cached location are rejected.
 ///
 /// Tries up to 10 different seed countries before giving up.
+/// Per-image metrics cached after a thumbnail download.
+/// `(sharpness, overlay_penalty)` — both in [0.0, 1.0].
+/// `sharpness` is a score (1 = sharp), `overlay_penalty` is a penalty (1 = severe overlay).
+pub type ImageMetrics = (Option<f32>, Option<f32>);
+
 pub async fn fetch(
     cfg:           &MapillaryConfig,
     n_photos:      usize,
     existing:      &[(f64, f64)],
     existing_seqs: &[Option<String>],
     filter:        &mut super::quality_filter::FilterState,
-    blur_cache:    &Mutex<HashMap<String, Option<f32>>>,
+    blur_cache:    &Mutex<HashMap<String, ImageMetrics>>,
 ) -> Result<GeoImage> {
     let n_photos = n_photos.max(1);
     if cfg.access_token.is_empty() {
@@ -169,7 +174,7 @@ async fn try_seed(
     existing:      &[(f64, f64)],
     existing_seqs: &[Option<String>],
     filter:        &mut super::quality_filter::FilterState,
-    blur_cache:    &Mutex<HashMap<String, Option<f32>>>,
+    blur_cache:    &Mutex<HashMap<String, ImageMetrics>>,
 ) -> Result<Option<GeoImage>> {
     let radius_km = (cfg.search_radius / 1000).clamp(1, 50);
     let url = format!(
@@ -257,27 +262,34 @@ async fn try_seed(
         let img_id    = candidates[primary_idx].id.clone();
         let thumb_url = candidates[primary_idx].thumb_1024_url.clone().unwrap_or_default();
 
-        // Look up cached sharpness score, or download + compute + cache it.
-        // The std::sync::Mutex guard is released before every await point.
-        let sharpness = {
+        // Look up cached metrics, or download thumbnail + compute both in one pass.
+        // std::sync::Mutex guards are always released before await points.
+        let (sharpness, overlay_penalty) = {
             let cached = blur_cache.lock()
                 .expect("blur_cache lock poisoned")
                 .get(&img_id)
                 .copied();
             match cached {
-                Some(v) => v,
+                Some(metrics) => metrics,
                 None => {
-                    let result = download_thumbnail(client, &thumb_url).await
-                        .and_then(|bytes| compute_sharpness(&bytes));
-                    let mut cache = blur_cache.lock()
-                        .expect("blur_cache lock poisoned");
-                    // Simple size cap — clear when cache grows large.
+                    let metrics = match download_thumbnail(client, &thumb_url).await {
+                        Some(ref bytes) => (compute_sharpness(bytes), detect_overlay(bytes)),
+                        None            => (None, None),
+                    };
+                    let mut cache = blur_cache.lock().expect("blur_cache lock poisoned");
                     if cache.len() >= 1000 { cache.clear(); }
-                    cache.insert(img_id, result);
-                    result
+                    cache.insert(img_id.clone(), metrics);
+                    metrics
                 }
             }
         };
+
+        // Sequence-aware overlay: isolated overlay artifacts are penalised less
+        // than overlays present across all frames of the same capture run.
+        let overlay = overlay_penalty.map(|penalty| {
+            let multiplier = sequence_overlay_multiplier(&candidates, primary_idx, blur_cache);
+            1.0 - (penalty * multiplier).clamp(0.0, 1.0)
+        });
 
         let seq_score = sequence_score_for(&candidates, primary_idx);
         let qr = filter.evaluate(&super::quality_filter::QualityInput {
@@ -290,6 +302,7 @@ async fn try_seed(
             sequence_continuity: seq_score,
             server_quality:      candidates[primary_idx].quality_score,
             sharpness,
+            overlay,
         });
 
         if qr.decision == super::quality_filter::Decision::Reject {
@@ -357,7 +370,7 @@ async fn download_thumbnail(client: &reqwest::Client, url: &str) -> Option<Vec<u
 /// Calibration: variance < 200 → 0.0 (blurry), variance ≥ 2000 → 1.0.
 /// These thresholds suit 1024 px JPEG thumbnails; motion-blurred dashcam
 /// footage typically scores below 0.2.
-fn compute_sharpness(img_bytes: &[u8]) -> Option<f32> {
+pub(super) fn compute_sharpness(img_bytes: &[u8]) -> Option<f32> {
     let img = image::load_from_memory(img_bytes).ok()?.to_luma8();
     let w = img.width() as usize;
     let h = img.height() as usize;
@@ -383,6 +396,121 @@ fn compute_sharpness(img_bytes: &[u8]) -> Option<f32> {
     const BLUR:  f32 = 200.0;
     const SHARP: f32 = 2000.0;
     Some(((variance - BLUR) / (SHARP - BLUR)).clamp(0.0, 1.0))
+}
+
+/// Detect UI/banner overlays at the bottom of an image.
+///
+/// Returns an **overlay penalty** in [0.0, 1.0]: 0.0 = no overlay detected,
+/// 1.0 = severe full-width overlay.  The caller converts to a quality score
+/// via `1.0 - penalty` before passing to the filter.
+///
+/// Two complementary signals are combined:
+///
+/// * **Variance suppression** — a solid-colour UI bar has much lower pixel
+///   variance than the rest of the image.  Threshold: strip variance < 35% of
+///   full-image variance.
+///
+/// * **Horizontal edge dominance** — a clear overlay boundary (the top edge of
+///   a bar) produces strong horizontal edges.  Measured via Sobel Gy/Gx ratio
+///   in the bottom strip; threshold at > 65% of total edge energy being
+///   horizontal.
+///
+/// Both signals use the bottom 20% of the image.
+pub(super) fn detect_overlay(img_bytes: &[u8]) -> Option<f32> {
+    let img = image::load_from_memory(img_bytes).ok()?.to_luma8();
+    let w = img.width()  as usize;
+    let h = img.height() as usize;
+    if w < 10 || h < 10 { return None; }
+    let raw = img.as_raw();
+
+    // Bottom 20% strip (needs ≥ 3 rows for Sobel).
+    let strip_y = (h * 4 / 5).max(1);
+    if h.saturating_sub(strip_y) < 3 { return None; }
+
+    // ── Signal 1: variance suppression ───────────────────────────────────────
+    let img_sum: f64 = raw.iter().map(|&p| p as f64).sum();
+    let img_mean     = img_sum / (w * h) as f64;
+    let img_var: f64 = raw.iter()
+        .map(|&p| { let d = p as f64 - img_mean; d * d }).sum::<f64>()
+        / (w * h) as f64;
+
+    let strip = &raw[strip_y * w..];
+    let s_sum: f64 = strip.iter().map(|&p| p as f64).sum();
+    let s_mean      = s_sum / strip.len() as f64;
+    let s_var: f64  = strip.iter()
+        .map(|&p| { let d = p as f64 - s_mean; d * d }).sum::<f64>()
+        / strip.len() as f64;
+
+    // 1.0 when strip_var < 35% of full-image variance; 0.0 above that.
+    let var_ratio    = if img_var > 1.0 { (s_var / img_var) as f32 } else { 1.0 };
+    let var_signal   = (1.0 - var_ratio / 0.35).clamp(0.0, 1.0);
+
+    // ── Signal 2: horizontal edge dominance (Sobel Gy vs Gx) ─────────────────
+    let mut gy_sum = 0.0f64; // horizontal-edge response (detects horizontal lines)
+    let mut gx_sum = 0.0f64; // vertical-edge response
+    for y in (strip_y + 1)..(h.saturating_sub(1)) {
+        for x in 1..(w.saturating_sub(1)) {
+            macro_rules! px { ($r:expr,$c:expr) => { raw[$r * w + $c] as f64 }; }
+            let gy = -px!(y-1,x-1) - 2.0*px!(y-1,x) - px!(y-1,x+1)
+                     +px!(y+1,x-1) + 2.0*px!(y+1,x) + px!(y+1,x+1);
+            let gx = -px!(y-1,x-1) - 2.0*px!(y,x-1) - px!(y+1,x-1)
+                     +px!(y-1,x+1) + 2.0*px!(y,x+1) + px!(y+1,x+1);
+            gy_sum += gy.abs();
+            gx_sum += gx.abs();
+        }
+    }
+    let total_edge  = gy_sum + gx_sum + 1.0;
+    let h_frac      = (gy_sum / total_edge) as f32;
+    // 0.0 at h_frac = 0.65 (slightly H-dominant but common outdoors);
+    // 1.0 at h_frac = 0.90 (overwhelmingly horizontal — clear bar border).
+    let hv_signal   = ((h_frac - 0.65) / 0.25).clamp(0.0, 1.0);
+
+    // ── Combine ───────────────────────────────────────────────────────────────
+    // Variance suppression alone is sufficient for solid bars.
+    // Horizontal edge dominance catches banner-border overlays.
+    Some((var_signal * 0.55 + hv_signal * 0.45).clamp(0.0, 1.0))
+}
+
+/// Compute a sequence-level multiplier for the overlay penalty of `primary_idx`.
+///
+/// * 0.5  — only one frame visible in this candidate pool → possibly isolated.
+/// * 0.6  — fewer than 25% of cached peers have high overlay → isolated artifact.
+/// * 1.0  — no peer cache data, or overlay is widespread across the sequence.
+fn sequence_overlay_multiplier(
+    candidates:  &[MapillaryImage],
+    primary_idx: usize,
+    blur_cache:  &Mutex<HashMap<String, ImageMetrics>>,
+) -> f32 {
+    let seq_id = match candidates[primary_idx].sequence.as_deref() {
+        Some(s) => s,
+        None    => return 1.0,
+    };
+
+    let peer_ids: Vec<&str> = candidates.iter()
+        .enumerate()
+        .filter(|&(i, img)| i != primary_idx && img.sequence.as_deref() == Some(seq_id))
+        .map(|(_, img)| img.id.as_str())
+        .collect();
+
+    if peer_ids.is_empty() {
+        return 0.5; // no other frames from this sequence in the pool
+    }
+
+    let cache = blur_cache.lock().expect("blur_cache lock");
+    let peer_overlays: Vec<f32> = peer_ids.iter()
+        .filter_map(|id| cache.get(*id))
+        .filter_map(|&(_, penalty)| penalty)
+        .collect();
+    drop(cache);
+
+    if peer_overlays.is_empty() {
+        return 1.0; // peers exist but uncached — apply full penalty conservatively
+    }
+
+    let high_frac = peer_overlays.iter().filter(|&&s| s > 0.5).count() as f32
+        / peer_overlays.len() as f32;
+
+    if high_frac < 0.25 { 0.6 } else { 1.0 }
 }
 
 /// Build a sequence-continuity score for the candidate at `primary_idx` by
