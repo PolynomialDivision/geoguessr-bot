@@ -3,6 +3,7 @@
 //! Each source returns a `GeoImage` — metadata + a download URL (or file path)
 //! for the image.  The game layer handles downloading and uploading to Matrix.
 
+pub mod diversity;
 pub mod local;
 pub mod mapillary;
 pub mod quality_filter;

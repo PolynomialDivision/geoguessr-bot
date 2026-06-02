@@ -1,17 +1,20 @@
 //! Deterministic, offline image-quality filter for street-level photo candidates.
 //!
-//! Scores each candidate on five axes:
+//! Scores each candidate on up to seven axes:
 //!
-//! | Axis                | Weight | Source            |
-//! |---------------------|--------|-------------------|
-//! | Resolution          |   35%  | width × height    |
-//! | Sequence continuity |   20%  | per-sequence GPS  |
-//! | Density             |   20%  | images / km²      |
-//! | GPS stability       |   15%  | jitter metres     |
-//! | Freshness           |   10%  | capture age       |
+//! | Axis                | Nominal | Source                     |
+//! |---------------------|---------|----------------------------|
+//! | Resolution          |    35%  | width × height             |
+//! | Sharpness           |    20%  | Laplacian variance         |
+//! | Sequence continuity |    20%  | per-sequence GPS           |
+//! | Density             |    20%  | images / km²               |
+//! | GPS stability       |    15%  | jitter metres              |
+//! | Server quality      |    15%  | Mapillary quality_score    |
+//! | Freshness           |    10%  | capture age                |
 //!
-//! Axes whose data is unavailable are excluded and the remaining weights are
-//! renormalised, so a missing signal never silently biases the score.
+//! Nominal weights sum to 135 % because sharpness and server quality are
+//! optional; absent axes are excluded and the remaining weights renormalise
+//! to 1.0, so a missing signal never silently biases the score.
 //!
 //! An anti-starvation mechanism progressively relaxes the rejection threshold
 //! when too many consecutive candidates are rejected, ensuring the prefetch
@@ -161,6 +164,10 @@ pub struct QualityInput {
     /// Pre-computed sequence continuity score [0.0, 1.0].
     /// None = no sequence data → axis excluded and weight redistributed.
     pub sequence_continuity:  Option<f32>,
+    /// Mapillary server-side quality score [0.0, 5.0] (None = field not returned by API).
+    pub server_quality:       Option<f32>,
+    /// Image sharpness from Laplacian variance, normalized [0.0, 1.0] (None = not computed).
+    pub sharpness:            Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +195,10 @@ pub struct SubScores {
     pub stability:           Option<f32>,
     /// `None` when no sequence data is available.
     pub sequence_continuity: Option<f32>,
+    /// `None` when the Mapillary quality_score field was not returned.
+    pub server_quality:      Option<f32>,
+    /// `None` when sharpness was not computed (thumbnail not downloaded).
+    pub sharpness:           Option<f32>,
 }
 
 // ── Filter state (anti-starvation) ────────────────────────────────────────────
@@ -200,13 +211,21 @@ pub struct SubScores {
 #[derive(Debug, Default)]
 pub struct FilterState {
     pub(super) consecutive_rejections: u32,
+    /// When true, applies an extra threshold relaxation to boost exploration
+    /// when the cache has collapsed into a small geographic cluster.
+    pub(super) exploration_mode: bool,
 }
 
 impl FilterState {
     pub fn new() -> Self { Self::default() }
 
     /// Restore from a previously persisted rejection streak.
-    pub fn with_streak(n: u32) -> Self { Self { consecutive_rejections: n } }
+    pub fn with_streak(n: u32) -> Self { Self { consecutive_rejections: n, ..Self::default() } }
+
+    /// Restore streak and set exploration mode (for geographic anti-collapse).
+    pub fn with_streak_and_exploration(n: u32, explore: bool) -> Self {
+        Self { consecutive_rejections: n, exploration_mode: explore }
+    }
 
     /// Current rejection streak (save into BotContext after a session).
     pub fn streak(&self) -> u32 { self.consecutive_rejections }
@@ -215,7 +234,7 @@ impl FilterState {
     pub fn evaluate(&mut self, input: &QualityInput) -> QualityResult {
         let sub    = sub_scores(input);
         let score  = aggregate(&sub);
-        let result = decide(score, sub, self.consecutive_rejections);
+        let result = decide(score, sub, self.consecutive_rejections, self.exploration_mode);
         if result.decision == Decision::Reject {
             self.consecutive_rejections += 1;
         } else {
@@ -234,7 +253,14 @@ fn sub_scores(input: &QualityInput) -> SubScores {
         density:             score_density(input.area_image_count, input.search_radius_km),
         stability:           input.gps_jitter_m.map(score_stability),
         sequence_continuity: input.sequence_continuity,
+        server_quality:      input.server_quality.map(score_server_quality),
+        sharpness:           input.sharpness,
     }
+}
+
+/// Mapillary quality_score [0.0, 5.0] → [0.0, 1.0].
+fn score_server_quality(q: f32) -> f32 {
+    (q / 5.0).clamp(0.0, 1.0)
 }
 
 /// Pixel count: 320×240 → 0.0, ≥2048×1536 → 1.0.  Unknown → 0.5 (neutral).
@@ -290,11 +316,14 @@ fn score_stability(jitter_m: f64) -> f32 {
 
 // ── Aggregation ───────────────────────────────────────────────────────────────
 
-/// Nominal axis weights (must sum to 1.0 when all five axes are present).
+/// Nominal axis weights.  Sum to 1.35 when all seven axes are present;
+/// renormalisation in `aggregate` always brings the effective sum to 1.0.
 const W_RES: f32 = 0.35;
+const W_SHA: f32 = 0.20; // sharpness (Laplacian)
 const W_SEQ: f32 = 0.20;
 const W_DEN: f32 = 0.20;
 const W_STA: f32 = 0.15;
+const W_SQU: f32 = 0.15; // server quality (Mapillary)
 const W_FRE: f32 = 0.10;
 
 /// Weighted sum with dynamic renormalisation.
@@ -304,12 +333,14 @@ const W_FRE: f32 = 0.10;
 /// This avoids phantom 0.5 fillers corrupting the score.
 fn aggregate(s: &SubScores) -> f32 {
     // Build the list of (score, weight) pairs for available axes only.
-    let mut pairs: [(f32, f32); 5] = [
+    let mut pairs: [(f32, f32); 7] = [
         (s.resolution, W_RES),
         (s.density,    W_DEN),
         (s.freshness,  W_FRE),
         (s.stability.unwrap_or(0.0),           if s.stability.is_some()           { W_STA } else { 0.0 }),
         (s.sequence_continuity.unwrap_or(0.0), if s.sequence_continuity.is_some() { W_SEQ } else { 0.0 }),
+        (s.server_quality.unwrap_or(0.0),      if s.server_quality.is_some()      { W_SQU } else { 0.0 }),
+        (s.sharpness.unwrap_or(0.0),           if s.sharpness.is_some()           { W_SHA } else { 0.0 }),
     ];
 
     let total_weight: f32 = pairs.iter().map(|(_, w)| *w).sum();
@@ -325,28 +356,36 @@ fn aggregate(s: &SubScores) -> f32 {
 
 // ── Decision ──────────────────────────────────────────────────────────────────
 
-const THRESHOLD_GOOD:  f32 = 0.60;
-const THRESHOLD_SOFT:  f32 = 0.40;
-const THRESHOLD_FLOOR: f32 = 0.30;
-const RELAX_AFTER:     u32 = 3;
-const RELAX_STEP:      f32 = 0.02;
+const THRESHOLD_GOOD:    f32 = 0.60;
+const THRESHOLD_SOFT:    f32 = 0.40;
+const THRESHOLD_FLOOR:   f32 = 0.30;
+const RELAX_AFTER:       u32 = 3;
+const RELAX_STEP:        f32 = 0.02;
+/// Extra threshold relaxation applied in exploration mode (geographic anti-collapse).
+const EXPLORE_RELAX:     f32 = 0.05;
 
-fn decide(score: f32, sub: SubScores, consecutive: u32) -> QualityResult {
+fn decide(score: f32, sub: SubScores, consecutive: u32, exploration: bool) -> QualityResult {
     let relax = if consecutive >= RELAX_AFTER {
         ((consecutive - RELAX_AFTER + 1) as f32 * RELAX_STEP)
             .min(THRESHOLD_SOFT - THRESHOLD_FLOOR)
     } else {
         0.0
     };
-    let effective = THRESHOLD_SOFT - relax;
+    let extra = if exploration { EXPLORE_RELAX } else { 0.0 };
+    let effective = (THRESHOLD_SOFT - relax - extra).max(THRESHOLD_FLOOR);
 
     if score >= THRESHOLD_GOOD {
-        QualityResult { decision: Decision::Accept, score, reason: "good quality",               sub }
+        QualityResult { decision: Decision::Accept, score, reason: "good quality",                       sub }
     } else if score >= effective {
-        let reason = if relax > 0.0 { "soft accept (anti-starvation)" } else { "soft accept" };
-        QualityResult { decision: Decision::Accept, score, reason,                               sub }
+        let reason = match (relax > 0.0, exploration) {
+            (true,  true)  => "soft accept (anti-starvation + exploration)",
+            (true,  false) => "soft accept (anti-starvation)",
+            (false, true)  => "soft accept (exploration)",
+            (false, false) => "soft accept",
+        };
+        QualityResult { decision: Decision::Accept, score, reason,                                       sub }
     } else {
-        QualityResult { decision: Decision::Reject, score, reason: weakest_axis(&sub),           sub }
+        QualityResult { decision: Decision::Reject, score, reason: weakest_axis(&sub),                   sub }
     }
 }
 
@@ -360,6 +399,8 @@ fn weakest_axis(sub: &SubScores) -> &'static str {
         (sub.density                                 * W_DEN, "sparse coverage"),
         (sub.stability.unwrap_or(0.5)                * W_STA, "high GPS jitter"),
         (sub.freshness                               * W_FRE, "stale imagery"),
+        (sub.server_quality.unwrap_or(0.5)           * W_SQU, "low server quality"),
+        (sub.sharpness.unwrap_or(0.5)                * W_SHA, "motion blur"),
     ];
     contributions
         .iter()
@@ -387,6 +428,8 @@ mod tests {
             search_radius_km:    radius_km,
             gps_jitter_m:        None,
             sequence_continuity: None,
+            server_quality:      None,
+            sharpness:           None,
         }
     }
 
@@ -424,7 +467,8 @@ mod tests {
     #[test]
     fn stability_excluded_when_unknown() {
         let no_gps = SubScores { resolution: 0.8, freshness: 0.9, density: 0.7,
-                                 stability: None, sequence_continuity: None };
+                                 stability: None, sequence_continuity: None,
+                                 server_quality: None, sharpness: None };
         let with_gps = SubScores { stability: Some(0.5), ..no_gps };
         assert!(aggregate(&no_gps) > aggregate(&with_gps),
             "no_gps={:.3} with_gps={:.3}", aggregate(&no_gps), aggregate(&with_gps));
@@ -528,13 +572,53 @@ mod tests {
         // Same image input; one has good sequence, one has none.
         let base = input_with_age(1920, 1080, 180, 20, 5.0);
         let with_seq = QualityInput { sequence_continuity: Some(0.90), ..base.clone() };
-        let without  = QualityInput { sequence_continuity: None,       ..base.clone() };
+        let without  = QualityInput { sequence_continuity: None,        ..base.clone() };
 
         let mut f = FilterState::new();
         let r_seq  = f.evaluate(&with_seq);
         let r_none = f.evaluate(&without);
         assert!(r_seq.score > r_none.score,
             "with_seq={:.3} without={:.3}", r_seq.score, r_none.score);
+    }
+
+    // ── Sharpness / server quality ────────────────────────────────────────────
+
+    #[test]
+    fn sharpness_affects_score() {
+        let base = input_with_age(1920, 1080, 180, 20, 5.0);
+        let sharp  = QualityInput { sharpness: Some(1.0), ..base.clone() };
+        let blurry = QualityInput { sharpness: Some(0.0), ..base.clone() };
+        let mut f = FilterState::new();
+        assert!(f.evaluate(&sharp).score > f.evaluate(&blurry).score);
+    }
+
+    #[test]
+    fn blurry_image_rejected() {
+        // Low-res, moderately stale, sparse — with sharpness=0, this should reject
+        // and report "motion blur" as the weakest axis.
+        let input = QualityInput {
+            width: 1280, height: 720,
+            captured_at_ms: Some(now_ms() - 1000 * 86_400_000),
+            area_image_count: 30,
+            search_radius_km: 5.0,
+            gps_jitter_m:        None,
+            sequence_continuity: None,
+            server_quality:      None,
+            sharpness:           Some(0.0),
+        };
+        let mut f = FilterState::new();
+        let r = f.evaluate(&input);
+        assert_eq!(r.decision, Decision::Reject, "score={:.3}", r.score);
+        assert_eq!(r.reason, "motion blur");
+    }
+
+    #[test]
+    fn low_server_quality_reduces_score() {
+        let base = input_with_age(1920, 1080, 180, 20, 5.0);
+        let good = QualityInput { server_quality: Some(4.5), ..base.clone() };
+        let bad  = QualityInput { server_quality: Some(1.0), ..base.clone() };
+        let mut f = FilterState::new();
+        assert!(f.evaluate(&good).score > f.evaluate(&bad).score);
     }
 
     #[test]
@@ -544,6 +628,7 @@ mod tests {
         let sub = SubScores {
             resolution: 0.7, freshness: 0.8, density: 0.5,
             stability: None, sequence_continuity: None,
+            server_quality: None, sharpness: None,
         };
         let score = aggregate(&sub);
         assert!(score > 0.0 && score < 1.0, "score out of range: {score:.3}");

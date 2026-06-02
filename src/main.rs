@@ -84,6 +84,9 @@ pub struct BotContext {
     /// Consecutive Mapillary quality-filter rejections across prefetch sessions.
     /// Persists the anti-starvation streak so it survives between prefetch calls.
     pub prefetch_streak: Arc<AtomicU32>,
+    /// Per-image-ID Laplacian sharpness cache — avoids re-downloading thumbnails
+    /// across prefetch sessions.  Bounded at 1000 entries; cleared on overflow.
+    pub blur_cache: Arc<std::sync::Mutex<HashMap<String, Option<f32>>>>,
 }
 
 impl BotContext {
@@ -193,6 +196,7 @@ async fn main() -> Result<()> {
         dm_rooms:        Arc::new(Mutex::new(HashMap::new())),
         round_abort:     Arc::new(Mutex::new(None)),
         prefetch_streak: Arc::new(AtomicU32::new(0)),
+        blur_cache:      Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
 
     // ── Invite handler ────────────────────────────────────────────────────────

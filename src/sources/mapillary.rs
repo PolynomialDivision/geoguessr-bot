@@ -11,12 +11,17 @@
 //! Requires a free Mapillary client access token (register at
 //! https://www.mapillary.com/developer).
 
+use std::{collections::HashMap, sync::Mutex};
+
 use anyhow::{bail, Result};
 use rand::seq::SliceRandom;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use super::{get_with_retry, min_dist_to_existing, MIN_DISTANCE_KM};
+use super::{
+    diversity::DiversityTracker,
+    get_with_retry, min_dist_to_existing, MIN_DISTANCE_KM,
+};
 
 use crate::{
     config::MapillaryConfig,
@@ -36,7 +41,6 @@ struct MapillaryResp {
 
 #[derive(Deserialize, Clone)]
 struct MapillaryImage {
-    #[allow(dead_code)]
     id:              String,
     geometry:        Geometry,
     thumb_1024_url:  Option<String>,
@@ -56,6 +60,9 @@ struct MapillaryImage {
     /// Camera heading in degrees [0, 360) — used for sequence heading stability.
     #[serde(default)]
     compass_angle:   Option<f32>,
+    /// Mapillary server-side quality estimate [0.0, 5.0].
+    #[serde(default)]
+    quality_score:   Option<f32>,
 }
 
 /// GeoJSON Point geometry — coordinates are [longitude, latitude].
@@ -86,6 +93,7 @@ pub async fn fetch(
     existing:      &[(f64, f64)],
     existing_seqs: &[Option<String>],
     filter:        &mut super::quality_filter::FilterState,
+    blur_cache:    &Mutex<HashMap<String, Option<f32>>>,
 ) -> Result<GeoImage> {
     let n_photos = n_photos.max(1);
     if cfg.access_token.is_empty() {
@@ -109,15 +117,29 @@ pub async fn fetch(
         bail!("Mapillary: country filter matches no known countries");
     }
 
+    // Build a diversity tracker from already-accepted locations to detect
+    // geographic collapse and prefer under-sampled regions.
+    let diversity = DiversityTracker::from_coords(existing);
+    if diversity.is_homogeneous() {
+        warn!("Mapillary: cache is geographically homogeneous — prioritising under-sampled regions");
+    }
+
+    // Shuffle first (so countries with equal diversity scores are tried in
+    // random order), then stable-sort by diversity score descending.
     let candidates: Vec<&Country> = {
         let mut rng = rand::thread_rng();
         let mut v = pool.clone();
         v.shuffle(&mut rng);
+        v.sort_by(|a, b| {
+            diversity.score(b.lat, b.lon)
+                .partial_cmp(&diversity.score(a.lat, a.lon))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         v
     };
 
     for seed in candidates.iter().take(10) {
-        match try_seed(&client, seed, cfg, n_photos, existing, existing_seqs, filter).await {
+        match try_seed(&client, seed, cfg, n_photos, existing, existing_seqs, filter, blur_cache).await {
             Ok(Some(img)) => {
                 info!(
                     "Mapillary: found {} photo(s) for {} ({}) — nearest existing {:.0} km",
@@ -147,11 +169,12 @@ async fn try_seed(
     existing:      &[(f64, f64)],
     existing_seqs: &[Option<String>],
     filter:        &mut super::quality_filter::FilterState,
+    blur_cache:    &Mutex<HashMap<String, Option<f32>>>,
 ) -> Result<Option<GeoImage>> {
     let radius_km = (cfg.search_radius / 1000).clamp(1, 50);
     let url = format!(
         "{API}?access_token={token}\
-         &fields=id,geometry,thumb_1024_url,creator,sequence,captured_at,width,height,compass_angle\
+         &fields=id,geometry,thumb_1024_url,creator,sequence,captured_at,width,height,compass_angle,quality_score\
          &lat={lat}&lng={lon}\
          &radius={radius}\
          &limit=50",
@@ -184,8 +207,8 @@ async fn try_seed(
         bail!("no images with thumbnail URL near {}", seed.name);
     }
 
-    // ── Collect all diversity-passing candidate indices ───────────────────────
-    let passing: Vec<usize> = (0..candidates.len())
+    // ── Collect all distance/sequence-passing candidate indices ─────────────
+    let mut passing: Vec<usize> = (0..candidates.len())
         .filter(|&i| {
             let img = &candidates[i];
             let lon = img.geometry.coordinates[0];
@@ -210,10 +233,52 @@ async fn try_seed(
         );
     }
 
+    // Sort by geographic novelty (under-sampled cells first) so the quality
+    // filter sees the most diverse candidates before falling back to familiar
+    // regions under anti-starvation pressure.
+    let cell_diversity = DiversityTracker::from_coords(existing);
+    passing.sort_by(|&a, &b| {
+        let sa = cell_diversity.score(
+            candidates[a].geometry.coordinates[1],
+            candidates[a].geometry.coordinates[0],
+        );
+        let sb = cell_diversity.score(
+            candidates[b].geometry.coordinates[1],
+            candidates[b].geometry.coordinates[0],
+        );
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     // ── Try each diversity-passing candidate through the quality filter ────────
     // Iterating over indices lets us remove and return the first one that passes
     // without cloning the whole struct up front.
     for primary_idx in passing {
+        // Clone ID and URL before any borrow of `candidates` crosses an await.
+        let img_id    = candidates[primary_idx].id.clone();
+        let thumb_url = candidates[primary_idx].thumb_1024_url.clone().unwrap_or_default();
+
+        // Look up cached sharpness score, or download + compute + cache it.
+        // The std::sync::Mutex guard is released before every await point.
+        let sharpness = {
+            let cached = blur_cache.lock()
+                .expect("blur_cache lock poisoned")
+                .get(&img_id)
+                .copied();
+            match cached {
+                Some(v) => v,
+                None => {
+                    let result = download_thumbnail(client, &thumb_url).await
+                        .and_then(|bytes| compute_sharpness(&bytes));
+                    let mut cache = blur_cache.lock()
+                        .expect("blur_cache lock poisoned");
+                    // Simple size cap — clear when cache grows large.
+                    if cache.len() >= 1000 { cache.clear(); }
+                    cache.insert(img_id, result);
+                    result
+                }
+            }
+        };
+
         let seq_score = sequence_score_for(&candidates, primary_idx);
         let qr = filter.evaluate(&super::quality_filter::QualityInput {
             width:               candidates[primary_idx].width.unwrap_or(0),
@@ -223,6 +288,8 @@ async fn try_seed(
             search_radius_km:    radius_km as f64,
             gps_jitter_m:        None, // not exposed by Mapillary v4 API
             sequence_continuity: seq_score,
+            server_quality:      candidates[primary_idx].quality_score,
+            sharpness,
         });
 
         if qr.decision == super::quality_filter::Decision::Reject {
@@ -274,6 +341,49 @@ async fn try_seed(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Download a thumbnail image; returns `None` on any network or HTTP error.
+async fn download_thumbnail(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
+    if url.is_empty() { return None; }
+    let resp = client.get(url).send().await.ok()?;
+    if !resp.status().is_success() { return None; }
+    resp.bytes().await.ok().map(|b| b.to_vec())
+}
+
+/// Compute a sharpness score [0.0, 1.0] from image bytes using the Laplacian
+/// variance method.  Higher variance means more high-frequency edge content
+/// (sharper image).
+///
+/// Calibration: variance < 200 → 0.0 (blurry), variance ≥ 2000 → 1.0.
+/// These thresholds suit 1024 px JPEG thumbnails; motion-blurred dashcam
+/// footage typically scores below 0.2.
+fn compute_sharpness(img_bytes: &[u8]) -> Option<f32> {
+    let img = image::load_from_memory(img_bytes).ok()?.to_luma8();
+    let w = img.width() as usize;
+    let h = img.height() as usize;
+    if w < 3 || h < 3 { return None; }
+
+    let raw = img.as_raw();
+    let mut sum_sq = 0.0_f64;
+    for y in 1..(h - 1) {
+        for x in 1..(w - 1) {
+            let c   = raw[y * w + x] as f64;
+            let lap = raw[(y - 1) * w + x] as f64
+                    + raw[(y + 1) * w + x] as f64
+                    + raw[y * w + (x - 1)] as f64
+                    + raw[y * w + (x + 1)] as f64
+                    - 4.0 * c;
+            sum_sq += lap * lap;
+        }
+    }
+
+    let n = ((w - 2) * (h - 2)) as f64;
+    let variance = (sum_sq / n) as f32;
+
+    const BLUR:  f32 = 200.0;
+    const SHARP: f32 = 2000.0;
+    Some(((variance - BLUR) / (SHARP - BLUR)).clamp(0.0, 1.0))
+}
 
 /// Build a sequence-continuity score for the candidate at `primary_idx` by
 /// collecting all images from the same sequence ID in `candidates`, sorting

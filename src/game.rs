@@ -1601,9 +1601,17 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
         }
     }
 
-    // Restore the anti-starvation streak so it survives between prefetch batches.
-    let mut filter = crate::sources::quality_filter::FilterState::with_streak(
+    // Detect geographic collapse and enable exploration mode if needed.
+    let diversity     = crate::sources::diversity::DiversityTracker::from_coords(&existing_coords);
+    let is_homogeneous = diversity.is_homogeneous();
+    if is_homogeneous {
+        warn!("GeoGuessr: prefetch cache is geographically homogeneous — enabling exploration mode");
+    }
+
+    // Restore the anti-starvation streak; enable exploration when homogeneous.
+    let mut filter = crate::sources::quality_filter::FilterState::with_streak_and_exploration(
         ctx.prefetch_streak.load(std::sync::atomic::Ordering::Relaxed),
+        is_homogeneous,
     );
 
     for _ in 0..needed {
@@ -1621,6 +1629,7 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
                     &existing_coords,
                     &existing_seqs,
                     &mut filter,
+                    &ctx.blur_cache,
                 ).await
             }
             "local" => {
@@ -1641,8 +1650,12 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
 
         match result {
             Ok(img) => {
-                // A successful fetch (any source) resets the starvation streak.
-                filter = crate::sources::quality_filter::FilterState::new();
+                // Reset the starvation streak but keep exploration mode active
+                // for the rest of this batch (homogeneity was computed upfront).
+                filter = crate::sources::quality_filter::FilterState::with_streak_and_exploration(
+                    0,
+                    is_homogeneous,
+                );
                 // Update the local diversity lists so the next iteration in
                 // this batch also respects the location we just fetched.
                 if let Some(coord) = img.lat.zip(img.lon) {
