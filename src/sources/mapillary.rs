@@ -327,10 +327,21 @@ async fn try_seed(
             .unwrap_or_else(|| "© Mapillary contributors (CC BY-SA)".to_owned());
 
         // Extra photos: from the remaining pool, different sequence from primary.
+        // Skip candidates whose cached metrics indicate blur or heavy overlay.
         let primary_seq = primary.sequence.as_deref();
         let extra_image_urls: Vec<String> = candidates
             .iter()
             .filter(|img| img.sequence.as_deref() != primary_seq || primary_seq.is_none())
+            .filter(|img| {
+                let metrics = blur_cache.lock().ok()
+                    .and_then(|c| c.get(&img.id).copied());
+                match metrics {
+                    Some((sharpness, overlay)) =>
+                        sharpness.map(|s| s >= 0.2).unwrap_or(true)
+                        && overlay.map(|o| o >= 0.3).unwrap_or(true),
+                    None => true,
+                }
+            })
             .filter_map(|img| img.thumb_1024_url.clone())
             .take(n_photos.saturating_sub(1))
             .collect();
