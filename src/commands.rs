@@ -101,14 +101,28 @@ async fn cmd_cancelgeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Re
     // !cancelgeo — abort the currently running round (join phase or active game).
     let abort = ctx.round_abort.lock().await.take();
     let had_game = ctx.active_game.lock().await.take().is_some();
-    let had_join = {
+
+    // Collect DM participants before clearing state, so we can notify them.
+    let (round_id_to_close, dm_participants_to_notify) = {
         let mut st = ctx.state.lock().await;
-        let had = st.pending_join.is_some();
-        st.pending_join = None;
+        let round_id = st.active_round.as_ref().map(|ar| ar.round_id);
+        let dms: Vec<String> = st.active_round.as_ref()
+            .map(|ar| ar.dm_participants.values().map(|p| p.dm_room_id.clone()).collect())
+            .unwrap_or_default();
+        st.active_round = None;
+        st.pending_join  = None;
         st.save(&ctx.state_path).await.ok();
-        had
+        (round_id, dms)
     };
-    // Clear any DM-room mappings too.
+
+    let had_join = round_id_to_close.is_some() || had_game;
+
+    // Mark the DB round as finished so it doesn't stay open indefinitely.
+    if let Some(round_id) = round_id_to_close {
+        ctx.db.finish_round(round_id).await.ok();
+    }
+
+    // Clear DM routing and join-phase state.
     ctx.dm_rooms.lock().await.clear();
     {
         let mut js = ctx.join_state.lock().await;
@@ -116,8 +130,19 @@ async fn cmd_cancelgeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Re
         js.participants.clear();
     }
 
+    // Abort the task only after state is clean, so a restart doesn't resume.
     if let Some(handle) = abort {
         handle.abort();
+    }
+
+    // Notify DM participants so they're not left waiting.
+    for dm_room_id_str in &dm_participants_to_notify {
+        if let Ok(dm_room_id) = dm_room_id_str.parse::<matrix_sdk::ruma::OwnedRoomId>() {
+            if let Some(dm_room) = ctx.client.get_room(&dm_room_id) {
+                dm_room.send(crate::format::mentionify("🛑 Round was cancelled by an admin."))
+                    .await.ok();
+            }
+        }
     }
 
     if had_game || had_join {
