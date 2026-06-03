@@ -18,7 +18,9 @@ pub async fn handle(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Resul
         "!prefetch"      => cmd_prefetch(ctx, sender).await,
         "!resetstats"    => cmd_resetstats(ctx, sender, body).await,
         "!scores"
-        | "!leaderboard" => cmd_scores(ctx).await,
+        | "!leaderboard"   => cmd_scores(ctx).await,
+        "!scores90"
+        | "!leaderboard90" => cmd_scores_rolling(ctx).await,
         "!mystats"       => cmd_mystats(ctx, sender).await,
         "!countries"     => cmd_countries(ctx).await,
         "!gameinfo"      => cmd_gameinfo(ctx).await,
@@ -434,6 +436,13 @@ async fn cmd_scores_free_guess(ctx: &BotContext) -> Result<Option<String>> {
     }
 }
 
+async fn cmd_scores_rolling(ctx: &BotContext) -> Result<Option<String>> {
+    match build_rolling_leaderboard(ctx).await {
+        Some(text) => Ok(Some(text)),
+        None       => Ok(Some("No scores in the last 90 days.".to_owned())),
+    }
+}
+
 fn format_leaderboard(
     mut board:   Vec<crate::db::ScoreLeaderboardEntry>,
     header:      &str,
@@ -693,6 +702,7 @@ fn help_text() -> String {
 
   !gameinfo          · schedule & how to play
   !scores            · all-time leaderboard
+  !scores90          · last 90 days leaderboard
   !mystats           · your rank and stats
   !countries         · country accuracy chart
   !fastest           · speed leaderboard
