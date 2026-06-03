@@ -455,10 +455,9 @@ async fn play_free_guess(
 
     // Post all images to the main room.
     for (i, media) in all_images.iter().enumerate() {
-        let label = if n_imgs == 1 {
-            "📍 Where is this?".to_owned()
-        } else if i == 0 {
-            format!("📍 Reference location (1/{n_imgs})")
+        let label = if i == 0 {
+            if n_imgs == 1 { "📍 Reference location".to_owned() }
+            else           { format!("📍 Reference location (1/{n_imgs})") }
         } else {
             format!("📍 Context image ({}/{})", i + 1, n_imgs)
         };
@@ -503,10 +502,9 @@ async fn play_free_guess(
     for (uid, dm_room_id) in dm_participants.iter() {
         if let Some(dm_room) = client.get_room(dm_room_id) {
             for (i, media) in all_images.iter().enumerate() {
-                let label = if n_imgs == 1 {
-                    "📍 Where is this?".to_owned()
-                } else if i == 0 {
-                    format!("📍 Reference location (1/{n_imgs})")
+                let label = if i == 0 {
+                    if n_imgs == 1 { "📍 Reference location".to_owned() }
+                    else           { format!("📍 Reference location (1/{n_imgs})") }
                 } else {
                     format!("📍 Context image ({}/{})", i + 1, n_imgs)
                 };
