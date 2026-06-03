@@ -437,6 +437,42 @@ impl Db {
         .await
     }
 
+    /// All-time leaderboard — includes every round ever played.
+    pub async fn score_leaderboard_alltime(&self) -> Result<Vec<ScoreLeaderboardEntry>> {
+        self.run(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT rs.user_id,
+                        SUM(rs.total_score)                AS total_score,
+                        COUNT(DISTINCT rs.round_id)        AS rounds_played,
+                        COALESCE(a.guesses_played, 0)      AS guesses_played,
+                        COALESCE(a.avg_distance_km, 0.0)   AS avg_distance_km,
+                        COALESCE(a.best_distance_km, 0.0)  AS best_distance_km
+                   FROM round_scores rs
+                   LEFT JOIN (
+                       SELECT user_id,
+                              COUNT(*)          AS guesses_played,
+                              AVG(distance_km)  AS avg_distance_km,
+                              MIN(distance_km)  AS best_distance_km
+                         FROM answers
+                        WHERE distance_km IS NOT NULL
+                        GROUP BY user_id
+                   ) a ON a.user_id = rs.user_id
+                  GROUP BY rs.user_id",
+            )?;
+            let rows = stmt.query_map([], |r| Ok(ScoreLeaderboardEntry {
+                user_id:          r.get(0)?,
+                total_score:      r.get(1)?,
+                rounds_played:    r.get(2)?,
+                guesses_played:   r.get(3)?,
+                avg_distance_km:  r.get(4)?,
+                best_distance_km: r.get(5)?,
+            }))?;
+            rows.map(|r| r.context("reading score leaderboard row")).collect()
+        })
+        .await
+    }
+
+    /// Rolling leaderboard — only rounds from the last 90 days.
     pub async fn score_leaderboard(&self) -> Result<Vec<ScoreLeaderboardEntry>> {
         self.run(|conn| {
             let mut stmt = conn.prepare(

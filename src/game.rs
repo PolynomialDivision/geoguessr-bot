@@ -1049,9 +1049,12 @@ async fn post_round_summary_free_guess(
         }
     }
 
-    // ── All-time leaderboard ──────────────────────────────────────────────────
-    if let Some(lb_text) = crate::commands::build_alltime_leaderboard(ctx).await {
-        if let Some(r) = client.get_room(&ctx.room_id) {
+    // ── Leaderboards ──────────────────────────────────────────────────────────
+    if let Some(r) = client.get_room(&ctx.room_id) {
+        if let Some(lb_text) = crate::commands::build_rolling_leaderboard(ctx).await {
+            r.send(format::mentionify(&lb_text)).await.ok();
+        }
+        if let Some(lb_text) = crate::commands::build_alltime_leaderboard(ctx).await {
             r.send(format::mentionify(&lb_text)).await.ok();
         }
     }

@@ -409,18 +409,17 @@ async fn cmd_scores_free_guess(ctx: &BotContext) -> Result<Option<String>> {
     }
 }
 
-/// Build the all-time leaderboard text (Bayesian-ranked).
-/// Returns `None` if the DB is empty.
-pub async fn build_alltime_leaderboard(ctx: &BotContext) -> Option<String> {
-    let mut board = ctx.db.score_leaderboard().await.ok()?;
-    if board.is_empty() { return None; }
-
-    const C: f64    = 10.0;
+fn format_leaderboard(
+    mut board:   Vec<crate::db::ScoreLeaderboardEntry>,
+    header:      &str,
+    round_count: i64,
+) -> String {
+    const C: f64       = 10.0;
     const BAR_W: usize = 10;
 
     let total_guesses: i64 = board.iter().map(|e| e.guesses_played).sum();
     let total_pts:     i64 = board.iter().map(|e| e.total_score).sum();
-    let global_mean: f64 = if total_guesses > 0 {
+    let global_mean: f64   = if total_guesses > 0 {
         total_pts as f64 / total_guesses as f64
     } else { 2000.0 };
 
@@ -435,25 +434,37 @@ pub async fn build_alltime_leaderboard(ctx: &BotContext) -> Option<String> {
             .then(a.user_id.cmp(&b.user_id))
     });
 
-    let round_count = ctx.db.round_count().await.unwrap_or(0);
     let mut lines = vec![
-        format!("🏆 **Leaderboard** (last 90 days) · {} round(s) total", round_count),
+        format!("🏆 **{}** · {} round(s)", header, round_count),
         String::new(),
     ];
-
     for (i, entry) in board.iter().enumerate() {
-        let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
-
-        let b_avg  = bayesian(entry);
-        let filled = ((b_avg / 5000.0) * BAR_W as f64).round() as usize;
-        let bar    = format!("{}{}", "█".repeat(filled.min(BAR_W)), "░".repeat(BAR_W - filled.min(BAR_W)));
+        let medal    = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
+        let b_avg    = bayesian(entry);
+        let filled   = ((b_avg / 5000.0) * BAR_W as f64).round() as usize;
+        let bar      = format!("{}{}", "█".repeat(filled.min(BAR_W)), "░".repeat(BAR_W - filled.min(BAR_W)));
         let avg_dist  = if entry.guesses_played > 0 { format_dist(entry.avg_distance_km)  } else { "n/a".to_owned() };
         let best_dist = if entry.guesses_played > 0 { format_dist(entry.best_distance_km) } else { "n/a".to_owned() };
-
         lines.push(format!("{medal} {:>2}. {} : {} pts/guess", i + 1, entry.user_id, b_avg.round() as i64));
         lines.push(format!("      {bar}  ⌀ {}  🏅 {}  ({} guesses)", avg_dist, best_dist, entry.guesses_played));
     }
-    Some(lines.join("\n"))
+    lines.join("\n")
+}
+
+/// All-time leaderboard (every round ever played). Used by `!leaderboard`.
+pub async fn build_alltime_leaderboard(ctx: &BotContext) -> Option<String> {
+    let board = ctx.db.score_leaderboard_alltime().await.ok()?;
+    if board.is_empty() { return None; }
+    let round_count = ctx.db.round_count().await.unwrap_or(0);
+    Some(format_leaderboard(board, "All-time Leaderboard", round_count))
+}
+
+/// 90-day rolling leaderboard. Posted after each round.
+pub async fn build_rolling_leaderboard(ctx: &BotContext) -> Option<String> {
+    let board = ctx.db.score_leaderboard().await.ok()?;
+    if board.is_empty() { return None; }
+    let round_count = ctx.db.round_count().await.unwrap_or(0);
+    Some(format_leaderboard(board, "Leaderboard (last 90 days)", round_count))
 }
 
 // ── !mystats ──────────────────────────────────────────────────────────────────
