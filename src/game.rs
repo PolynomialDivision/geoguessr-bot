@@ -457,8 +457,10 @@ async fn play_free_guess(
     for (i, media) in all_images.iter().enumerate() {
         let label = if n_imgs == 1 {
             "📍 Where is this?".to_owned()
+        } else if i == 0 {
+            format!("📍 Reference location (1/{n_imgs})")
         } else {
-            format!("📍 {}/{}", i + 1, n_imgs)
+            format!("📍 Context image ({}/{})", i + 1, n_imgs)
         };
         room.send(image_content_with_info(label, media.uri.clone(), &media.mime, media.w, media.h, media.size)).await?;
     }
@@ -503,8 +505,10 @@ async fn play_free_guess(
             for (i, media) in all_images.iter().enumerate() {
                 let label = if n_imgs == 1 {
                     "📍 Where is this?".to_owned()
+                } else if i == 0 {
+                    format!("📍 Reference location (1/{n_imgs})")
                 } else {
-                    format!("📍 {}/{}", i + 1, n_imgs)
+                    format!("📍 Context image ({}/{})", i + 1, n_imgs)
                 };
                 dm_room.send(image_content_with_info(label, media.uri.clone(), &media.mime, media.w, media.h, media.size)).await.ok();
             }
@@ -630,7 +634,11 @@ async fn play_free_guess(
             (uid, guess, dist, score)
         })
         .collect();
-    scored.sort_by(|a, b| b.3.cmp(&a.3));
+    scored.sort_by(|a, b| {
+        b.3.cmp(&a.3)
+            .then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+            .then(a.0.cmp(&b.0))
+    });
 
     let n_answers = scored.len();
 
@@ -997,9 +1005,17 @@ async fn post_round_summary_free_guess(
         String::new(),
     ];
 
-    // Sort by total score desc. Use DB stats if available, fall back to in-memory scores.
+    // Sort by total score desc, then avg distance asc (from DB), then username asc.
     let mut ranking: Vec<(&str, i64)> = scores.iter().map(|(u, &s)| (u.as_str(), s)).collect();
-    ranking.sort_by(|a, b| b.1.cmp(&a.1));
+    ranking.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| {
+                let da = round_stats.iter().find(|e| e.user_id == a.0).map(|e| e.avg_distance_km).unwrap_or(f64::MAX);
+                let db = round_stats.iter().find(|e| e.user_id == b.0).map(|e| e.avg_distance_km).unwrap_or(f64::MAX);
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then(a.0.cmp(&b.0))
+    });
 
     for (i, (uid, score)) in ranking.iter().enumerate() {
         let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
@@ -1917,7 +1933,11 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
             (uid, guess, dist, score)
         })
         .collect();
-    scored.sort_by(|a, b| b.3.cmp(&a.3));
+    scored.sort_by(|a, b| {
+        b.3.cmp(&a.3)
+            .then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+            .then(a.0.cmp(&b.0))
+    });
 
     let n_answers = scored.len();
     let db_rows: Vec<(String, String, f64, f64, f64, i64)> = scored.iter()

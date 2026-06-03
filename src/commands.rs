@@ -430,7 +430,10 @@ pub async fn build_alltime_leaderboard(ctx: &BotContext) -> Option<String> {
         (C * global_mean + n * avg) / (C + n)
     };
 
-    board.sort_by(|a, b| bayesian(b).partial_cmp(&bayesian(a)).unwrap_or(std::cmp::Ordering::Equal));
+    board.sort_by(|a, b| {
+        bayesian(b).partial_cmp(&bayesian(a)).unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.user_id.cmp(&b.user_id))
+    });
 
     let round_count = ctx.db.round_count().await.unwrap_or(0);
     let mut lines = vec![
