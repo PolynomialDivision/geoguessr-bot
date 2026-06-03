@@ -437,7 +437,7 @@ pub async fn build_alltime_leaderboard(ctx: &BotContext) -> Option<String> {
 
     let round_count = ctx.db.round_count().await.unwrap_or(0);
     let mut lines = vec![
-        format!("🏆 **All-time Leaderboard** · {} round(s)", round_count),
+        format!("🏆 **Leaderboard** (last 90 days) · {} round(s) total", round_count),
         String::new(),
     ];
 

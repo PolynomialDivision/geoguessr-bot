@@ -626,11 +626,12 @@ async fn play_free_guess(
     };
 
     // Score.
+    let half_life = ctx.config.schedule.score_half_life_km;
     let mut scored: Vec<(String, FreeGuess, f64, i64)> = guesses
         .into_iter()
         .map(|(uid, guess)| {
             let dist  = haversine_km(guess.lat, guess.lon, actual_lat, actual_lon);
-            let score = distance_score(dist);
+            let score = distance_score(dist, half_life);
             (uid, guess, dist, score)
         })
         .collect();
@@ -1129,10 +1130,12 @@ fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     R * 2.0 * a.sqrt().asin()
 }
 
-/// GeoGuessr-style score: 5000 × e^(−distance_km / 2000).
-/// 0 km → 5000 pts, 2000 km → ~1839 pts, 5000 km → ~286 pts.
-fn distance_score(distance_km: f64) -> i64 {
-    (5000.0 * (-distance_km / 2000.0).exp()).round() as i64
+/// Score: 5000 × e^(−distance_km / half_life_km).
+/// Uses floor() so 5000 is only achievable at exactly 0 km.
+/// Default half_life = 2000 km: 50 km → 4876, 500 km → 2840.
+/// Lower half_life rewards precision: 1000 → 50 km scores 4753.
+fn distance_score(distance_km: f64, half_life_km: f64) -> i64 {
+    (5000.0 * (-distance_km / half_life_km.max(1.0)).exp()).floor() as i64
 }
 
 pub fn format_dist(dist_km: f64) -> String {
@@ -1636,10 +1639,21 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
         is_homogeneous,
     );
 
+    // Countries seen too often recently — skip at seed-selection time.
+    // Combines DB history (last 90 days) with what is already in the cache.
+    let skip_countries: HashSet<String> = {
+        let mut freq: HashMap<String, u32> = ctx.db.recent_country_counts().await.unwrap_or_default();
+        let st = ctx.state.lock().await;
+        for img in &st.cached_guesses {
+            *freq.entry(img.country.clone()).or_insert(0) += 1;
+        }
+        freq.into_iter().filter(|(_, n)| *n >= 3).map(|(k, _)| k).collect()
+    };
+
     for _ in 0..needed {
         let source = {
             let mut rng = rand::thread_rng();
-            sources.choose(&mut rng).map(|s| s.as_str()).unwrap_or("wikimedia").to_owned()
+            sources.choose(&mut rng).map(|s| s.as_str()).unwrap_or("mapillary").to_owned()
         };
 
         let n_photos = ctx.effective_photos_per_location().await;
@@ -1652,6 +1666,7 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
                     &existing_seqs,
                     &mut filter,
                     &ctx.blur_cache,
+                    &skip_countries,
                 ).await
             }
             "local" => {
@@ -1663,11 +1678,10 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
                     }
                 }
             }
-            _ => crate::sources::wikimedia::fetch(
-                &ctx.config.sources.wikimedia,
-                n_photos,
-                &existing_coords,
-            ).await,
+            _ => {
+                warn!("GeoGuessr: unknown source '{}' — skipping", source);
+                continue;
+            }
         };
 
         match result {
@@ -1925,11 +1939,12 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
         }
     };
 
+    let half_life = ctx.config.schedule.score_half_life_km;
     let mut scored: Vec<(String, FreeGuess, f64, i64)> = guesses
         .into_iter()
         .map(|(uid, guess)| {
             let dist  = haversine_km(guess.lat, guess.lon, actual_lat, actual_lon);
-            let score = distance_score(dist);
+            let score = distance_score(dist, half_life);
             (uid, guess, dist, score)
         })
         .collect();

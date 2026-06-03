@@ -447,14 +447,19 @@ impl Db {
                         COALESCE(a.avg_distance_km, 0.0)   AS avg_distance_km,
                         COALESCE(a.best_distance_km, 0.0)  AS best_distance_km
                    FROM round_scores rs
+                   JOIN rounds ro ON ro.id = rs.round_id
+                    AND ro.started_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-90 days')
                    LEFT JOIN (
-                       SELECT user_id,
-                              COUNT(*)          AS guesses_played,
-                              AVG(distance_km)  AS avg_distance_km,
-                              MIN(distance_km)  AS best_distance_km
-                         FROM answers
-                        WHERE distance_km IS NOT NULL
-                        GROUP BY user_id
+                       SELECT ans.user_id,
+                              COUNT(*)             AS guesses_played,
+                              AVG(ans.distance_km) AS avg_distance_km,
+                              MIN(ans.distance_km) AS best_distance_km
+                         FROM answers ans
+                         JOIN guesses g  ON g.id  = ans.guess_id
+                         JOIN rounds  ri ON ri.id = g.round_id
+                        WHERE ans.distance_km IS NOT NULL
+                          AND ri.started_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-90 days')
+                        GROUP BY ans.user_id
                    ) a ON a.user_id = rs.user_id
                   GROUP BY rs.user_id",
             )?;
@@ -481,13 +486,33 @@ impl Db {
         self.run(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT actual_lat, actual_lon FROM guesses
-                 WHERE actual_lat IS NOT NULL AND actual_lon IS NOT NULL",
+                 WHERE actual_lat IS NOT NULL
+                   AND actual_lon IS NOT NULL
+                   AND asked_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-90 days')",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?))
             })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .context("reading played coords")
+        })
+        .await
+    }
+
+    /// Returns how many times each country was played in the last 90 days.
+    pub async fn recent_country_counts(&self) -> Result<HashMap<String, u32>> {
+        self.run(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT country, COUNT(*) AS cnt
+                   FROM guesses
+                  WHERE asked_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-90 days')
+                  GROUP BY country",
+            )?;
+            let pairs: Vec<(String, u32)> = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .context("reading country counts")?;
+            Ok(pairs.into_iter().collect())
         })
         .await
     }

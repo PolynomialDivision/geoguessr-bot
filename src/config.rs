@@ -54,6 +54,12 @@ pub struct ScheduleConfig {
     /// 1 = only the first guess counts; subsequent attempts are rejected.
     #[serde(default)]
     pub max_guesses_per_player: u32,
+    /// Half-life distance for the scoring curve: score = 5000 × e^(−dist_km / half_life).
+    /// Default 2000 km (original GeoGuessr-style). Lower values reward precision more:
+    ///   1000 = 50 km scores ~4753 pts instead of 4876.
+    ///   500  = 50 km scores ~4512 pts.
+    #[serde(default = "default_score_half_life_km")]
+    pub score_half_life_km: f64,
 }
 
 impl ScheduleConfig {
@@ -72,18 +78,16 @@ fn default_inter_guess_secs()     -> u64 { 15 }
 fn default_reminder_before_secs() -> u64 { 300 }
 fn default_timezone()             -> String { "UTC".to_owned() }
 fn default_photos_per_location()  -> usize { 1 }
+fn default_score_half_life_km()   -> f64 { 2000.0 }
 
 // ── Sources ───────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct SourcesConfig {
-    /// Which sources to draw images from: "wikimedia", "mapillary", "local".
+    /// Which sources to draw images from: "mapillary", "local".
     /// The bot picks a random source from this list for each image.
     #[serde(default = "default_enabled_sources")]
     pub enabled: Vec<String>,
-
-    #[serde(default)]
-    pub wikimedia: WikimediaConfig,
 
     #[serde(default)]
     pub mapillary: MapillaryConfig,
@@ -93,26 +97,8 @@ pub struct SourcesConfig {
 }
 
 fn default_enabled_sources() -> Vec<String> {
-    vec!["wikimedia".to_owned()]
+    vec!["mapillary".to_owned()]
 }
-
-#[derive(Deserialize, Default)]
-pub struct WikimediaConfig {
-    /// Geosearch radius in metres around each seed coordinate (default 50 000).
-    #[serde(default = "default_search_radius")]
-    pub search_radius: u32,
-    /// Maximum image size in bytes to accept (default 4 MB).
-    /// Larger images are skipped.
-    #[serde(default = "default_max_image_bytes")]
-    pub max_image_bytes: u64,
-    /// Optional allow-list of ISO 3166-1 alpha-2 country codes.
-    /// When set, only seed locations in these countries are used.
-    #[serde(default)]
-    pub countries: Vec<String>,
-}
-
-fn default_search_radius()   -> u32  { 50_000 }
-fn default_max_image_bytes() -> u64  { 4 * 1024 * 1024 }
 
 #[derive(Deserialize, Default)]
 pub struct MapillaryConfig {

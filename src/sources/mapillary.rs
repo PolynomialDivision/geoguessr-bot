@@ -11,7 +11,7 @@
 //! Requires a free Mapillary client access token (register at
 //! https://www.mapillary.com/developer).
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{collections::{HashMap, HashSet, VecDeque}, sync::Mutex};
 
 use anyhow::{bail, Result};
 use rand::seq::SliceRandom;
@@ -87,18 +87,50 @@ struct Creator {
 /// sharing a sequence with any cached location are rejected.
 ///
 /// Tries up to 10 different seed countries before giving up.
-/// Per-image metrics cached after a thumbnail download.
-/// `(sharpness, overlay_penalty)` — both in [0.0, 1.0].
-/// `sharpness` is a score (1 = sharp), `overlay_penalty` is a penalty (1 = severe overlay).
+/// Per-image metrics: (sharpness_score [0=blurry,1=sharp], overlay_penalty [0=clean,1=severe]).
 pub type ImageMetrics = (Option<f32>, Option<f32>);
 
+/// LRU-style in-memory cache of per-image thumbnail metrics.
+///
+/// Evicts the oldest 20 % of entries when capacity is reached rather than
+/// clearing everything, so recently-computed metrics survive across prefetch
+/// batches even when the cache is busy.
+pub struct BlurCache {
+    map:   HashMap<String, ImageMetrics>,
+    order: VecDeque<String>,
+    cap:   usize,
+}
+
+impl BlurCache {
+    pub fn new(cap: usize) -> Self {
+        BlurCache { map: HashMap::new(), order: VecDeque::new(), cap }
+    }
+
+    pub fn get(&self, key: &str) -> Option<ImageMetrics> {
+        self.map.get(key).copied()
+    }
+
+    pub fn insert(&mut self, key: String, val: ImageMetrics) {
+        if self.map.contains_key(&key) { return; }
+        if self.map.len() >= self.cap {
+            let evict = (self.cap / 5).max(1);
+            for _ in 0..evict {
+                if let Some(old) = self.order.pop_front() { self.map.remove(&old); }
+            }
+        }
+        self.order.push_back(key.clone());
+        self.map.insert(key, val);
+    }
+}
+
 pub async fn fetch(
-    cfg:           &MapillaryConfig,
-    n_photos:      usize,
-    existing:      &[(f64, f64)],
-    existing_seqs: &[Option<String>],
-    filter:        &mut super::quality_filter::FilterState,
-    blur_cache:    &Mutex<HashMap<String, ImageMetrics>>,
+    cfg:            &MapillaryConfig,
+    n_photos:       usize,
+    existing:       &[(f64, f64)],
+    existing_seqs:  &[Option<String>],
+    filter:         &mut super::quality_filter::FilterState,
+    blur_cache:     &Mutex<BlurCache>,
+    skip_countries: &HashSet<String>,
 ) -> Result<GeoImage> {
     let n_photos = n_photos.max(1);
     if cfg.access_token.is_empty() {
@@ -109,7 +141,7 @@ pub async fn fetch(
         .user_agent(UA)
         .build()?;
 
-    let pool: Vec<&Country> = if cfg.countries.is_empty() {
+    let full_pool: Vec<&Country> = if cfg.countries.is_empty() {
         countries::COUNTRIES.iter().collect()
     } else {
         countries::COUNTRIES
@@ -118,9 +150,16 @@ pub async fn fetch(
             .collect()
     };
 
-    if pool.is_empty() {
+    if full_pool.is_empty() {
         bail!("Mapillary: country filter matches no known countries");
     }
+
+    // Exclude recently over-represented countries, but keep at least 5 options
+    // so the skip list can never starve the pool.
+    let filtered: Vec<&Country> = full_pool.iter().copied()
+        .filter(|c| !skip_countries.contains(c.iso) && !skip_countries.contains(c.name))
+        .collect();
+    let pool = if filtered.len() >= 5 { filtered } else { full_pool };
 
     // Build a diversity tracker from already-accepted locations to detect
     // geographic collapse and prefer under-sampled regions.
@@ -174,7 +213,7 @@ async fn try_seed(
     existing:      &[(f64, f64)],
     existing_seqs: &[Option<String>],
     filter:        &mut super::quality_filter::FilterState,
-    blur_cache:    &Mutex<HashMap<String, ImageMetrics>>,
+    blur_cache:    &Mutex<BlurCache>,
 ) -> Result<Option<GeoImage>> {
     let radius_km = (cfg.search_radius / 1000).clamp(1, 50);
     let url = format!(
@@ -267,8 +306,7 @@ async fn try_seed(
         let (sharpness, overlay_penalty) = {
             let cached = blur_cache.lock()
                 .expect("blur_cache lock poisoned")
-                .get(&img_id)
-                .copied();
+                .get(&img_id);
             match cached {
                 Some(metrics) => metrics,
                 None => {
@@ -276,9 +314,8 @@ async fn try_seed(
                         Some(ref bytes) => (compute_sharpness(bytes), detect_overlay(bytes)),
                         None            => (None, None),
                     };
-                    let mut cache = blur_cache.lock().expect("blur_cache lock poisoned");
-                    if cache.len() >= 1000 { cache.clear(); }
-                    cache.insert(img_id.clone(), metrics);
+                    blur_cache.lock().expect("blur_cache lock poisoned")
+                        .insert(img_id.clone(), metrics);
                     metrics
                 }
             }
@@ -334,7 +371,7 @@ async fn try_seed(
             .filter(|img| img.sequence.as_deref() != primary_seq || primary_seq.is_none())
             .filter(|img| {
                 let metrics = blur_cache.lock().ok()
-                    .and_then(|c| c.get(&img.id).copied());
+                    .and_then(|c| c.get(&img.id));
                 match metrics {
                     Some((sharpness, overlay)) =>
                         sharpness.map(|s| s >= 0.2).unwrap_or(true)
@@ -490,7 +527,7 @@ pub(super) fn detect_overlay(img_bytes: &[u8]) -> Option<f32> {
 fn sequence_overlay_multiplier(
     candidates:  &[MapillaryImage],
     primary_idx: usize,
-    blur_cache:  &Mutex<HashMap<String, ImageMetrics>>,
+    blur_cache:  &Mutex<BlurCache>,
 ) -> f32 {
     let seq_id = match candidates[primary_idx].sequence.as_deref() {
         Some(s) => s,
@@ -509,8 +546,8 @@ fn sequence_overlay_multiplier(
 
     let cache = blur_cache.lock().expect("blur_cache lock");
     let peer_overlays: Vec<f32> = peer_ids.iter()
-        .filter_map(|id| cache.get(*id))
-        .filter_map(|&(_, penalty)| penalty)
+        .filter_map(|id| cache.get(id))
+        .filter_map(|(_, penalty)| penalty)
         .collect();
     drop(cache);
 

@@ -86,8 +86,8 @@ pub struct BotContext {
     pub prefetch_streak: Arc<AtomicU32>,
     /// Per-image-ID thumbnail metrics cache — avoids re-downloading thumbnails
     /// across prefetch sessions.  Stores (sharpness, overlay_penalty).
-    /// Bounded at 1000 entries; cleared on overflow.
-    pub blur_cache: Arc<std::sync::Mutex<HashMap<String, crate::sources::mapillary::ImageMetrics>>>,
+    /// Evicts oldest 20 % of entries at 1000-entry capacity.
+    pub blur_cache: Arc<std::sync::Mutex<crate::sources::mapillary::BlurCache>>,
 }
 
 impl BotContext {
@@ -197,7 +197,7 @@ async fn main() -> Result<()> {
         dm_rooms:        Arc::new(Mutex::new(HashMap::new())),
         round_abort:     Arc::new(Mutex::new(None)),
         prefetch_streak: Arc::new(AtomicU32::new(0)),
-        blur_cache:      Arc::new(std::sync::Mutex::new(HashMap::new())),
+        blur_cache:      Arc::new(std::sync::Mutex::new(crate::sources::mapillary::BlurCache::new(1000))),
     };
 
     // ── Invite handler ────────────────────────────────────────────────────────

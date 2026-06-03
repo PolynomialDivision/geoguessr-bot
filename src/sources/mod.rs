@@ -7,7 +7,6 @@ pub mod diversity;
 pub mod local;
 pub mod mapillary;
 pub mod quality_filter;
-pub mod wikimedia;
 
 use serde::{Deserialize, Serialize};
 use tracing::warn;
