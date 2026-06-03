@@ -184,8 +184,6 @@ pub struct QualityResult {
     pub score:    f32,
     /// Human-readable summary for logging.
     pub reason:   &'static str,
-    /// Per-axis scores (for debug logging).
-    pub sub:      SubScores,
 }
 
 /// Per-axis raw scores before weighting.
@@ -212,8 +210,8 @@ pub struct SubScores {
 /// Tracks consecutive rejections across fetch calls.
 ///
 /// Create one instance per `prefetch_if_needed` session via
-/// [`FilterState::with_streak`], pass it mutably to each source fetch,
-/// and write the updated streak back to `BotContext` via [`FilterState::streak`].
+/// [`FilterState::with_streak_and_exploration`], pass it mutably to each source
+/// fetch, and write the updated streak back to `BotContext` via [`FilterState::streak`].
 #[derive(Debug, Default)]
 pub struct FilterState {
     pub(super) consecutive_rejections: u32,
@@ -223,10 +221,8 @@ pub struct FilterState {
 }
 
 impl FilterState {
-    pub fn new() -> Self { Self::default() }
-
-    /// Restore from a previously persisted rejection streak.
-    pub fn with_streak(n: u32) -> Self { Self { consecutive_rejections: n, ..Self::default() } }
+    #[cfg(test)] fn new() -> Self { Self::default() }
+    #[cfg(test)] fn with_streak(n: u32) -> Self { Self { consecutive_rejections: n, ..Self::default() } }
 
     /// Restore streak and set exploration mode (for geographic anti-collapse).
     pub fn with_streak_and_exploration(n: u32, explore: bool) -> Self {
@@ -384,7 +380,7 @@ fn decide(score: f32, sub: SubScores, consecutive: u32, exploration: bool) -> Qu
     let effective = (THRESHOLD_SOFT - relax - extra).max(THRESHOLD_FLOOR);
 
     if score >= THRESHOLD_GOOD {
-        QualityResult { decision: Decision::Accept, score, reason: "good quality",                       sub }
+        QualityResult { decision: Decision::Accept, score, reason: "good quality" }
     } else if score >= effective {
         let reason = match (relax > 0.0, exploration) {
             (true,  true)  => "soft accept (anti-starvation + exploration)",
@@ -392,9 +388,9 @@ fn decide(score: f32, sub: SubScores, consecutive: u32, exploration: bool) -> Qu
             (false, true)  => "soft accept (exploration)",
             (false, false) => "soft accept",
         };
-        QualityResult { decision: Decision::Accept, score, reason,                                       sub }
+        QualityResult { decision: Decision::Accept, score, reason }
     } else {
-        QualityResult { decision: Decision::Reject, score, reason: weakest_axis(&sub),                   sub }
+        QualityResult { decision: Decision::Reject, score, reason: weakest_axis(&sub) }
     }
 }
 
