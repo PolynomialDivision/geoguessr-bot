@@ -59,13 +59,22 @@ pub fn render_guess_map(
         2001..=5000 => 4,
         _           => 3,
     };
-    // Maximum zoom at which the arc still fits inside 640 px (tile = 256 px).
+    // Maximum zoom at which the lon arc still fits inside 640 px (tile = 256 px).
     let max_zoom_arc = if arc_span > 0.0 {
         ((640.0_f64 / 256.0 * 360.0) / arc_span).log2().floor().clamp(0.0, 17.0) as u8
     } else {
         base_zoom
     };
-    let zoom = base_zoom.min(max_zoom_arc);
+    // Maximum zoom at which the lat span fits inside the effective height (400 - 2×30 = 340 px).
+    let lat_min = guess_lat.min(actual_lat);
+    let lat_max = guess_lat.max(actual_lat);
+    let max_zoom_lat = (0u8..=17).rev()
+        .find(|&z| {
+            let y_span = (lat_to_y(lat_min, z) - lat_to_y(lat_max, z)).abs() * 256.0;
+            y_span <= 340.0
+        })
+        .unwrap_or(0);
+    let zoom = base_zoom.min(max_zoom_arc).min(max_zoom_lat);
 
     let mut map = StaticMapBuilder::new()
         .width(640)
