@@ -285,6 +285,7 @@ pub async fn start_round(
     // (spawned at the end of the *previous* round) may have added a stale entry
     // between that eviction and this pop.
     let pop_db_coords = ctx.db.recent_played_coords().await.unwrap_or_default();
+    let n_photos = ctx.effective_photos_per_location().await;
     let mut image_queue: VecDeque<GeoImage> = {
         let mut st    = ctx.state.lock().await;
         let mut q     = VecDeque::new();
@@ -293,19 +294,27 @@ pub async fn start_round(
         while q.len() < n && checked < limit {
             let img = st.cached_guesses.pop_front().expect("bounded by limit");
             checked += 1;
-            let valid = img.lat.zip(img.lon)
+            let far_enough = img.lat.zip(img.lon)
                 .map(|(la, lo)| {
                     crate::sources::min_dist_to_existing(la, lo, &pop_db_coords)
                         >= crate::sources::MIN_DISTANCE_KM
                 })
                 .unwrap_or(true); // no coords → can't check, accept
-            if valid {
-                q.push_back(img);
-            } else {
+            let enough_photos = img.extra_image_urls.len() + 1 >= n_photos;
+            if !far_enough {
                 warn!(
                     "GeoGuessr: pop-time dedup: discarded {} (too close to a played location)",
                     img.country
                 );
+            } else if !enough_photos {
+                warn!(
+                    "GeoGuessr: pop-time dedup: discarded {} ({} photo(s) cached, {} required)",
+                    img.country,
+                    img.extra_image_urls.len() + 1,
+                    n_photos,
+                );
+            } else {
+                q.push_back(img);
             }
         }
         if q.len() < n {
@@ -2104,6 +2113,7 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
     }
 
     let n            = ctx.effective_guesses_per_round().await;
+    let n_photos     = ctx.effective_photos_per_location().await;
     let triggered_by = "scheduler";
 
     if participants.is_empty() {
@@ -2166,7 +2176,20 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
     for i in 0..n {
         let img = {
             let mut st = ctx.state.lock().await;
-            match st.cached_guesses.pop_front() {
+            let mut found = None;
+            while let Some(img) = st.cached_guesses.pop_front() {
+                if img.extra_image_urls.len() + 1 >= n_photos {
+                    found = Some(img);
+                    break;
+                }
+                warn!(
+                    "GeoGuessr: pop-time dedup: discarded {} ({} photo(s) cached, {} required)",
+                    img.country,
+                    img.extra_image_urls.len() + 1,
+                    n_photos,
+                );
+            }
+            match found {
                 Some(img) => {
                     st.save(&ctx.state_path).await.ok();
                     img
