@@ -1928,18 +1928,12 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
         }
     }
 
-    // Collect and score guesses — re-use the DB guess_id from the existing row if possible,
-    // otherwise create a new one (fallback only; the DB row should already exist).
+    // Re-use the DB guess row created by play_free_guess before the crash.
+    // Never insert a duplicate — the original row already exists.
     let guess_id = ctx.db
-        .start_guess(
-            ar.round_id, ar.guess_num,
-            &ar.current_image.country, &ar.current_image.region,
-            ar.current_image.city.as_deref(),
-            &ar.current_image.source, ar.current_image.attribution.as_deref(),
-            &[], 0,
-            ar.answer_timeout_secs,
-            Some(actual_lat), Some(actual_lon),
-        ).await.unwrap_or(-1);
+        .find_guess_id(ar.round_id, ar.guess_num)
+        .await
+        .unwrap_or(-1);
 
     let guesses = {
         let mut ag = ctx.active_game.lock().await;
@@ -2171,45 +2165,76 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
 
     info!("GeoGuessr round {round_id} resumed after restart ({n} images)");
 
-    let mut round_scores_free: HashMap<String, i64> = HashMap::new();
-
-    for i in 0..n {
-        let img = {
-            let mut st = ctx.state.lock().await;
-            let mut found = None;
-            while let Some(img) = st.cached_guesses.pop_front() {
-                if img.extra_image_urls.len() + 1 >= n_photos {
-                    found = Some(img);
-                    break;
-                }
-                warn!(
-                    "GeoGuessr: pop-time dedup: discarded {} ({} photo(s) cached, {} required)",
-                    img.country,
-                    img.extra_image_urls.len() + 1,
-                    n_photos,
-                );
-            }
-            match found {
-                Some(img) => {
-                    st.save(&ctx.state_path).await.ok();
-                    img
-                }
+    // Pre-collect all images into a queue (mirrors start_round) so that
+    // active_round state can be persisted before each guess, making the
+    // play phase of a resumed-join-round also crash-safe.
+    let mut image_queue: VecDeque<GeoImage> = {
+        let mut st = ctx.state.lock().await;
+        let mut q  = VecDeque::new();
+        while q.len() < n {
+            match st.cached_guesses.pop_front() {
                 None => {
-                    warn!("resume_pending_join: guess cache empty — skipping remaining");
+                    warn!("resume_pending_join: guess cache empty after {} image(s)", q.len());
                     break;
                 }
+                Some(img) => {
+                    if img.extra_image_urls.len() + 1 >= n_photos {
+                        q.push_back(img);
+                    } else {
+                        warn!(
+                            "GeoGuessr: pop-time dedup: discarded {} ({} photo(s) cached, {} required)",
+                            img.country, img.extra_image_urls.len() + 1, n_photos,
+                        );
+                    }
+                }
             }
-        };
+        }
+        st.save(&ctx.state_path).await.ok();
+        q
+    };
 
-        if i > 0 {
+    let total              = image_queue.len();
+    let mut round_scores_free: HashMap<String, i64> = HashMap::new();
+    let mut first_guess    = true;
+
+    while let Some(img) = image_queue.pop_front() {
+        let guess_num = (total - image_queue.len()) as u32; // 1-based after pop
+
+        // Persist active_round before starting the guess so a second restart
+        // during the play phase can resume via resume_active_round.
+        {
+            let mut st = ctx.state.lock().await;
+            let dm_state = dm_map.iter().map(|(uid, dm_room_id)| {
+                (uid.to_string(), ActiveDmParticipant {
+                    dm_room_id:      dm_room_id.to_string(),
+                    prompt_event_id: None,
+                    answer_acked:    false,
+                })
+            }).collect();
+            st.active_round = Some(ActiveRoundState {
+                round_id,
+                guess_num,
+                total_guesses:       total as u32,
+                current_image:       img.clone(),
+                remaining_images:    image_queue.clone(),
+                guess_started_at:    chrono::Utc::now(),
+                answer_timeout_secs: pj.answer_timeout_secs,
+                dm_participants:     dm_state,
+                round_scores:        round_scores_free.clone(),
+            });
+            st.save(&ctx.state_path).await.ok();
+        }
+
+        if !first_guess {
             tokio::time::sleep(tokio::time::Duration::from_secs(
                 ctx.config.schedule.inter_guess_secs,
             )).await;
         }
+        first_guess = false;
 
         if let Err(e) = play_free_guess(
             &ctx, &client, &room,
-            round_id, i as u32 + 1, n as u32,
+            round_id, guess_num, total as u32,
             &img, &mut round_scores_free, &dm_map,
             pj.answer_timeout_secs,
         ).await {

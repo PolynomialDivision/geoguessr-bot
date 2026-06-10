@@ -130,3 +130,207 @@ impl State {
         Ok(())
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sources::GeoImage;
+
+    fn sample_image() -> GeoImage {
+        GeoImage {
+            country:          "Germany".to_owned(),
+            region:           "Europe".to_owned(),
+            city:             Some("Munich".to_owned()),
+            image_url:        "https://example.com/img.jpg".to_owned(),
+            source:           "test".to_owned(),
+            attribution:      None,
+            lat:              Some(48.1351),
+            lon:              Some(11.5820),
+            sequence:         None,
+            extra_image_urls: vec![],
+        }
+    }
+
+    fn sample_active_round() -> ActiveRoundState {
+        let mut dm = HashMap::new();
+        dm.insert("@alice:example.com".to_owned(), ActiveDmParticipant {
+            dm_room_id:      "!dm:example.com".to_owned(),
+            prompt_event_id: Some("$prompt:example.com".to_owned()),
+            answer_acked:    false,
+        });
+        let mut scores = HashMap::new();
+        scores.insert("@alice:example.com".to_owned(), 3500i64);
+
+        ActiveRoundState {
+            round_id:            42,
+            guess_num:           2,
+            total_guesses:       3,
+            current_image:       sample_image(),
+            remaining_images:    VecDeque::from(vec![sample_image()]),
+            guess_started_at:    chrono::DateTime::parse_from_rfc3339("2024-01-01T12:00:00Z")
+                                     .unwrap()
+                                     .with_timezone(&Utc),
+            answer_timeout_secs: 90,
+            dm_participants:     dm,
+            round_scores:        scores,
+        }
+    }
+
+    // ── Serde roundtrips ──────────────────────────────────────────────────────
+
+    #[test]
+    fn active_round_state_roundtrip() {
+        let original = sample_active_round();
+        let json     = serde_json::to_string(&original).unwrap();
+        let restored: ActiveRoundState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.round_id, 42);
+        assert_eq!(restored.guess_num, 2);
+        assert_eq!(restored.total_guesses, 3);
+        assert_eq!(restored.answer_timeout_secs, 90);
+        assert_eq!(restored.current_image.country, "Germany");
+        assert_eq!(restored.remaining_images.len(), 1);
+
+        let alice = restored.dm_participants.get("@alice:example.com").unwrap();
+        assert_eq!(alice.dm_room_id, "!dm:example.com");
+        assert_eq!(alice.prompt_event_id.as_deref(), Some("$prompt:example.com"));
+        assert!(!alice.answer_acked);
+
+        assert_eq!(*restored.round_scores.get("@alice:example.com").unwrap(), 3500);
+    }
+
+    #[test]
+    fn pending_join_roundtrip() {
+        let pj = PendingJoin {
+            event_id:            "$join:example.com".to_owned(),
+            join_emoji:          "🇬🇧".to_owned(),
+            slot:                Some("12:00".to_owned()),
+            game_at_utc:         chrono::DateTime::parse_from_rfc3339("2024-06-01T12:00:00Z")
+                                     .unwrap()
+                                     .with_timezone(&Utc),
+            answer_timeout_secs: 120,
+        };
+        let json     = serde_json::to_string(&pj).unwrap();
+        let restored: PendingJoin = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.event_id, "$join:example.com");
+        assert_eq!(restored.join_emoji, "🇬🇧");
+        assert_eq!(restored.slot.as_deref(), Some("12:00"));
+        assert_eq!(restored.answer_timeout_secs, 120);
+        assert_eq!(restored.game_at_utc, pj.game_at_utc);
+    }
+
+    #[test]
+    fn state_roundtrip_with_active_round() {
+        let mut state = State::default();
+        state.active_round = Some(sample_active_round());
+        state.user_langs.insert("@bob:example.com".to_owned(), "de".to_owned());
+
+        let json     = serde_json::to_string(&state).unwrap();
+        let restored: State = serde_json::from_str(&json).unwrap();
+
+        assert!(restored.active_round.is_some());
+        assert_eq!(restored.active_round.unwrap().round_id, 42);
+        assert_eq!(restored.user_langs.get("@bob:example.com").map(|s| s.as_str()), Some("de"));
+    }
+
+    #[test]
+    fn state_default_roundtrip() {
+        let state    = State::default();
+        let json     = serde_json::to_string(&state).unwrap();
+        let restored: State = serde_json::from_str(&json).unwrap();
+
+        assert!(restored.active_round.is_none());
+        assert!(restored.pending_join.is_none());
+        assert!(restored.cached_guesses.is_empty());
+        assert!(restored.last_game_dates.is_empty());
+    }
+
+    #[test]
+    fn answer_acked_flag_roundtrip() {
+        let p = ActiveDmParticipant {
+            dm_room_id:      "!dm:example.com".to_owned(),
+            prompt_event_id: None,
+            answer_acked:    true,
+        };
+        let json     = serde_json::to_string(&p).unwrap();
+        let restored: ActiveDmParticipant = serde_json::from_str(&json).unwrap();
+        assert!(restored.answer_acked);
+        assert!(restored.prompt_event_id.is_none());
+    }
+
+    // ── Atomic save ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn save_is_atomic_tmp_then_rename() {
+        let dir  = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let mut state = State::default();
+        state.user_langs.insert("@test:example.com".to_owned(), "fr".to_owned());
+        state.save(&path).await.unwrap();
+
+        // Rename completed: tmp file must be gone.
+        assert!(!path.with_extension("tmp").exists(),
+            "tmp file was not cleaned up after save");
+
+        // File must load back to identical state.
+        let loaded = State::load(&path).await.unwrap();
+        assert_eq!(
+            loaded.user_langs.get("@test:example.com").map(|s| s.as_str()),
+            Some("fr"),
+        );
+    }
+
+    #[tokio::test]
+    async fn load_returns_default_when_file_missing() {
+        let dir  = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let state = State::load(&path).await.unwrap();
+        assert!(state.active_round.is_none());
+    }
+
+    #[tokio::test]
+    async fn save_then_load_preserves_active_round() {
+        let dir   = tempfile::tempdir().unwrap();
+        let path  = dir.path().join("state.json");
+        let mut state = State::default();
+        state.active_round = Some(sample_active_round());
+        state.save(&path).await.unwrap();
+
+        let loaded = State::load(&path).await.unwrap();
+        let ar = loaded.active_round.unwrap();
+        assert_eq!(ar.round_id, 42);
+        assert_eq!(ar.guess_num, 2);
+        assert_eq!(ar.remaining_images.len(), 1);
+        assert_eq!(ar.remaining_images[0].country, "Germany");
+    }
+
+    // ── Timeout math ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn remaining_timeout_saturates_when_elapsed_exceeds_window() {
+        let started      = Utc::now() - chrono::Duration::seconds(200);
+        let timeout_secs = 90u64;
+        let elapsed      = Utc::now()
+            .signed_duration_since(started)
+            .num_seconds()
+            .max(0) as u64;
+        assert_eq!(timeout_secs.saturating_sub(elapsed), 0);
+    }
+
+    #[test]
+    fn remaining_timeout_when_time_is_left() {
+        let started      = Utc::now() - chrono::Duration::seconds(30);
+        let timeout_secs = 90u64;
+        let elapsed      = Utc::now()
+            .signed_duration_since(started)
+            .num_seconds()
+            .max(0) as u64;
+        let remaining    = timeout_secs.saturating_sub(elapsed);
+        assert!(remaining > 50 && remaining <= 60,
+            "expected ~60s remaining, got {remaining}");
+    }
+}

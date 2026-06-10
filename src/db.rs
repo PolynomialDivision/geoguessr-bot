@@ -250,6 +250,26 @@ impl Db {
         .await
     }
 
+    /// Return the `id` of an existing guess row for (round_id, guess_num), if any.
+    /// Used on restart to retrieve the existing id rather than inserting a duplicate.
+    pub async fn find_guess_id(&self, round_id: i64, guess_num: u32) -> Option<i64> {
+        let guess_num = guess_num as i64;
+        self.run(move |conn| {
+            match conn.query_row(
+                "SELECT id FROM guesses WHERE round_id = ?1 AND guess_num = ?2 LIMIT 1",
+                params![round_id, guess_num],
+                |r| r.get::<_, i64>(0),
+            ) {
+                Ok(id)                                    => Ok(Some(id)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e)                                    => Err(e.into()),
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Check whether a country has been shown in a previous round.
     pub async fn country_asked_before(&self, country: &str) -> Result<bool> {
         let country = country.to_owned();
