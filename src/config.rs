@@ -8,6 +8,23 @@ pub struct Config {
     pub security: SecurityConfig,
     pub schedule: ScheduleConfig,
     pub sources: SourcesConfig,
+    #[serde(default)]
+    pub web: Option<WebConfig>,
+}
+
+/// Optional HTTP server for the interactive map-based guess interface.
+///
+/// ```toml
+/// [web]
+/// bind_addr  = "0.0.0.0:8080"
+/// public_url = "https://geo.example.com"
+/// ```
+#[derive(Deserialize, Clone)]
+pub struct WebConfig {
+    /// Address the bot listens on (e.g. "0.0.0.0:8080").
+    pub bind_addr: String,
+    /// Public base URL players open in their browser (no trailing slash).
+    pub public_url: String,
 }
 
 #[derive(Deserialize, Default)]

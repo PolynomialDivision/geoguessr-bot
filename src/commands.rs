@@ -104,47 +104,35 @@ async fn cmd_cancelgeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Re
     let abort = ctx.round_abort.lock().await.take();
     let had_game = ctx.active_game.lock().await.take().is_some();
 
-    // Collect DM participants before clearing state, so we can notify them.
-    let (round_id_to_close, dm_participants_to_notify) = {
+    let round_id_to_close = {
         let mut st = ctx.state.lock().await;
         let round_id = st.active_round.as_ref().map(|ar| ar.round_id);
-        let dms: Vec<String> = st.active_round.as_ref()
-            .map(|ar| ar.dm_participants.values().map(|p| p.dm_room_id.clone()).collect())
-            .unwrap_or_default();
         st.active_round = None;
         st.pending_join  = None;
         st.save(&ctx.state_path).await.ok();
-        (round_id, dms)
+        round_id
     };
 
     let had_join = round_id_to_close.is_some() || had_game;
 
-    // Mark the DB round as finished so it doesn't stay open indefinitely.
     if let Some(round_id) = round_id_to_close {
         ctx.db.finish_round(round_id).await.ok();
     }
 
-    // Clear DM routing and join-phase state.
-    ctx.dm_rooms.lock().await.clear();
+    // Clear join-phase state and web tokens.
     {
         let mut js = ctx.join_state.lock().await;
         js.message_event_id = None;
         js.participants.clear();
     }
-
-    // Abort the task only after state is clean, so a restart doesn't resume.
-    if let Some(handle) = abort {
-        handle.abort();
+    {
+        let mut store = ctx.web_tokens.lock().await;
+        store.tokens.clear();
+        store.sessions.clear();
     }
 
-    // Notify DM participants so they're not left waiting.
-    for dm_room_id_str in &dm_participants_to_notify {
-        if let Ok(dm_room_id) = dm_room_id_str.parse::<matrix_sdk::ruma::OwnedRoomId>() {
-            if let Some(dm_room) = ctx.client.get_room(&dm_room_id) {
-                dm_room.send(crate::format::mentionify("🛑 Round was cancelled by an admin."))
-                    .await.ok();
-            }
-        }
+    if let Some(handle) = abort {
+        handle.abort();
     }
 
     if had_game || had_join {
@@ -245,6 +233,24 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
     let now_secs  = (local_now.hour() * 3600
         + local_now.minute() * 60
         + local_now.second()) as i64;
+
+    // Reject if the reminder is longer than the time from midnight to the game —
+    // that wraps the fire time to later in the day than the game itself.
+    if fire_secs > game_secs {
+        let hrs  = reminder / 3600;
+        let mins = (reminder % 3600) / 60;
+        let mut msg = format!(
+            "❌ reminder={reminder}s (~{hrs}h {mins}m) is longer than the time from midnight to {qh:02}:{qm:02} \
+             — the join window would open at {:02}:{:02}, after the game itself.",
+            (fire_secs / 3600) as u32,
+            ((fire_secs % 3600) / 60) as u32,
+        );
+        let as_secs = reminder / 1000;
+        if as_secs >= 1 && as_secs as i64 <= game_secs {
+            msg.push_str(&format!(" (Did you mean reminder={as_secs}?)"));
+        }
+        return Ok(Some(msg));
+    }
 
     // If the game itself has already passed today → schedule for tomorrow.
     // If only the join window has passed but the game is still future → schedule

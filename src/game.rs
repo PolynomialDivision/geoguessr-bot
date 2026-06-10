@@ -2,12 +2,11 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use anyhow::Context as _;
 use chrono_tz::Tz;
 use matrix_sdk::{
     Client, Room,
     ruma::{
-        OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, UInt,
+        OwnedEventId, OwnedMxcUri, OwnedUserId, UInt,
         events::{
             Mentions,
             reaction::ReactionEventContent,
@@ -18,6 +17,7 @@ use matrix_sdk::{
                     ImageMessageEventContent, MessageType,
                     ReplacementMetadata, RoomMessageEventContent,
                 },
+                pinned_events::RoomPinnedEventsEventContent,
             },
         },
         // (ReactionEventContent and Annotation kept for join-phase reactions)
@@ -128,8 +128,8 @@ pub async fn start_round(
 
     // ── Join phase (scheduled only) ───────────────────────────────────────────
     // When reminder_before_secs > 0, post a "who wants to play?" message,
-    // react to it, wait for participants, then open a DM with each opt-in player.
-    let dm_participants: HashMap<OwnedUserId, OwnedRoomId> =
+    // react to it, and wait for participants.
+    let participants: Vec<OwnedUserId> =
         if !manual && reminder_before_secs_cfg > 0 {
             let reminder_secs = reminder_before_secs_cfg;
             let emoji         = ctx.config.schedule.join_emoji.clone();
@@ -138,7 +138,6 @@ pub async fn start_round(
             let flags_str = JOIN_REACTION_FLAGS.join(" ");
             let join_msg = format!(
                 "🌍 GeoGuessr starts in {}! @room\n\
-                 I'll invite you to a private chat · answer there.\n\
                  React with your flag to join and set the map language:\n\
                  {}",
                 format_duration(reminder_secs),
@@ -152,6 +151,7 @@ pub async fn start_round(
             });
             let join_event    = room.send(join_content).await?;
             let join_event_id = join_event.response.event_id.clone();
+            set_pinned(&room, &join_event_id).await;
 
             // Bot primes the flag reactions so clients show them as tappable buttons.
             for flag in JOIN_REACTION_FLAGS {
@@ -231,31 +231,17 @@ pub async fn start_round(
                 return Ok(());
             }
 
-            // Open (or reuse) a DM with each participant.
-            let mut dm_map: HashMap<OwnedUserId, OwnedRoomId> = HashMap::new();
-            for uid in &participants {
-                match get_or_create_dm(&client, uid).await {
-                    Ok(dm_room_id) => {
-                        // Register in the global DM-room map so the message handler
-                        // can route answers.
-                        ctx.dm_rooms.lock().await
-                            .insert(dm_room_id.clone(), uid.clone());
+            let mut sorted: Vec<OwnedUserId> = participants.into_iter().collect();
+            sorted.sort();
 
-                        dm_map.insert(uid.clone(), dm_room_id);
-                    }
-                    Err(e) => warn!("Could not open DM with {uid}: {e}"),
-                }
-            }
-
-            let participant_list: Vec<String> = dm_map.keys()
-                .map(|u| u.to_string())
-                .collect();
-            let participant_ids: Vec<OwnedUserId> = dm_map.keys().cloned().collect();
+            let participant_list: Vec<String> = sorted.iter().map(|u| u.to_string()).collect();
+            let participant_ids: Vec<OwnedUserId> = sorted.clone();
+            let n = sorted.len();
             room.send(
                 format::mentionify(&format!(
                     "🌍 GeoGuessr starting now! {} player{}: {}",
-                    dm_map.len(),
-                    if dm_map.len() == 1 { "" } else { "s" },
+                    n,
+                    if n == 1 { "" } else { "s" },
                     participant_list.join(", "),
                 ))
                 .add_mentions(Mentions::with_user_ids(participant_ids)),
@@ -263,10 +249,10 @@ pub async fn start_round(
             .await
             .ok();
 
-            dm_map
+            sorted
 
         } else {
-            HashMap::new()
+            Vec::new()
         };
 
     // ── Pre-fetch + pop images upfront ────────────────────────────────────────
@@ -336,9 +322,9 @@ pub async fn start_round(
         // Save active round state so a restart can resume.
         {
             let mut st = ctx.state.lock().await;
-            let dm_state = dm_participants.iter().map(|(uid, dm_room_id)| {
+            let dm_state = participants.iter().map(|uid| {
                 (uid.to_string(), ActiveDmParticipant {
-                    dm_room_id:      dm_room_id.to_string(),
+                    dm_room_id:      String::new(),
                     prompt_event_id: None,
                     answer_acked:    false,
                 })
@@ -367,7 +353,7 @@ pub async fn start_round(
         play_free_guess(
             &ctx, &client, &room,
             round_id, guess_num, n as u32,
-            &img, &mut round_scores_free, &dm_participants,
+            &img, &mut round_scores_free, &participants,
             answer_timeout_secs_cfg,
         ).await?;
     }
@@ -396,21 +382,13 @@ pub async fn start_round(
 
     post_round_summary_free_guess(
         &ctx, &client, &room,
-        round_id, &round_scores_free, &dm_participants,
+        round_id, &round_scores_free,
     ).await;
 
-    // Clear active_round and DM-room mappings now that the round is complete.
     {
         let mut st = ctx.state.lock().await;
         st.active_round = None;
         st.save(&ctx.state_path).await.ok();
-    }
-    if !dm_participants.is_empty() {
-        let dm_room_ids: Vec<OwnedRoomId> = dm_participants.values().cloned().collect();
-        let mut dm_rooms = ctx.dm_rooms.lock().await;
-        for id in &dm_room_ids {
-            dm_rooms.remove(id);
-        }
     }
 
     Ok(())
@@ -419,15 +397,15 @@ pub async fn start_round(
 // ── Single image — free guess ─────────────────────────────────────────────────
 
 async fn play_free_guess(
-    ctx:                &BotContext,
-    client:             &Client,
-    room:               &Room,
-    round_id:           i64,
-    guess_num:          u32,
-    n_total:            u32,
-    img:                &GeoImage,
-    round_scores:       &mut HashMap<String, i64>,
-    dm_participants:    &HashMap<OwnedUserId, OwnedRoomId>,
+    ctx:                 &BotContext,
+    client:              &Client,
+    room:                &Room,
+    round_id:            i64,
+    guess_num:           u32,
+    n_total:             u32,
+    img:                 &GeoImage,
+    round_scores:        &mut HashMap<String, i64>,
+    participants:        &[OwnedUserId],
     answer_timeout_secs: u64,
 ) -> anyhow::Result<()> {
     let (actual_lat, actual_lon) = match (img.lat, img.lon) {
@@ -475,72 +453,66 @@ async fn play_free_guess(
 
     let total_secs  = answer_timeout_secs;
     let timeout_str = format_duration(total_secs);
-    let bot_mxid    = client.user_id().map(|u| u.to_string()).unwrap_or_default();
-    let room_id_str = ctx.room_id.as_str();
 
-    // Show the "can't find the chat?" hint only once per round, below the first batch of photos.
-    // Plain variant: used in countdown edits (plain-text). HTML variant: used in the initial send.
-    let q_event = if dm_participants.is_empty() {
+    // Generate per-player web tokens and post the initial links message.
+    let web_token_map: HashMap<OwnedUserId, String> = if !participants.is_empty() {
+        if let Some(ref public_url) = ctx.web_public_url {
+            let mut tmap: HashMap<OwnedUserId, String> = HashMap::new();
+            {
+                let mut store = ctx.web_tokens.lock().await;
+                for uid in participants {
+                    let lang = ctx.state.lock().await
+                        .user_langs.get(uid.as_str()).cloned()
+                        .unwrap_or_else(|| "en".to_owned());
+                    let token = crate::web::generate_token();
+                    store.tokens.insert(token.clone(), crate::web::GuessToken {
+                        user_id:   uid.clone(),
+                        round_id,
+                        guess_num,
+                        lang,
+                    });
+                    tmap.insert(uid.clone(), token);
+                }
+
+                let links_line = participants.iter().map(|uid| {
+                    let tok = &tmap[uid];
+                    format!("[🗺️ {}]({}/g/{})", uid.localpart(), public_url, tok)
+                }).collect::<Vec<_>>().join("  ·  ");
+
+                if let Ok(ev) = room.send(format::mentionify(&links_line)).await {
+                    set_pinned(&room, &ev.response.event_id).await;
+                    store.sessions.insert(
+                        (round_id, guess_num),
+                        crate::web::GuessSession {
+                            links_event_id: ev.response.event_id.clone(),
+                            participants:   participants.to_vec(),
+                        },
+                    );
+                }
+            }
+            tmap
+        } else {
+            HashMap::new()
+        }
+    } else {
+        HashMap::new()
+    };
+
+    // Countdown message: web mode shows just the timer (links message handles the rest),
+    // otherwise show the !guess hint.
+    let q_event = if !web_token_map.is_empty() {
+        room.send(format::mentionify(&format!(
+            "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}",
+        ))).await?
+    } else {
         room.send(format::mentionify(&format!(
             "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}\n\
              📍 Where is this? Type: **!guess** city, country, or lat,lon",
-        ))).await?
-    } else if guess_num == 1 {
-        let plain = format!("🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str} | 💬 Open DM");
-        let html  = format!(
-            "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str} | \
-             💬 <a href=\"https://matrix.to/#/{bot_mxid}\">Open DM</a>"
-        );
-        room.send(RoomMessageEventContent::text_html(plain, html)).await?
-    } else {
-        room.send(format::mentionify(&format!(
-            "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}",
         ))).await?
     };
     let q_event_id = q_event.response.event_id.clone();
 
     ctx.db.set_guess_event_id(guess_id, q_event_id.as_str()).await.ok();
-
-    // Post all images + prompt in each participant's DM.
-    let dm_prompt_plain = format!(
-        "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}\n\
-         📍 Where is this?\n\
-         City, country, address, or lat,lon\n\
-         ↩️ Main room: https://matrix.to/#/{room_id_str}"
-    );
-    for (uid, dm_room_id) in dm_participants.iter() {
-        if let Some(dm_room) = client.get_room(dm_room_id) {
-            for (i, media) in all_images.iter().enumerate() {
-                let label = if i == 0 {
-                    if n_imgs == 1 { "📍 Reference location".to_owned() }
-                    else           { format!("📍 Reference location (1/{n_imgs})") }
-                } else {
-                    format!("📍 Context image ({}/{})", i + 1, n_imgs)
-                };
-                dm_room.send(image_content_with_info(label, media.uri.clone(), &media.mime, media.w, media.h, media.size)).await.ok();
-            }
-            let lang = ctx.state.lock().await
-                .user_langs.get(uid.as_str()).cloned()
-                .unwrap_or_else(|| "en".to_owned());
-            let dm_prompt_html = format!(
-                "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}<br>\
-                 📍 Where is this?<br>\
-                 City, country, address, or \
-                 <a href=\"https://polynomialdivision.github.io/geo-picker/?lang={lang}\">pick on map</a><br>\
-                 ↩️ <a href=\"https://matrix.to/#/{room_id_str}\">Main room</a>"
-            );
-            if let Ok(resp) = dm_room.send(RoomMessageEventContent::text_html(&dm_prompt_plain, &dm_prompt_html)).await {
-                // Persist the prompt event ID so we can recover answers after a restart.
-                let mut st = ctx.state.lock().await;
-                if let Some(ref mut ar) = st.active_round {
-                    if let Some(p) = ar.dm_participants.get_mut(uid.as_str()) {
-                        p.prompt_event_id = Some(resp.response.event_id.to_string());
-                    }
-                }
-                st.save(&ctx.state_path).await.ok();
-            }
-        }
-    }
 
     // Register active game.
     {
@@ -567,14 +539,14 @@ async fn play_free_guess(
         tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
         remaining -= sleep_secs;
 
-        // Early-exit check: all DM participants have submitted a guess.
-        if !dm_participants.is_empty() {
+        // Early-exit check: all participants have submitted a guess.
+        if !participants.is_empty() {
             let ag = ctx.active_game.lock().await;
             if let Some(ActiveGame {
                 mode: ActiveGameMode::FreeGuess { ref guesses, .. }, ..
             }) = *ag
             {
-                if dm_participants.keys().all(|uid| guesses.contains_key(uid.as_str())) {
+                if participants.iter().all(|uid| guesses.contains_key(uid.as_str())) {
                     all_in = true;
                 }
             }
@@ -584,21 +556,14 @@ async fn play_free_guess(
 
         let bar      = time_bar(remaining, total_secs);
         let time_str = format_duration(remaining);
-        let edit_msg = if dm_participants.is_empty() {
+        let edit_msg = if !web_token_map.is_empty() {
+            format::mentionify(&format!(
+                "🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar}",
+            ))
+        } else {
             format::mentionify(&format!(
                 "🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar}\n\
                  📍 Where is this? Type: **!guess** city, country, or lat,lon",
-            ))
-        } else if guess_num == 1 {
-            let plain = format!("🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar} | 💬 Open DM");
-            let html  = format!(
-                "🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar} | \
-                 💬 <a href=\"https://matrix.to/#/{bot_mxid}\">Open DM</a>"
-            );
-            RoomMessageEventContent::text_html(plain, html)
-        } else {
-            format::mentionify(&format!(
-                "🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar}",
             ))
         };
         if let Some(r) = client.get_room(&ctx.room_id) {
@@ -608,18 +573,12 @@ async fn play_free_guess(
         }
     }
 
-    // If everyone answered before the timer ran out, update the message and ping DMs.
     if all_in {
         let final_msg = format!("🌍 Guess {guess_num}/{n_total} | ⚡ All guesses in!");
         if let Some(r) = client.get_room(&ctx.room_id) {
             let edit = RoomMessageEventContent::text_plain(&final_msg)
                 .make_replacement(ReplacementMetadata::new(q_event_id.clone(), None));
             r.send(edit).await.ok();
-        }
-        for dm_room_id in dm_participants.values() {
-            if let Some(dm_room) = client.get_room(dm_room_id) {
-                dm_room.send(format::mentionify("⚡ All guesses in! Calculating results…")).await.ok();
-            }
         }
     }
 
@@ -631,6 +590,13 @@ async fn play_free_guess(
             _ => HashMap::new(),
         }
     };
+
+    // Clear web tokens for this guess so the links expire immediately.
+    if !web_token_map.is_empty() {
+        let mut store = ctx.web_tokens.lock().await;
+        store.tokens.retain(|_, t| !(t.round_id == round_id && t.guess_num == guess_num));
+        store.sessions.remove(&(round_id, guess_num));
+    }
 
     // Score.
     let half_life = ctx.config.schedule.score_half_life_km;
@@ -677,7 +643,7 @@ async fn play_free_guess(
     post_reveal_free_guess(
         ctx, client, img,
         actual_lat, actual_lon,
-        &scored, &names, &raw_avatars, &avatar_mxcs, dm_participants,
+        &scored, &names, &raw_avatars, &avatar_mxcs,
     )
     .await;
 
@@ -685,16 +651,15 @@ async fn play_free_guess(
 }
 
 async fn post_reveal_free_guess(
-    ctx:             &BotContext,
-    client:          &Client,
-    img:             &GeoImage,
-    actual_lat:      f64,
-    actual_lon:      f64,
-    scored:          &[(String, FreeGuess, f64, i64)],
-    names:           &HashMap<String, String>,
-    raw_avatars:     &HashMap<String, Vec<u8>>,
-    avatar_mxcs:     &HashMap<String, String>,
-    dm_participants: &HashMap<OwnedUserId, OwnedRoomId>,
+    ctx:         &BotContext,
+    client:      &Client,
+    img:         &GeoImage,
+    actual_lat:  f64,
+    actual_lon:  f64,
+    scored:      &[(String, FreeGuess, f64, i64)],
+    names:       &HashMap<String, String>,
+    raw_avatars: &HashMap<String, Vec<u8>>,
+    avatar_mxcs: &HashMap<String, String>,
 ) {
     let location_str = match &img.city {
         Some(city) => format!("{}, {}", city, img.country),
@@ -894,107 +859,20 @@ async fn post_reveal_free_guess(
         }
     }
 
-    // ── Per-user DM feedback ──────────────────────────────────────────────────
-    for (rank_0, (uid, guess, dist, score)) in scored.iter().enumerate() {
-        let rank  = rank_0 + 1;
-        let medal = match rank { 1 => "🥇", 2 => "🥈", 3 => "🥉", _ => "  " };
-        let dist_str = format_dist(*dist);
-
-        // Find their DM room (if they are a DM participant).
-        let dm_room_id = match uid.parse::<OwnedUserId>() {
-            Ok(owned_uid) => dm_participants.get(&owned_uid).cloned(),
-            Err(_)        => None,
-        };
-
-        let lang = ctx.state.lock().await
-            .user_langs.get(uid.as_str()).cloned()
-            .unwrap_or_else(|| "en".to_owned());
-
-        // Geocode the player's guess in their language + build an interactive map link.
-        let (pr, pg, pb, _) = crate::mapimage::PLAYER_COLORS[rank_0 % crate::mapimage::PLAYER_COLORS.len()];
-        let mxc = avatar_mxcs.get(uid.as_str()).map(|s| s.as_str()).unwrap_or("");
-        let guess_map_url = build_guess_map_url(display_name(names, uid), guess.lat, guess.lon, actual_lat, actual_lon, pr, pg, pb, &lang, mxc, *score, *dist);
-        let guess_label = crate::geocode::reverse_geocode(guess.lat, guess.lon, &lang)
-            .await
-            .unwrap_or_else(|| format!("{:.2}, {:.2}", guess.lat, guess.lon));
-
-        // Geocode the actual location in their language.
-        let actual_label = crate::geocode::reverse_geocode(actual_lat, actual_lon, &lang)
-            .await
-            .unwrap_or_else(|| "Map".to_owned());
-
-        let fb_text = format!(
-            "{medal} Rank #{rank} of {}\n\
-             [{guess_label}]({guess_map_url}) · {dist_str} · {score} pts\n\
-             📍 Actual: [{actual_label}]({})",
-            scored.len(),
-            maps_url,
-        );
-
-        if let Some(dm_room_id) = dm_room_id {
-            if let Some(dm_room) = client.get_room(&dm_room_id) {
-                dm_room.send(format::mentionify(&fb_text)).await.ok();
-
-                // Map image: avatar pin = guess, dark dot = actual, coloured line.
-                let player_raw = raw_avatars.get(uid.as_str()).cloned();
-                let (g_lat, g_lon, dist_val) = (guess.lat, guess.lon, *dist);
-                if let Ok(Some(png)) = tokio::task::spawn_blocking(move || {
-                    let pin = crate::avatar::render_avatar_pin(player_raw.as_deref(), pr, pg, pb);
-                    crate::mapimage::render_guess_map(g_lat, g_lon, actual_lat, actual_lon, dist_val, pin, pr, pg, pb)
-                })
-                .await
-                {
-                    let map_mime: mime::Mime = "image/png".parse().unwrap();
-                    let (w, h) = image_dimensions(&png);
-                    let size = png.len();
-                    if let Ok(resp) = client.media().upload(&map_mime, png, None).await {
-                        let label = format!("📍 {} away", format_dist(dist_val));
-                        dm_room
-                            .send(image_content_with_info(label, resp.content_uri, &map_mime, w, h, size))
-                            .await
-                            .ok();
-                    }
-                }
-            }
-        }
-    }
-
-    // Also DM players who did NOT submit a guess.
-    for (uid, dm_room_id) in dm_participants {
-        let already_got_fb = scored.iter().any(|(u, _, _, _)| {
-            u.parse::<OwnedUserId>().ok().as_ref() == Some(uid)
-        });
-        if !already_got_fb {
-            if let Some(dm_room) = client.get_room(dm_room_id) {
-                let lang = ctx.state.lock().await
-                    .user_langs.get(uid.as_str()).cloned()
-                    .unwrap_or_else(|| "en".to_owned());
-                let actual_label = crate::geocode::reverse_geocode(actual_lat, actual_lon, &lang)
-                    .await
-                    .unwrap_or_else(|| "Map".to_owned());
-                dm_room.send(format::mentionify(&format!(
-                    "⏰ Time's up! No guess submitted.\n\
-                     📍 Actual: [{actual_label}]({})",
-                    maps_url,
-                )))
-                .await
-                .ok();
-            }
-        }
-    }
 }
 
 async fn post_round_summary_free_guess(
-    ctx:             &BotContext,
-    client:          &Client,
-    _room:           &Room,
-    round_id:        i64,
-    scores:          &HashMap<String, i64>,
-    dm_participants: &HashMap<OwnedUserId, OwnedRoomId>,
+    ctx:      &BotContext,
+    client:   &Client,
+    _room:    &Room,
+    round_id: i64,
+    scores:   &HashMap<String, i64>,
 ) {
     if scores.is_empty() {
         if let Some(r) = client.get_room(&ctx.room_id) {
-            r.send(format::mentionify("🌍 Round over · nobody played.")).await.ok();
+            if let Ok(ev) = r.send(format::mentionify("🌍 Round over · nobody played.")).await {
+                set_pinned(&r, &ev.response.event_id).await;
+            }
         }
         return;
     }
@@ -1048,11 +926,8 @@ async fn post_round_summary_free_guess(
     let round_text = lines.join("\n");
 
     if let Some(r) = client.get_room(&ctx.room_id) {
-        r.send(format::mentionify(&round_text)).await.ok();
-    }
-    for dm_room_id in dm_participants.values() {
-        if let Some(dm_room) = client.get_room(dm_room_id) {
-            dm_room.send(format::mentionify(&round_text)).await.ok();
+        if let Ok(ev) = r.send(format::mentionify(&round_text)).await {
+            set_pinned(&r, &ev.response.event_id).await;
         }
     }
 
@@ -1150,61 +1025,6 @@ pub fn format_dist(dist_km: f64) -> String {
         format!("{:.0} m", dist_km * 1000.0)
     } else {
         format!("{:.0} km", dist_km)
-    }
-}
-
-// ── DM helpers ────────────────────────────────────────────────────────────────
-
-/// Return an existing DM room with `user_id`, or create a new one.
-pub async fn get_or_create_dm(
-    client:  &Client,
-    user_id: &OwnedUserId,
-) -> anyhow::Result<OwnedRoomId> {
-    if let Some(room) = client.get_dm_room(user_id) {
-        return Ok(room.room_id().to_owned());
-    }
-    let room = client.create_dm(user_id).await
-        .with_context(|| format!("create_dm with {user_id}"))?;
-    Ok(room.room_id().to_owned())
-}
-
-/// Called immediately when a user reacts to the join-phase message.
-///
-/// Opens (or reuses) a 1-to-1 DM room and sends a confirmation that the game
-/// is starting soon. The room is registered in `ctx.dm_rooms` straight away so
-/// any message the user sends during the wait window is already routable.
-pub async fn open_join_dm(
-    ctx:           &BotContext,
-    client:        &Client,
-    user_id:       &OwnedUserId,
-    reminder_secs: u64,
-) {
-    match get_or_create_dm(client, user_id).await {
-        Ok(dm_room_id) => {
-            let is_existing = ctx.dm_rooms.lock().await.contains_key(&dm_room_id);
-
-            // Register right away — DM messages during the wait window are routed here.
-            ctx.dm_rooms.lock().await.insert(dm_room_id.clone(), user_id.clone());
-
-            if let Some(dm_room) = client.get_room(&dm_room_id) {
-                let eta = if reminder_secs > 0 {
-                    format!("in ~{}", format_duration(reminder_secs))
-                } else {
-                    "very soon".to_owned()
-                };
-
-                let msg = if is_existing {
-                    format!("🌍 Game starts {eta} · photo coming here.")
-                } else {
-                    format!(
-                        "🌍 You're in! Game starts {eta}.\n\
-                         I'll send the photo here · type city, country, address, or lat,lon."
-                    )
-                };
-                dm_room.send(format::mentionify(&msg)).await.ok();
-            }
-        }
-        Err(e) => warn!("Could not open DM with {user_id} on join reaction: {e}"),
     }
 }
 
@@ -1558,6 +1378,15 @@ fn url_encode_component(s: &str) -> String {
     out
 }
 
+/// Replace the room's pinned-messages list with just `event_id`.
+/// Sending a single-element list atomically unpins all prior messages.
+async fn set_pinned(room: &Room, event_id: &OwnedEventId) {
+    let content = RoomPinnedEventsEventContent::new(vec![event_id.clone()]);
+    if let Err(e) = room.send_state_event(content).await {
+        warn!("Failed to pin message {event_id}: {e}");
+    }
+}
+
 fn display_name<'a>(names: &'a HashMap<String, String>, uid: &'a str) -> &'a str {
     names.get(uid).map(|s| s.as_str()).unwrap_or_else(|| {
         uid.split(':').next().unwrap_or("").trim_start_matches('@')
@@ -1725,69 +1554,7 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
 /// Called on startup when a join phase was in progress at shutdown time.
 /// Waits until the game-start instant, re-reads reactions to rebuild the
 /// participant list, then runs the game exactly as `start_round` would.
-// ── Restart recovery — active round ──────────────────────────────────────────
-
-/// Fetch messages backward from a DM room and find the player's answer
-/// sent between the bot's prompt message and the bot's ack message.
-/// Returns `None` if the answer was already acked or not yet submitted.
-async fn recover_dm_answer(
-    client:          &Client,
-    dm_room_id:      &OwnedRoomId,
-    player_id:       &OwnedUserId,
-    prompt_event_id: &str,
-) -> Option<String> {
-    use matrix_sdk::{
-        room::MessagesOptions,
-        ruma::{
-            events::{AnySyncMessageLikeEvent, AnySyncTimelineEvent, room::message::MessageType},
-            uint,
-        },
-    };
-
-    let room = client.get_room(dm_room_id)?;
-
-    // Fetch recent messages backward (newest first), enough to cover one guess window.
-    let mut options = MessagesOptions::backward();
-    options.limit   = uint!(100);
-    let batch       = room.messages(options).await.ok()?;
-
-    let mut player_answer: Option<String> = None;
-    let mut found_ack    = false;
-    let mut found_prompt = false;
-
-    for timeline_event in &batch.chunk {
-        let Ok(AnySyncTimelineEvent::MessageLike(ml)) = timeline_event.raw().deserialize() else { continue };
-
-        // Stop once we hit the prompt — everything before is from prior guesses.
-        if ml.event_id() == prompt_event_id {
-            found_prompt = true;
-            break;
-        }
-
-        let AnySyncMessageLikeEvent::RoomMessage(msg) = ml else { continue };
-        let Some(orig) = msg.as_original() else { continue };
-        let MessageType::Text(ref text) = orig.content.msgtype else { continue };
-        let body = text.body.trim();
-
-        if orig.sender == *player_id {
-            if player_answer.is_none() {
-                player_answer = Some(body.to_owned());
-            }
-        } else if body.starts_with("✅ Guess recorded") {
-            found_ack = true;
-            break;
-        }
-    }
-
-    if found_ack || !found_prompt {
-        None
-    } else {
-        player_answer
-    }
-}
-
 /// Resume a round that was interrupted by a restart.
-/// Recovers the current guess from DM history, then continues normally.
 pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoundState) {
     info!(
         "Resuming active round {} (guess {}/{})",
@@ -1802,27 +1569,12 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
         }
     };
 
-    // Restore DM routing so new answers arriving after restart are handled.
-    for (uid_str, participant) in &ar.dm_participants {
-        if let (Ok(uid), Ok(dm_room_id)) = (
-            uid_str.parse::<OwnedUserId>(),
-            participant.dm_room_id.parse::<OwnedRoomId>(),
-        ) {
-            ctx.dm_rooms.lock().await.insert(dm_room_id, uid);
-        }
-    }
-
-    // Rebuild the dm_participants map (OwnedUserId → OwnedRoomId).
-    let dm_participants: HashMap<OwnedUserId, OwnedRoomId> = ar.dm_participants
-        .iter()
-        .filter_map(|(uid_str, p)| {
-            let uid       = uid_str.parse::<OwnedUserId>().ok()?;
-            let dm_room_id = p.dm_room_id.parse::<OwnedRoomId>().ok()?;
-            Some((uid, dm_room_id))
-        })
+    // Rebuild sorted participant list from persisted state.
+    let mut participants: Vec<OwnedUserId> = ar.dm_participants
+        .keys()
+        .filter_map(|s| s.parse::<OwnedUserId>().ok())
         .collect();
-
-    // ── Recover the current guess ─────────────────────────────────────────────
+    participants.sort();
 
     let (actual_lat, actual_lon) = match (ar.current_image.lat, ar.current_image.lon) {
         (Some(lat), Some(lon)) => (lat, lon),
@@ -1832,73 +1584,27 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
             .unwrap_or((0.0, 0.0)),
     };
 
-    // Recover already-submitted answers from DM history.
-    let mut recovered: HashMap<String, FreeGuess> = HashMap::new();
-    for (uid_str, participant) in &ar.dm_participants {
-        if participant.answer_acked { continue; }
-        let Some(ref prompt_id) = participant.prompt_event_id else { continue };
-        let Ok(uid)       = uid_str.parse::<OwnedUserId>() else { continue };
-        let Ok(dm_room_id) = participant.dm_room_id.parse::<OwnedRoomId>() else { continue };
-
-        if let Some(answer_text) = recover_dm_answer(&client, &dm_room_id, &uid, prompt_id).await {
-            info!("Recovered answer from {uid_str}: \"{answer_text}\"");
-            if let Some((lat, lon)) = geocode(&answer_text).await {
-                // Send the ack and mark as acked in state.
-                if let Some(dm_room) = client.get_room(&dm_room_id) {
-                    dm_room.send(format::mentionify(&format!(
-                        "✅ Guess recorded: \"{answer_text}\"\nWaiting for the others or the timer…"
-                    ))).await.ok();
-                }
-                {
-                    let mut st = ctx.state.lock().await;
-                    if let Some(ref mut active) = st.active_round {
-                        if let Some(p) = active.dm_participants.get_mut(uid_str) {
-                            p.answer_acked = true;
-                        }
-                    }
-                    st.save(&ctx.state_path).await.ok();
-                }
-                recovered.insert(uid_str.clone(), FreeGuess {
-                    text:         answer_text,
-                    lat,
-                    lon,
-                    submitted_at: chrono::Utc::now(),
-                });
-            }
-        }
-    }
-
-    // Seed the in-memory active game with recovered answers.
+    // Seed the in-memory active game (no DM history to recover from).
     {
         let mut ag = ctx.active_game.lock().await;
-        let guess_event_id = {
-            // Use a placeholder event ID — the actual one is already in the DB.
-            OwnedEventId::try_from("$placeholder:recovery").unwrap_or_else(|_| {
-                OwnedEventId::try_from(format!("$recovery_{}:{}", ar.round_id, ar.guess_num)).unwrap()
-            })
-        };
+        let guess_event_id = OwnedEventId::try_from("$placeholder:recovery").unwrap_or_else(|_| {
+            OwnedEventId::try_from(format!("$recovery_{}:{}", ar.round_id, ar.guess_num)).unwrap()
+        });
         *ag = Some(ActiveGame {
             event_id: guess_event_id,
             mode: ActiveGameMode::FreeGuess {
-                guesses: recovered,
+                guesses: HashMap::new(),
                 actual_lat,
                 actual_lon,
             },
         });
     }
 
-    // Post a restart notice to the main room.
     room.send(format::mentionify(&format!(
         "⚠️ Bot restarted mid-round — resuming guess {}/{} ({})",
         ar.guess_num, ar.total_guesses,
         format_duration(ar.answer_timeout_secs),
     ))).await.ok();
-    for (_, dm_room_id) in &dm_participants {
-        if let Some(dm_room) = client.get_room(dm_room_id) {
-            dm_room.send(format::mentionify("⚠️ Bot restarted — your guess window is still open."))
-                .await.ok();
-        }
-    }
 
     // Compute remaining timeout.
     let elapsed_secs = chrono::Utc::now()
@@ -1916,10 +1622,10 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
             tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
             remaining -= sleep_secs;
 
-            if !dm_participants.is_empty() {
+            if !participants.is_empty() {
                 let ag = ctx.active_game.lock().await;
                 if let Some(ActiveGame { mode: ActiveGameMode::FreeGuess { ref guesses, .. }, .. }) = *ag {
-                    if dm_participants.keys().all(|uid| guesses.contains_key(uid.as_str())) {
+                    if participants.iter().all(|uid| guesses.contains_key(uid.as_str())) {
                         break;
                     }
                 }
@@ -1981,7 +1687,7 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
     post_reveal_free_guess(
         &ctx, &client, &ar.current_image,
         actual_lat, actual_lon,
-        &scored, &names, &raw_avatars, &avatar_mxcs, &dm_participants,
+        &scored, &names, &raw_avatars, &avatar_mxcs,
     ).await;
 
     // ── Continue with remaining guesses ───────────────────────────────────────
@@ -1990,12 +1696,11 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
     while let Some(img) = image_queue.pop_front() {
         let guess_num = ar.guess_num + (ar.remaining_images.len() - image_queue.len()) as u32;
 
-        // Update active_round state.
         {
             let mut st = ctx.state.lock().await;
-            let dm_state = dm_participants.iter().map(|(uid, dm_room_id)| {
+            let dm_state = participants.iter().map(|uid| {
                 (uid.to_string(), ActiveDmParticipant {
-                    dm_room_id:      dm_room_id.to_string(),
+                    dm_room_id:      String::new(),
                     prompt_event_id: None,
                     answer_acked:    false,
                 })
@@ -2021,7 +1726,7 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
         if let Err(e) = play_free_guess(
             &ctx, &client, &room,
             ar.round_id, guess_num, ar.total_guesses,
-            &img, &mut round_scores_free, &dm_participants,
+            &img, &mut round_scores_free, &participants,
             ar.answer_timeout_secs,
         ).await {
             error!("resume_active_round: play_free_guess error: {e}");
@@ -2032,18 +1737,12 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
     ctx.db.finish_round(ar.round_id).await.ok();
     ctx.db.upsert_round_scores_free_guess(ar.round_id, &round_scores_free).await.ok();
 
-    post_round_summary_free_guess(&ctx, &client, &room, ar.round_id, &round_scores_free, &dm_participants).await;
+    post_round_summary_free_guess(&ctx, &client, &room, ar.round_id, &round_scores_free).await;
 
-    // Clear state.
     {
         let mut st = ctx.state.lock().await;
         st.active_round = None;
         st.save(&ctx.state_path).await.ok();
-    }
-    {
-        let dm_room_ids: Vec<OwnedRoomId> = dm_participants.values().cloned().collect();
-        let mut dm_rooms = ctx.dm_rooms.lock().await;
-        for id in &dm_room_ids { dm_rooms.remove(id); }
     }
     *ctx.round_abort.lock().await = None;
 }
@@ -2123,27 +1822,17 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         return;
     }
 
-    // Open (or reuse) DMs with each participant.
-    let mut dm_map: HashMap<OwnedUserId, OwnedRoomId> = HashMap::new();
-    for uid in &participants {
-        match get_or_create_dm(&client, uid).await {
-            Ok(dm_room_id) => {
-                ctx.dm_rooms.lock().await.insert(dm_room_id.clone(), uid.clone());
-                dm_map.insert(uid.clone(), dm_room_id);
-            }
-            Err(e) => warn!("resume_pending_join: could not open DM with {uid}: {e}"),
-        }
-    }
+    let mut sorted_participants: Vec<OwnedUserId> = participants.into_iter().collect();
+    sorted_participants.sort();
 
-    let participant_list: Vec<String> = dm_map.keys()
-        .map(|u| u.to_string())
-        .collect();
-    let participant_ids: Vec<OwnedUserId> = dm_map.keys().cloned().collect();
+    let participant_list: Vec<String> = sorted_participants.iter().map(|u| u.to_string()).collect();
+    let participant_ids: Vec<OwnedUserId> = sorted_participants.clone();
+    let n_players = sorted_participants.len();
     room.send(
         format::mentionify(&format!(
             "🌍 GeoGuessr starting now! {} player{}: {}",
-            dm_map.len(),
-            if dm_map.len() == 1 { "" } else { "s" },
+            n_players,
+            if n_players == 1 { "" } else { "s" },
             participant_list.join(", "),
         ))
         .add_mentions(Mentions::with_user_ids(participant_ids)),
@@ -2204,9 +1893,9 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         // during the play phase can resume via resume_active_round.
         {
             let mut st = ctx.state.lock().await;
-            let dm_state = dm_map.iter().map(|(uid, dm_room_id)| {
+            let dm_state = sorted_participants.iter().map(|uid| {
                 (uid.to_string(), ActiveDmParticipant {
-                    dm_room_id:      dm_room_id.to_string(),
+                    dm_room_id:      String::new(),
                     prompt_event_id: None,
                     answer_acked:    false,
                 })
@@ -2235,7 +1924,7 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         if let Err(e) = play_free_guess(
             &ctx, &client, &room,
             round_id, guess_num, total as u32,
-            &img, &mut round_scores_free, &dm_map,
+            &img, &mut round_scores_free, &sorted_participants,
             pj.answer_timeout_secs,
         ).await {
             error!("resume_pending_join: play_free_guess error: {e}");
@@ -2258,15 +1947,7 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         st.save(&ctx.state_path).await.ok();
     }
 
-    post_round_summary_free_guess(&ctx, &client, &room, round_id, &round_scores_free, &dm_map).await;
+    post_round_summary_free_guess(&ctx, &client, &room, round_id, &round_scores_free).await;
 
-    // Clear DM mappings.
-    {
-        let dm_room_ids: Vec<OwnedRoomId> = dm_map.values().cloned().collect();
-        let mut dm_rooms = ctx.dm_rooms.lock().await;
-        for id in &dm_room_ids {
-            dm_rooms.remove(id);
-        }
-    }
     *ctx.round_abort.lock().await = None;
 }

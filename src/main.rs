@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, path::PathBuf, sync::{Arc, atomic::AtomicU32}};
+use std::{collections::HashSet, path::PathBuf, sync::{Arc, atomic::AtomicU32}};
 
 use anyhow::{Context, Result};
 use matrix_sdk::{
@@ -35,9 +35,10 @@ mod mapimage;
 mod scheduler;
 mod sources;
 mod state;
+mod web;
 
 use config::Config;
-use game::{ActiveGame, ActiveGameMode};
+use game::ActiveGame;
 use state::State;
 
 // ── Join-phase state ──────────────────────────────────────────────────────────
@@ -76,8 +77,6 @@ pub struct BotContext {
     pub db:          Arc<db::Db>,
     /// Tracks participants who have opted in to the upcoming round.
     pub join_state:  Arc<Mutex<JoinState>>,
-    /// Maps DM room IDs to the user_id of the participant (for routing DM answers).
-    pub dm_rooms:    Arc<Mutex<HashMap<OwnedRoomId, OwnedUserId>>>,
     /// Abort handle for the currently running round task (join phase or active game).
     /// Set when a round is spawned; cleared when it finishes.
     pub round_abort: Arc<Mutex<Option<tokio::task::AbortHandle>>>,
@@ -88,6 +87,12 @@ pub struct BotContext {
     /// across prefetch sessions.  Stores (sharpness, overlay_penalty).
     /// Evicts oldest 20 % of entries at 1000-entry capacity.
     pub blur_cache: Arc<std::sync::Mutex<crate::sources::mapillary::BlurCache>>,
+    /// In-memory per-player guess tokens; populated by play_free_guess, cleared
+    /// at round end.  Always present; empty when web serving is disabled.
+    pub web_tokens:     web::SharedTokenStore,
+    /// Public base URL of the web server (e.g. "https://geo.example.com").
+    /// None when [web] is absent from config.
+    pub web_public_url: Option<Arc<String>>,
 }
 
 impl BotContext {
@@ -184,6 +189,9 @@ async fn main() -> Result<()> {
         ..Default::default()
     }));
 
+    let web_tokens     = web::new_token_store();
+    let web_public_url = config.web.as_ref().map(|w| Arc::new(w.public_url.clone()));
+
     let ctx = BotContext {
         state,
         state_path,
@@ -194,11 +202,30 @@ async fn main() -> Result<()> {
         client:      client.clone(),
         db,
         join_state,
-        dm_rooms:        Arc::new(Mutex::new(HashMap::new())),
         round_abort:     Arc::new(Mutex::new(None)),
         prefetch_streak: Arc::new(AtomicU32::new(0)),
         blur_cache:      Arc::new(std::sync::Mutex::new(crate::sources::mapillary::BlurCache::new(1000))),
+        web_tokens:     Arc::clone(&web_tokens),
+        web_public_url: web_public_url.clone(),
     };
+
+    // Spawn the web server if [web] is configured.
+    if let Some(ref web_cfg) = config.web {
+        let web_state = web::WebState {
+            store:       Arc::clone(&web_tokens),
+            active_game: Arc::clone(&ctx.active_game),
+            client:      client.clone(),
+            room_id:     room_id.clone(),
+            max_guesses: config.schedule.max_guesses_per_player,
+            public_url:  web_cfg.public_url.clone(),
+        };
+        let bind_addr = web_cfg.bind_addr.clone();
+        tokio::spawn(async move {
+            if let Err(e) = web::run(bind_addr, web_state).await {
+                error!("Web server error: {e}");
+            }
+        });
+    }
 
     // ── Invite handler ────────────────────────────────────────────────────────
     client.add_event_handler({
@@ -323,103 +350,11 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ── DM answer handler (free-guess answers sent in private chat) ───────────
-    client.add_event_handler({
-        let ctx         = ctx.clone();
-        let bot_user_id = bot_user_id.clone();
-        move |ev: OriginalSyncRoomMessageEvent, room: Room, client: Client| {
-            let ctx         = ctx.clone();
-            let bot_user_id = bot_user_id.clone();
-            async move {
-                if ev.sender == bot_user_id          { return; }
-                if room.state() != RoomState::Joined { return; }
-                // Only handle rooms that are NOT the main game room.
-                if room.room_id() == ctx.room_id     { return; }
-
-                // Is this one of our game DM rooms?
-                let user_id = {
-                    let dm_rooms = ctx.dm_rooms.lock().await;
-                    dm_rooms.get(room.room_id()).cloned()
-                };
-                let Some(user_id) = user_id else { return; };
-
-                let MessageType::Text(ref text) = ev.content.msgtype else { return; };
-                // Skip command-looking messages (e.g. !help, !scores).
-                let body = text.body.trim();
-                if body.starts_with('!') { return; }
-                if body.is_empty()       { return; }
-
-                let query = body.to_owned();
-                let dm_room_id = room.room_id().to_owned();
-
-                // There must be an active free-guess game.
-                let is_free_guess = {
-                    let ag = ctx.active_game.lock().await;
-                    matches!(
-                        ag.as_ref().map(|g| &g.mode),
-                        Some(ActiveGameMode::FreeGuess { .. })
-                    )
-                };
-                if !is_free_guess { return; }
-
-                tokio::spawn(async move {
-                    let max_g = ctx.config.schedule.max_guesses_per_player;
-                    match game::geocode(&query).await {
-                        Some((lat, lon)) => {
-                            let accepted = {
-                                let mut ag = ctx.active_game.lock().await;
-                                ag.as_mut().map_or(false, |g| {
-                                    g.record_free_guess(
-                                        user_id.as_str().to_owned(),
-                                        game::FreeGuess {
-                                            text:         query.clone(),
-                                            lat,
-                                            lon,
-                                            submitted_at: chrono::Utc::now(),
-                                        },
-                                        max_g,
-                                    )
-                                })
-                            };
-                            if let Some(r) = client.get_room(&dm_room_id) {
-                                let msg = if accepted {
-                                    format!("✅ Guess recorded: \"{query}\"\nWaiting for the others or the timer…")
-                                } else {
-                                    "❌ You already submitted a guess for this round.".to_owned()
-                                };
-                                r.send(format::mentionify(&msg)).await.ok();
-                            }
-                            // Mark as acked only when the guess was accepted.
-                            if accepted {
-                                let mut st = ctx.state.lock().await;
-                                if let Some(ref mut ar) = st.active_round {
-                                    if let Some(p) = ar.dm_participants.get_mut(user_id.as_str()) {
-                                        p.answer_acked = true;
-                                    }
-                                }
-                                st.save(&ctx.state_path).await.ok();
-                            }
-                        }
-                        None => {
-                            if let Some(r) = client.get_room(&dm_room_id) {
-                                r.send(format::mentionify(&format!(
-                                    "❓ Could not geocode \"{query}\" — try a full address, city name, or lat,lon"
-                                )))
-                                .await
-                                .ok();
-                            }
-                        }
-                    }
-                });
-            }
-        }
-    });
-
     // ── Reaction handler — game answers + join opt-in ─────────────────────────
     client.add_event_handler({
         let ctx         = ctx.clone();
         let bot_user_id = bot_user_id.clone();
-        move |ev: OriginalSyncReactionEvent, room: Room, client: Client| {
+        move |ev: OriginalSyncReactionEvent, room: Room, _client: Client| {
             let ctx         = ctx.clone();
             let bot_user_id = bot_user_id.clone();
             async move {
@@ -447,26 +382,9 @@ async fn main() -> Result<()> {
                             st.save(&ctx.state_path).await.ok();
                         }
                         // Flag = join: add to participants and open DM.
-                        let is_new = {
+                        {
                             let mut js = ctx.join_state.lock().await;
-                            js.participants.insert(ev.sender.clone())
-                        };
-                        if is_new {
-                            let reminder_secs = {
-                                let st = ctx.state.lock().await;
-                                if let Some(ref pj) = st.pending_join {
-                                    (pj.game_at_utc - chrono::Utc::now())
-                                        .num_seconds().max(0) as u64
-                                } else {
-                                    ctx.config.schedule.reminder_before_secs
-                                }
-                            };
-                            let sender  = ev.sender.clone();
-                            let ctx2    = ctx.clone();
-                            let client2 = client.clone();
-                            tokio::spawn(async move {
-                                game::open_join_dm(&ctx2, &client2, &sender, reminder_secs).await;
-                            });
+                            js.participants.insert(ev.sender.clone());
                         }
                         return;
                     }
