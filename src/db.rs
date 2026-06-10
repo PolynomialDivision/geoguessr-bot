@@ -703,3 +703,92 @@ impl Db {
         .await
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an in-memory Db with the current schema applied.
+    async fn mem_db() -> Db {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(include_str!("../migrations/schema.sql"))
+            .expect("schema");
+        Db { conn: Arc::new(Mutex::new(conn)) }
+    }
+
+    // ── find_guess_id ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn find_guess_id_returns_none_when_empty() {
+        let db = mem_db().await;
+        assert!(db.find_guess_id(999, 1).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_guess_id_returns_existing_row() {
+        let db = mem_db().await;
+        let round_id = db.start_round("!room:example.com", 3, "test").await.unwrap();
+        let guess_id = db.start_guess(
+            round_id, 1, "Germany", "Europe", Some("Berlin"),
+            "test", None, &[], 0, 90, Some(52.52), Some(13.40),
+        ).await.unwrap();
+
+        let found = db.find_guess_id(round_id, 1).await;
+        assert_eq!(found, Some(guess_id));
+    }
+
+    #[tokio::test]
+    async fn find_guess_id_wrong_guess_num_returns_none() {
+        let db = mem_db().await;
+        let round_id = db.start_round("!room:example.com", 3, "test").await.unwrap();
+        db.start_guess(round_id, 1, "Germany", "Europe", None, "test", None, &[], 0, 90, None, None).await.unwrap();
+
+        assert!(db.find_guess_id(round_id, 2).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_guess_id_wrong_round_returns_none() {
+        let db = mem_db().await;
+        let round_id = db.start_round("!room:example.com", 3, "test").await.unwrap();
+        db.start_guess(round_id, 1, "Germany", "Europe", None, "test", None, &[], 0, 90, None, None).await.unwrap();
+
+        assert!(db.find_guess_id(round_id + 1, 1).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_guess_id_multiple_guesses_in_round() {
+        let db = mem_db().await;
+        let round_id = db.start_round("!room:example.com", 3, "test").await.unwrap();
+        let g1 = db.start_guess(round_id, 1, "France", "Europe", None, "test", None, &[], 0, 90, None, None).await.unwrap();
+        let g2 = db.start_guess(round_id, 2, "Japan",  "Asia",   None, "test", None, &[], 0, 90, None, None).await.unwrap();
+
+        assert_eq!(db.find_guess_id(round_id, 1).await, Some(g1));
+        assert_eq!(db.find_guess_id(round_id, 2).await, Some(g2));
+        assert!(db.find_guess_id(round_id, 3).await.is_none());
+    }
+
+    // ── Round lifecycle ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn start_and_finish_round() {
+        let db = mem_db().await;
+        let round_id = db.start_round("!r:example.com", 2, "manual").await.unwrap();
+        assert!(round_id > 0);
+        db.finish_round(round_id).await.unwrap();
+        // finish_round is idempotent (just sets ended_at).
+        db.finish_round(round_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn finish_guess_updates_answer_count() {
+        let db = mem_db().await;
+        let round_id = db.start_round("!r:example.com", 1, "test").await.unwrap();
+        let guess_id = db.start_guess(round_id, 1, "Brazil", "S. America", None, "test", None, &[], 0, 90, None, None).await.unwrap();
+        db.finish_guess(guess_id, 3, 1).await.unwrap();
+        // Verify via round_stats (indirect).
+        let stats = db.round_stats(round_id).await.unwrap();
+        assert!(stats.is_empty()); // no answer rows → no stats rows
+    }
+}

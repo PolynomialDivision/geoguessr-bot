@@ -2245,11 +2245,16 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
     ctx.db.finish_round(round_id).await.ok();
     ctx.db.upsert_round_scores_free_guess(round_id, &round_scores_free).await.ok();
 
-    if let Some(slot) = &pj.slot {
-        let tz: Tz = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
-        let today  = chrono::Utc::now().with_timezone(&tz).date_naive();
+    // Clear active_round (round is complete) and record last-game date in
+    // one atomic save so no intermediate state can trigger a spurious resume.
+    {
         let mut st = ctx.state.lock().await;
-        st.last_game_dates.insert(slot.clone(), today);
+        st.active_round = None;
+        if let Some(slot) = &pj.slot {
+            let tz: Tz = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
+            let today  = chrono::Utc::now().with_timezone(&tz).date_naive();
+            st.last_game_dates.insert(slot.clone(), today);
+        }
         st.save(&ctx.state_path).await.ok();
     }
 

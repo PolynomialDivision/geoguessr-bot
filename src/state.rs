@@ -333,4 +333,67 @@ mod tests {
         assert!(remaining > 50 && remaining <= 60,
             "expected ~60s remaining, got {remaining}");
     }
+
+    // ── Active-round lifecycle ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn clearing_active_round_persists() {
+        // Regression: resume_pending_join must clear active_round when the
+        // round finishes normally, otherwise the next startup would try to
+        // resume a completed round.
+        let dir  = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let mut state = State::default();
+        state.active_round = Some(sample_active_round());
+        state.save(&path).await.unwrap();
+
+        // Simulate end-of-round clear.
+        state.active_round = None;
+        state.save(&path).await.unwrap();
+
+        let loaded = State::load(&path).await.unwrap();
+        assert!(loaded.active_round.is_none(),
+            "active_round should be None after round completes");
+    }
+
+    #[tokio::test]
+    async fn active_round_clear_and_last_game_date_in_one_save() {
+        // Clearing active_round and recording last_game_dates must happen in
+        // the same save; otherwise a crash between the two would leave a
+        // stale active_round that triggers spurious resume.
+        let dir  = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let mut state = State::default();
+        state.active_round = Some(sample_active_round());
+        state.save(&path).await.unwrap();
+
+        // Atomic update: clear round AND record date in one operation.
+        state.active_round = None;
+        state.last_game_dates.insert(
+            "12:00".to_owned(),
+            chrono::NaiveDate::from_ymd_opt(2024, 6, 10).unwrap(),
+        );
+        state.save(&path).await.unwrap();
+
+        let loaded = State::load(&path).await.unwrap();
+        assert!(loaded.active_round.is_none());
+        assert!(loaded.last_game_dates.contains_key("12:00"));
+    }
+
+    #[test]
+    fn answer_acked_prevents_double_recovery() {
+        // When answer_acked = true the resume logic skips re-processing.
+        // Verify the flag is preserved through serialization.
+        let mut ar = sample_active_round();
+        ar.dm_participants.get_mut("@alice:example.com").unwrap().answer_acked = true;
+
+        let json     = serde_json::to_string(&ar).unwrap();
+        let restored: ActiveRoundState = serde_json::from_str(&json).unwrap();
+        assert!(
+            restored.dm_participants["@alice:example.com"].answer_acked,
+            "answer_acked must survive serde roundtrip so resume skips already-processed answers",
+        );
+    }
 }
