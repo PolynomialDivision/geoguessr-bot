@@ -10,6 +10,12 @@ use staticmap::{
 };
 use crate::avatar::{PIN_ANCHOR_X, PIN_ANCHOR_Y};
 
+const GUESS_MAP_W: u32 = 640;
+const GUESS_MAP_H: u32 = 400;
+const GUESS_MAP_MAX_ZOOM: u8 = 15;
+const GUESS_MAP_EFFECTIVE_W: f64 = 520.0;
+const GUESS_MAP_EFFECTIVE_H: f64 = 260.0;
+
 // ── Colour palette for multi-player round maps ────────────────────────────────
 // (R, G, B, chat_emoji)  — visually distinct, works on both light and dark maps.
 // `pub` so game.rs can look up the colour for each player when rendering pins.
@@ -48,37 +54,11 @@ pub fn render_guess_map(
     let guess_lon  = normalize_lon(guess_lon,  center_lon);
     let actual_lon = normalize_lon(actual_lon, center_lon);
 
-    // Base zoom from distance; cap further if the shorter arc is narrow enough
-    // that both points would fall off-screen at the default zoom.
-    let base_zoom: u8 = match dist_km as u32 {
-        0..=20      => 11,
-        21..=80     => 9,
-        81..=250    => 7,
-        251..=700   => 6,
-        701..=2000  => 5,
-        2001..=5000 => 4,
-        _           => 3,
-    };
-    // Maximum zoom at which the lon arc still fits inside 640 px (tile = 256 px).
-    let max_zoom_arc = if arc_span > 0.0 {
-        ((640.0_f64 / 256.0 * 360.0) / arc_span).log2().floor().clamp(0.0, 17.0) as u8
-    } else {
-        base_zoom
-    };
-    // Maximum zoom at which the lat span fits inside the effective height (400 - 2×30 = 340 px).
-    let lat_min = guess_lat.min(actual_lat);
-    let lat_max = guess_lat.max(actual_lat);
-    let max_zoom_lat = (0u8..=17).rev()
-        .find(|&z| {
-            let y_span = (lat_to_y(lat_min, z) - lat_to_y(lat_max, z)).abs() * 256.0;
-            y_span <= 340.0
-        })
-        .unwrap_or(0);
-    let zoom = base_zoom.min(max_zoom_arc).min(max_zoom_lat);
+    let zoom = guess_map_zoom(guess_lat, actual_lat, arc_span, dist_km);
 
     let mut map = StaticMapBuilder::new()
-        .width(640)
-        .height(400)
+        .width(GUESS_MAP_W)
+        .height(GUESS_MAP_H)
         .zoom(zoom)
         .lat_center(center_lat)
         .lon_center(center_lon)
@@ -270,6 +250,42 @@ fn minimum_lon_arc(lons: &[f64]) -> (f64, f64) {
     let center_frac = (arc_start + span / 2.0).rem_euclid(360.0);
     let center_lon  = center_frac - 180.0;
     (center_lon, span)
+}
+
+fn guess_map_zoom(guess_lat: f64, actual_lat: f64, lon_span: f64, dist_km: f64) -> u8 {
+    let max_zoom_lon = if lon_span > 0.0 {
+        ((GUESS_MAP_EFFECTIVE_W / 256.0 * 360.0) / lon_span)
+            .log2()
+            .floor()
+            .clamp(0.0, GUESS_MAP_MAX_ZOOM as f64) as u8
+    } else {
+        GUESS_MAP_MAX_ZOOM
+    };
+
+    let lat_min = guess_lat.min(actual_lat);
+    let lat_max = guess_lat.max(actual_lat);
+    let max_zoom_lat = (0u8..=GUESS_MAP_MAX_ZOOM).rev()
+        .find(|&z| {
+            let y_span = (lat_to_y(lat_min, z) - lat_to_y(lat_max, z)).abs() * 256.0;
+            y_span <= GUESS_MAP_EFFECTIVE_H
+        })
+        .unwrap_or(0);
+
+    let fit_zoom = max_zoom_lon.min(max_zoom_lat);
+    let distance_cap = match dist_km {
+        d if d <= 0.5 => 15,
+        d if d <= 2.0 => 14,
+        d if d <= 8.0 => 13,
+        d if d <= 20.0 => 12,
+        d if d <= 80.0 => 10,
+        d if d <= 250.0 => 8,
+        d if d <= 700.0 => 7,
+        d if d <= 2_000.0 => 6,
+        d if d <= 5_000.0 => 5,
+        _ => 4,
+    };
+
+    fit_zoom.min(distance_cap)
 }
 
 /// Draw a line taking the SHORTER arc between two points.
