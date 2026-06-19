@@ -4,30 +4,32 @@ use chrono_tz::Tz;
 use matrix_sdk::ruma::OwnedUserId;
 use tracing::error;
 
-use crate::{BotContext, config::ScheduleConfig, game::{self, format_dist}, state::ScheduledOnce};
+use crate::{
+    config::ScheduleConfig,
+    game::{self, format_dist},
+    state::ScheduledOnce,
+    BotContext,
+};
 
 pub async fn handle(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
     let cmd = body.split_whitespace().next().unwrap_or("").to_lowercase();
 
     match cmd.as_str() {
-        "!startgeo"
-        | "!geoguessr"   => cmd_startgeo(ctx, sender).await,
-        "!cancelgeo"     => cmd_cancelgeo(ctx, sender, body).await,
-        "!schedulegeo"   => cmd_schedulegeo(ctx, sender, body).await,
-        "!setschedule"   => cmd_setschedule(ctx, sender, body).await,
-        "!prefetch"      => cmd_prefetch(ctx, sender).await,
-        "!resetstats"    => cmd_resetstats(ctx, sender, body).await,
-        "!scores"
-        | "!leaderboard"   => cmd_scores(ctx).await,
-        "!scores90"
-        | "!leaderboard90" => cmd_scores_rolling(ctx).await,
-        "!mystats"       => cmd_mystats(ctx, sender).await,
-        "!countries"     => cmd_countries(ctx).await,
-        "!gameinfo"      => cmd_gameinfo(ctx).await,
-        "!fastest"       => cmd_fastest(ctx).await,
-        "!lang"          => cmd_lang(ctx, sender, body).await,
-        "!help"          => Ok(Some(help_text())),
-        _                => Ok(None),
+        "!startgeo" | "!geoguessr" => cmd_startgeo(ctx, sender).await,
+        "!cancelgeo" => cmd_cancelgeo(ctx, sender, body).await,
+        "!schedulegeo" => cmd_schedulegeo(ctx, sender, body).await,
+        "!setschedule" => cmd_setschedule(ctx, sender, body).await,
+        "!prefetch" => cmd_prefetch(ctx, sender).await,
+        "!resetstats" => cmd_resetstats(ctx, sender, body).await,
+        "!scores" | "!leaderboard" => cmd_scores(ctx).await,
+        "!scores90" | "!leaderboard90" => cmd_scores_rolling(ctx).await,
+        "!mystats" => cmd_mystats(ctx, sender).await,
+        "!countries" => cmd_countries(ctx).await,
+        "!gameinfo" => cmd_gameinfo(ctx).await,
+        "!fastest" => cmd_fastest(ctx).await,
+        "!lang" => cmd_lang(ctx, sender, body).await,
+        "!help" => Ok(Some(help_text())),
+        _ => Ok(None),
     }
 }
 
@@ -51,7 +53,7 @@ async fn cmd_startgeo(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<S
         }
     }
 
-    let ctx2   = ctx.clone();
+    let ctx2 = ctx.clone();
     let client = ctx.client.clone();
     let handle = tokio::spawn(async move {
         if let Err(e) = game::start_round(ctx2, client, true, None, None).await {
@@ -69,7 +71,11 @@ async fn cmd_startgeo(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<S
 
 // ── !cancelgeo ────────────────────────────────────────────────────────────────
 
-async fn cmd_cancelgeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
+async fn cmd_cancelgeo(
+    ctx: &BotContext,
+    sender: &OwnedUserId,
+    body: &str,
+) -> Result<Option<String>> {
     require_admin(ctx, sender)?;
 
     let time_arg = body
@@ -83,20 +89,24 @@ async fn cmd_cancelgeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Re
     if !time_arg.is_empty() {
         let (qh, qm) = match ScheduleConfig::parse_game_time(time_arg) {
             Some(t) => t,
-            None    => return Ok(Some(format!(
-                "❌ Invalid time \"{time_arg}\" · use HH:MM (e.g. 15:00)"
-            ))),
+            None => {
+                return Ok(Some(format!(
+                    "❌ Invalid time \"{time_arg}\" · use HH:MM (e.g. 15:00)"
+                )))
+            }
         };
         let game_time = format!("{qh:02}:{qm:02}");
-        let mut state  = ctx.state.lock().await;
-        let before     = state.scheduled_once.len();
+        let mut state = ctx.state.lock().await;
+        let before = state.scheduled_once.len();
         state.scheduled_once.retain(|e| e.game_time != game_time);
-        let removed    = before - state.scheduled_once.len();
+        let removed = before - state.scheduled_once.len();
         state.save(&ctx.state_path).await?;
         return if removed == 0 {
             Ok(Some(format!("⚠️ No scheduled game found for {game_time}.")))
         } else {
-            Ok(Some(format!("✅ Cancelled {removed} scheduled game(s) at {game_time}.")))
+            Ok(Some(format!(
+                "✅ Cancelled {removed} scheduled game(s) at {game_time}."
+            )))
         };
     }
 
@@ -108,7 +118,7 @@ async fn cmd_cancelgeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Re
         let mut st = ctx.state.lock().await;
         let round_id = st.active_round.as_ref().map(|ar| ar.round_id);
         st.active_round = None;
-        st.pending_join  = None;
+        st.pending_join = None;
         st.save(&ctx.state_path).await.ok();
         round_id
     };
@@ -155,7 +165,11 @@ async fn cmd_cancelgeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Re
 // Schedules for today if the game time is still in the future; tomorrow otherwise.
 // If the join window has already started but the game hasn't, the window is trimmed.
 
-async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
+async fn cmd_schedulegeo(
+    ctx: &BotContext,
+    sender: &OwnedUserId,
+    body: &str,
+) -> Result<Option<String>> {
     require_admin(ctx, sender)?;
 
     let args: Vec<&str> = body.split_whitespace().skip(1).collect();
@@ -166,21 +180,28 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
         if entries.is_empty() {
             return Ok(Some(
                 "No one-time games scheduled.\n\
-                 Usage: !schedulegeo HH:MM [reminder=<secs>] [timeout=<secs>]".to_owned()
+                 Usage: !schedulegeo HH:MM [reminder=<secs>] [timeout=<secs>]"
+                    .to_owned(),
             ));
         }
         let mut lines = vec!["📅 Pending one-time games:".to_owned()];
         for e in &entries {
-            let reminder_str = e.reminder_before_secs
-                .map(|s| format!(", reminder {}",  crate::game::format_duration(s)))
+            let reminder_str = e
+                .reminder_before_secs
+                .map(|s| format!(", reminder {}", crate::game::format_duration(s)))
                 .unwrap_or_default();
-            let timeout_str = e.answer_timeout_secs
+            let timeout_str = e
+                .answer_timeout_secs
                 .map(|s| format!(", timeout {}", crate::game::format_duration(s)))
                 .unwrap_or_default();
-            let guesses_str = e.guesses_per_round
+            let guesses_str = e
+                .guesses_per_round
                 .map(|n| format!(", {n} guess{}", if n == 1 { "" } else { "es" }))
                 .unwrap_or_default();
-            lines.push(format!("  • {} on {}{reminder_str}{timeout_str}{guesses_str}", e.game_time, e.date));
+            lines.push(format!(
+                "  • {} on {}{reminder_str}{timeout_str}{guesses_str}",
+                e.game_time, e.date
+            ));
         }
         return Ok(Some(lines.join("\n")));
     }
@@ -189,31 +210,45 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
     let time_arg = args[0];
     let (qh, qm) = match ScheduleConfig::parse_game_time(time_arg) {
         Some(t) => t,
-        None    => return Ok(Some(format!(
-            "❌ Invalid time \"{time_arg}\" · use HH:MM (e.g. 15:00)"
-        ))),
+        None => {
+            return Ok(Some(format!(
+                "❌ Invalid time \"{time_arg}\" · use HH:MM (e.g. 15:00)"
+            )))
+        }
     };
 
     // Parse optional key=value overrides.
     let mut reminder_override: Option<u64> = None;
-    let mut timeout_override:  Option<u64> = None;
+    let mut timeout_override: Option<u64> = None;
     let mut guesses_override: Option<u32> = None;
     for arg in &args[1..] {
         if let Some(v) = arg.strip_prefix("reminder=") {
             match v.parse::<u64>() {
-                Ok(n)  => reminder_override = Some(n),
-                Err(_) => return Ok(Some(format!("❌ Invalid reminder \"{v}\" · must be seconds."))),
+                Ok(n) => reminder_override = Some(n),
+                Err(_) => {
+                    return Ok(Some(format!(
+                        "❌ Invalid reminder \"{v}\" · must be seconds."
+                    )))
+                }
             }
         } else if let Some(v) = arg.strip_prefix("timeout=") {
             match v.parse::<u64>() {
-                Ok(n)  => timeout_override = Some(n),
-                Err(_) => return Ok(Some(format!("❌ Invalid timeout \"{v}\" · must be seconds."))),
+                Ok(n) => timeout_override = Some(n),
+                Err(_) => {
+                    return Ok(Some(format!(
+                        "❌ Invalid timeout \"{v}\" · must be seconds."
+                    )))
+                }
             }
         } else if let Some(v) = arg.strip_prefix("guesses=") {
             match v.parse::<u32>() {
                 Ok(n) if n >= 1 => guesses_override = Some(n),
-                Ok(_)  => return Ok(Some("❌ guesses must be at least 1.".to_owned())),
-                Err(_) => return Ok(Some(format!("❌ Invalid guesses \"{v}\" · must be a number."))),
+                Ok(_) => return Ok(Some("❌ guesses must be at least 1.".to_owned())),
+                Err(_) => {
+                    return Ok(Some(format!(
+                        "❌ Invalid guesses \"{v}\" · must be a number."
+                    )))
+                }
             }
         } else {
             return Ok(Some(format!(
@@ -222,22 +257,24 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
         }
     }
 
-    let reminder = reminder_override
-        .unwrap_or(ctx.config.schedule.reminder_before_secs);
+    let reminder = reminder_override.unwrap_or(ctx.config.schedule.reminder_before_secs);
 
-    let tz: Tz    = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
+    let tz: Tz = ctx
+        .config
+        .schedule
+        .timezone
+        .parse()
+        .unwrap_or(chrono_tz::UTC);
     let local_now = chrono::Utc::now().with_timezone(&tz);
 
     let game_secs = (qh * 3600 + qm * 60) as i64;
     let fire_secs = (game_secs - reminder as i64).rem_euclid(86400);
-    let now_secs  = (local_now.hour() * 3600
-        + local_now.minute() * 60
-        + local_now.second()) as i64;
+    let now_secs = (local_now.hour() * 3600 + local_now.minute() * 60 + local_now.second()) as i64;
 
     // Reject if the reminder is longer than the time from midnight to the game —
     // that wraps the fire time to later in the day than the game itself.
     if fire_secs > game_secs {
-        let hrs  = reminder / 3600;
+        let hrs = reminder / 3600;
         let mins = (reminder % 3600) / 60;
         let mut msg = format!(
             "❌ reminder={reminder}s (~{hrs}h {mins}m) is longer than the time from midnight to {qh:02}:{qm:02} \
@@ -256,34 +293,42 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
     // If only the join window has passed but the game is still future → schedule
     // for today with a truncated reminder (fire as soon as possible).
     let (date, effective_reminder_override, truncated) = if now_secs >= game_secs {
-        (local_now.date_naive() + chrono::Duration::days(1), reminder_override, false)
+        (
+            local_now.date_naive() + chrono::Duration::days(1),
+            reminder_override,
+            false,
+        )
     } else if now_secs >= fire_secs {
         // Join window started already; trim reminder so fire_time ≥ now + 60s.
         let secs_left = (game_secs - now_secs).max(60) as u64;
-        let trimmed   = secs_left.saturating_sub(60); // fire ~1 min from now
+        let trimmed = secs_left.saturating_sub(60); // fire ~1 min from now
         (local_now.date_naive(), Some(trimmed), trimmed < reminder)
     } else {
         (local_now.date_naive(), reminder_override, false)
     };
 
-    let effective_reminder = effective_reminder_override
-        .unwrap_or(ctx.config.schedule.reminder_before_secs);
+    let effective_reminder =
+        effective_reminder_override.unwrap_or(ctx.config.schedule.reminder_before_secs);
     let eff_fire_secs = (game_secs - effective_reminder as i64).rem_euclid(86400);
     let fire_hour = (eff_fire_secs / 3600) as u32;
-    let fire_min  = ((eff_fire_secs % 3600) / 60) as u32;
+    let fire_min = ((eff_fire_secs % 3600) / 60) as u32;
 
     let game_time = format!("{qh:02}:{qm:02}");
     let entry = ScheduledOnce {
-        game_time:            game_time.clone(),
+        game_time: game_time.clone(),
         date,
         reminder_before_secs: effective_reminder_override,
-        answer_timeout_secs:  timeout_override,
-        guesses_per_round:    guesses_override,
+        answer_timeout_secs: timeout_override,
+        guesses_per_round: guesses_override,
     };
 
     {
         let mut state = ctx.state.lock().await;
-        if state.scheduled_once.iter().any(|e| e.game_time == game_time && e.date == date) {
+        if state
+            .scheduled_once
+            .iter()
+            .any(|e| e.game_time == game_time && e.date == date)
+        {
             return Ok(Some(format!(
                 "⚠️ A game at {game_time} on {date} is already scheduled."
             )));
@@ -292,7 +337,11 @@ async fn cmd_schedulegeo(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
         state.save(&ctx.state_path).await?;
     }
 
-    let day_str = if date == local_now.date_naive() { "today".to_owned() } else { "tomorrow".to_owned() };
+    let day_str = if date == local_now.date_naive() {
+        "today".to_owned()
+    } else {
+        "tomorrow".to_owned()
+    };
 
     let mut detail = format!("✅ GeoGuessr: {day_str} at {game_time}");
     if effective_reminder > 0 {
@@ -335,22 +384,34 @@ async fn cmd_prefetch(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<S
 //   !setschedule timeout=N               — override answer timeout (seconds)
 //   !setschedule reset                   — clear all runtime overrides
 
-async fn cmd_setschedule(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
+async fn cmd_setschedule(
+    ctx: &BotContext,
+    sender: &OwnedUserId,
+    body: &str,
+) -> Result<Option<String>> {
     require_admin(ctx, sender)?;
 
     let args: Vec<&str> = body.split_whitespace().skip(1).collect();
 
     if args.is_empty() {
         let ov = ctx.state.lock().await.schedule_overrides.clone();
-        let guesses = ov.guesses_per_round
+        let guesses = ov
+            .guesses_per_round
             .map(|n| n.to_string())
             .unwrap_or_else(|| format!("{} (config)", ctx.config.schedule.guesses_per_round));
-        let photos = ov.photos_per_location
+        let photos = ov
+            .photos_per_location
             .map(|n| n.to_string())
             .unwrap_or_else(|| format!("{} (config)", ctx.config.schedule.photos_per_location));
-        let timeout = ov.answer_timeout_secs
+        let timeout = ov
+            .answer_timeout_secs
             .map(|s| crate::game::format_duration(s))
-            .unwrap_or_else(|| format!("{} (config)", crate::game::format_duration(ctx.config.schedule.answer_timeout_secs)));
+            .unwrap_or_else(|| {
+                format!(
+                    "{} (config)",
+                    crate::game::format_duration(ctx.config.schedule.answer_timeout_secs)
+                )
+            });
         return Ok(Some(format!(
             "📅 Schedule overrides:\n· guesses: {guesses}\n· photos/guess: {photos}\n· timeout: {timeout}\nChange: !setschedule [guesses=N] [photos=N] [timeout=N] | !setschedule reset"
         )));
@@ -362,29 +423,43 @@ async fn cmd_setschedule(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
             st.schedule_overrides = Default::default();
             st.save(&ctx.state_path).await?;
         }
-        return Ok(Some("✅ Schedule overrides cleared — using config defaults.".to_owned()));
+        return Ok(Some(
+            "✅ Schedule overrides cleared — using config defaults.".to_owned(),
+        ));
     }
 
-    let mut guesses_override: Option<u32>  = None;
-    let mut photos_override:  Option<usize> = None;
-    let mut timeout_override: Option<u64>  = None;
+    let mut guesses_override: Option<u32> = None;
+    let mut photos_override: Option<usize> = None;
+    let mut timeout_override: Option<u64> = None;
     for arg in &args {
         if let Some(v) = arg.strip_prefix("guesses=") {
             match v.parse::<u32>() {
                 Ok(n) if n >= 1 => guesses_override = Some(n),
-                Ok(_)  => return Ok(Some("❌ guesses must be at least 1.".to_owned())),
-                Err(_) => return Ok(Some(format!("❌ Invalid guesses \"{v}\" · must be a number."))),
+                Ok(_) => return Ok(Some("❌ guesses must be at least 1.".to_owned())),
+                Err(_) => {
+                    return Ok(Some(format!(
+                        "❌ Invalid guesses \"{v}\" · must be a number."
+                    )))
+                }
             }
         } else if let Some(v) = arg.strip_prefix("photos=") {
             match v.parse::<usize>() {
                 Ok(n) if n >= 1 => photos_override = Some(n),
-                Ok(_)  => return Ok(Some("❌ photos must be at least 1.".to_owned())),
-                Err(_) => return Ok(Some(format!("❌ Invalid photos \"{v}\" · must be a number."))),
+                Ok(_) => return Ok(Some("❌ photos must be at least 1.".to_owned())),
+                Err(_) => {
+                    return Ok(Some(format!(
+                        "❌ Invalid photos \"{v}\" · must be a number."
+                    )))
+                }
             }
         } else if let Some(v) = arg.strip_prefix("timeout=") {
             match v.parse::<u64>() {
-                Ok(n)  => timeout_override = Some(n),
-                Err(_) => return Ok(Some(format!("❌ Invalid timeout \"{v}\" · must be seconds."))),
+                Ok(n) => timeout_override = Some(n),
+                Err(_) => {
+                    return Ok(Some(format!(
+                        "❌ Invalid timeout \"{v}\" · must be seconds."
+                    )))
+                }
             }
         } else {
             return Ok(Some(format!(
@@ -395,28 +470,44 @@ async fn cmd_setschedule(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> 
 
     {
         let mut st = ctx.state.lock().await;
-        if let Some(n) = guesses_override { st.schedule_overrides.guesses_per_round = Some(n); }
-        if let Some(n) = photos_override  { st.schedule_overrides.photos_per_location = Some(n); }
-        if let Some(n) = timeout_override { st.schedule_overrides.answer_timeout_secs = Some(n); }
+        if let Some(n) = guesses_override {
+            st.schedule_overrides.guesses_per_round = Some(n);
+        }
+        if let Some(n) = photos_override {
+            st.schedule_overrides.photos_per_location = Some(n);
+        }
+        if let Some(n) = timeout_override {
+            st.schedule_overrides.answer_timeout_secs = Some(n);
+        }
         st.save(&ctx.state_path).await?;
     }
 
     let mut parts = Vec::new();
-    if let Some(n) = guesses_override { parts.push(format!("{n} guess{}", if n == 1 { "" } else { "es" })); }
-    if let Some(n) = photos_override  { parts.push(format!("{n} photo{}/guess", if n == 1 { "" } else { "s" })); }
-    if let Some(n) = timeout_override { parts.push(format!("timeout {}", crate::game::format_duration(n))); }
+    if let Some(n) = guesses_override {
+        parts.push(format!("{n} guess{}", if n == 1 { "" } else { "es" }));
+    }
+    if let Some(n) = photos_override {
+        parts.push(format!("{n} photo{}/guess", if n == 1 { "" } else { "s" }));
+    }
+    if let Some(n) = timeout_override {
+        parts.push(format!("timeout {}", crate::game::format_duration(n)));
+    }
     Ok(Some(format!("✅ Schedule updated: {}", parts.join(", "))))
 }
 
 // ── !resetstats ───────────────────────────────────────────────────────────────
 
-async fn cmd_resetstats(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<Option<String>> {
+async fn cmd_resetstats(
+    ctx: &BotContext,
+    sender: &OwnedUserId,
+    body: &str,
+) -> Result<Option<String>> {
     require_admin(ctx, sender)?;
 
     let confirmed = body.split_whitespace().nth(1).unwrap_or("") == "confirm";
     if !confirmed {
         return Ok(Some(
-            "⚠️ This deletes ALL game history.\nConfirm: !resetstats confirm".to_owned()
+            "⚠️ This deletes ALL game history.\nConfirm: !resetstats confirm".to_owned(),
         ));
     }
 
@@ -438,55 +529,108 @@ async fn cmd_scores(ctx: &BotContext) -> Result<Option<String>> {
 async fn cmd_scores_free_guess(ctx: &BotContext) -> Result<Option<String>> {
     match build_alltime_leaderboard(ctx).await {
         Some(text) => Ok(Some(text)),
-        None       => Ok(Some("No scores yet — no games have been played.".to_owned())),
+        None => Ok(Some(
+            "No scores yet — no games have been played.".to_owned(),
+        )),
     }
 }
 
 async fn cmd_scores_rolling(ctx: &BotContext) -> Result<Option<String>> {
     match build_rolling_leaderboard(ctx).await {
         Some(text) => Ok(Some(text)),
-        None       => Ok(Some("No scores in the last 90 days.".to_owned())),
+        None => Ok(Some("No scores in the last 90 days.".to_owned())),
     }
 }
 
 fn format_leaderboard(
-    mut board:   Vec<crate::db::ScoreLeaderboardEntry>,
-    header:      &str,
+    mut board: Vec<crate::db::ScoreLeaderboardEntry>,
+    header: &str,
     round_count: i64,
 ) -> String {
-    const C: f64       = 10.0;
+    const PRIOR_GUESSES: f64 = 30.0;
     const BAR_W: usize = 10;
 
     let total_guesses: i64 = board.iter().map(|e| e.guesses_played).sum();
-    let total_pts:     i64 = board.iter().map(|e| e.total_score).sum();
-    let global_mean: f64   = if total_guesses > 0 {
+    let total_pts: i64 = board.iter().map(|e| e.total_score).sum();
+    let global_mean: f64 = if total_guesses > 0 {
         total_pts as f64 / total_guesses as f64
-    } else { 2000.0 };
+    } else {
+        2000.0
+    };
 
     let bayesian = |e: &crate::db::ScoreLeaderboardEntry| -> f64 {
-        let n   = e.guesses_played as f64;
-        let avg = if n > 0.0 { e.total_score as f64 / n } else { 0.0 };
-        (C * global_mean + n * avg) / (C + n)
+        let n = e.guesses_played as f64;
+        let avg = if n > 0.0 {
+            e.total_score as f64 / n
+        } else {
+            0.0
+        };
+        (PRIOR_GUESSES * global_mean + n * avg) / (PRIOR_GUESSES + n)
     };
 
     board.sort_by(|a, b| {
-        bayesian(b).partial_cmp(&bayesian(a)).unwrap_or(std::cmp::Ordering::Equal)
+        bayesian(b)
+            .partial_cmp(&bayesian(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.guesses_played.cmp(&a.guesses_played))
             .then(a.user_id.cmp(&b.user_id))
     });
 
     let mut lines = vec![
-        format!("🏆 **{}** · {} round(s)", header, round_count),
+        format!(
+            "🏆 **{}** · {} round(s) · confidence-adjusted",
+            header, round_count
+        ),
         String::new(),
     ];
     for (i, entry) in board.iter().enumerate() {
-        let medal    = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
-        let b_avg    = bayesian(entry);
-        let filled   = ((b_avg / 5000.0) * BAR_W as f64).round() as usize;
-        let bar      = format!("{}{}", "█".repeat(filled.min(BAR_W)), "░".repeat(BAR_W - filled.min(BAR_W)));
-        let avg_dist  = if entry.guesses_played > 0 { format_dist(entry.avg_distance_km)  } else { "n/a".to_owned() };
-        let best_dist = if entry.guesses_played > 0 { format_dist(entry.best_distance_km) } else { "n/a".to_owned() };
-        lines.push(format!("{medal} {:>2}. {} : {} pts/guess", i + 1, entry.user_id, b_avg.round() as i64));
-        lines.push(format!("      {bar}  ⌀ {}  🏅 {}  ({} guesses)", avg_dist, best_dist, entry.guesses_played));
+        let medal = match i {
+            0 => "🥇",
+            1 => "🥈",
+            2 => "🥉",
+            _ => "  ",
+        };
+        let b_avg = bayesian(entry);
+        let raw_avg = if entry.guesses_played > 0 {
+            entry.total_score as f64 / entry.guesses_played as f64
+        } else {
+            0.0
+        };
+        let confidence = if entry.guesses_played > 0 {
+            entry.guesses_played as f64 / (entry.guesses_played as f64 + PRIOR_GUESSES)
+        } else {
+            0.0
+        };
+        let filled = ((b_avg / 5000.0) * BAR_W as f64).round() as usize;
+        let bar = format!(
+            "{}{}",
+            "█".repeat(filled.min(BAR_W)),
+            "░".repeat(BAR_W - filled.min(BAR_W))
+        );
+        let avg_dist = if entry.guesses_played > 0 {
+            format_dist(entry.avg_distance_km)
+        } else {
+            "n/a".to_owned()
+        };
+        let best_dist = if entry.guesses_played > 0 {
+            format_dist(entry.best_distance_km)
+        } else {
+            "n/a".to_owned()
+        };
+        lines.push(format!(
+            "{medal} {:>2}. {} : {} adj pts/guess",
+            i + 1,
+            entry.user_id,
+            b_avg.round() as i64
+        ));
+        lines.push(format!(
+            "      {bar}  raw {}  conf {}%  ⌀ {}  🏅 {}  ({} guesses)",
+            raw_avg.round() as i64,
+            (confidence * 100.0).round() as i64,
+            avg_dist,
+            best_dist,
+            entry.guesses_played,
+        ));
     }
     lines.join("\n")
 }
@@ -494,17 +638,29 @@ fn format_leaderboard(
 /// All-time leaderboard (every round ever played). Used by `!leaderboard`.
 pub async fn build_alltime_leaderboard(ctx: &BotContext) -> Option<String> {
     let board = ctx.db.score_leaderboard_alltime().await.ok()?;
-    if board.is_empty() { return None; }
+    if board.is_empty() {
+        return None;
+    }
     let round_count = ctx.db.round_count().await.unwrap_or(0);
-    Some(format_leaderboard(board, "All-time Leaderboard", round_count))
+    Some(format_leaderboard(
+        board,
+        "All-time Leaderboard",
+        round_count,
+    ))
 }
 
 /// 90-day rolling leaderboard. Posted after each round.
 pub async fn build_rolling_leaderboard(ctx: &BotContext) -> Option<String> {
     let board = ctx.db.score_leaderboard().await.ok()?;
-    if board.is_empty() { return None; }
+    if board.is_empty() {
+        return None;
+    }
     let round_count = ctx.db.round_count().await.unwrap_or(0);
-    Some(format_leaderboard(board, "Leaderboard (last 90 days)", round_count))
+    Some(format_leaderboard(
+        board,
+        "Leaderboard (last 90 days)",
+        round_count,
+    ))
 }
 
 // ── !mystats ──────────────────────────────────────────────────────────────────
@@ -523,10 +679,12 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
 
     let pct = if stats.total_questions > 0 {
         stats.total_correct * 100 / stats.total_questions
-    } else { 0 };
+    } else {
+        0
+    };
 
     let board = ctx.db.leaderboard().await.unwrap_or_default();
-    let rank  = board.iter().position(|e| e.user_id == user).map(|i| i + 1);
+    let rank = board.iter().position(|e| e.user_id == user).map(|i| i + 1);
     let rank_str = rank
         .map(|r| format!(" · rank #{r} of {}", board.len()))
         .unwrap_or_default();
@@ -538,9 +696,9 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
 
     let country_stats = ctx.db.user_country_stats(user).await.unwrap_or_default();
     if country_stats.len() >= 2 {
-        let best  = country_stats.first().unwrap();
+        let best = country_stats.first().unwrap();
         let worst = country_stats.last().unwrap();
-        let best_pct  = best.correct  * 100 / best.answered;
+        let best_pct = best.correct * 100 / best.answered;
         let worst_pct = worst.correct * 100 / worst.answered;
         lines.push(format!("🏆 Best: {} ({}%)", best.country, best_pct));
         lines.push(format!("😬 Worst: {} ({}%)", worst.country, worst_pct));
@@ -553,18 +711,20 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
 
 async fn cmd_countries(ctx: &BotContext) -> Result<Option<String>> {
     let stats = match ctx.db.country_stats().await {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(e) => {
             error!("country_stats: {e}");
-            return Ok(Some("❌ Could not read country stats from database.".to_owned()));
+            return Ok(Some(
+                "❌ Could not read country stats from database.".to_owned(),
+            ));
         }
     };
     if stats.is_empty() {
         return Ok(Some("No guesses yet.".to_owned()));
     }
 
-    let total_q: i64     = stats.iter().map(|s| s.times_asked).sum();
-    let max_asked: i64   = stats.iter().map(|s| s.times_asked).max().unwrap_or(1);
+    let total_q: i64 = stats.iter().map(|s| s.times_asked).sum();
+    let max_asked: i64 = stats.iter().map(|s| s.times_asked).max().unwrap_or(1);
 
     let mut lines = vec![
         format!("🗺️ **Countries** · {} guesses", total_q),
@@ -574,10 +734,12 @@ async fn cmd_countries(ctx: &BotContext) -> Result<Option<String>> {
     const BAR_W: usize = 10;
     for s in &stats {
         let filled = (s.times_asked * BAR_W as i64 / max_asked) as usize;
-        let bar    = format!("{}{}", "█".repeat(filled), "░".repeat(BAR_W - filled));
-        let pct    = if s.total_answers > 0 {
+        let bar = format!("{}{}", "█".repeat(filled), "░".repeat(BAR_W - filled));
+        let pct = if s.total_answers > 0 {
             s.correct_answers * 100 / s.total_answers
-        } else { 0 };
+        } else {
+            0
+        };
         lines.push(format!(
             "{bar}  {:>2}x  {:>3}% ✓  {} ({})",
             s.times_asked, pct, s.country, s.region,
@@ -591,15 +753,17 @@ async fn cmd_countries(ctx: &BotContext) -> Result<Option<String>> {
 
 async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
     let board = match ctx.db.speed_leaderboard().await {
-        Ok(b)  => b,
+        Ok(b) => b,
         Err(e) => {
             error!("speed_leaderboard: {e}");
-            return Ok(Some("❌ Could not read speed stats from database.".to_owned()));
+            return Ok(Some(
+                "❌ Could not read speed stats from database.".to_owned(),
+            ));
         }
     };
     if board.is_empty() {
         return Ok(Some(
-            "Not enough data yet · need at least 3 correct answers per player.".to_owned()
+            "Not enough data yet · need at least 3 correct answers per player.".to_owned(),
         ));
     }
 
@@ -608,10 +772,18 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
         String::new(),
     ];
     for (i, e) in board.iter().enumerate() {
-        let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
+        let medal = match i {
+            0 => "🥇",
+            1 => "🥈",
+            2 => "🥉",
+            _ => "  ",
+        };
         lines.push(format!(
             "{medal} {:>2}. {} : {:.1}s avg · {} correct",
-            i + 1, e.user_id, e.avg_secs, e.sample_count,
+            i + 1,
+            e.user_id,
+            e.avg_secs,
+            e.sample_count,
         ));
     }
 
@@ -621,7 +793,7 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
 // ── !gameinfo ─────────────────────────────────────────────────────────────────
 
 async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
-    let s  = &ctx.config.schedule;
+    let s = &ctx.config.schedule;
     let tz = &s.timezone;
 
     let times_str = if s.game_times.is_empty() {
@@ -668,8 +840,13 @@ async fn cmd_lang(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<
     let arg = body.split_whitespace().nth(1).unwrap_or("").trim();
 
     if arg.is_empty() {
-        let current = ctx.state.lock().await
-            .user_langs.get(sender.as_str()).cloned()
+        let current = ctx
+            .state
+            .lock()
+            .await
+            .user_langs
+            .get(sender.as_str())
+            .cloned()
             .unwrap_or_else(|| "en".to_owned());
         let label = game::lang_label(&current);
         return Ok(Some(format!(
@@ -694,11 +871,14 @@ async fn cmd_lang(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<
 
     {
         let mut st = ctx.state.lock().await;
-        st.user_langs.insert(sender.as_str().to_owned(), lang.to_owned());
+        st.user_langs
+            .insert(sender.as_str().to_owned(), lang.to_owned());
         st.save(&ctx.state_path).await?;
     }
 
-    Ok(Some(format!("Language set to **{lang}** ({label}) · your guess locations will now appear in {label}")))
+    Ok(Some(format!(
+        "Language set to **{lang}** ({label}) · your guess locations will now appear in {label}"
+    )))
 }
 
 // ── !help ─────────────────────────────────────────────────────────────────────

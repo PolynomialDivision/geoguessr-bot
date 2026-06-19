@@ -4,42 +4,44 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use chrono_tz::Tz;
 use matrix_sdk::{
-    Client, Room,
     ruma::{
-        OwnedEventId, OwnedMxcUri, OwnedUserId, UInt,
         events::{
-            Mentions,
             reaction::ReactionEventContent,
             relation::Annotation,
             room::{
-                ImageInfo,
                 message::{
-                    ImageMessageEventContent, MessageType,
-                    ReplacementMetadata, RoomMessageEventContent,
+                    ImageMessageEventContent, MessageType, ReplacementMetadata,
+                    RoomMessageEventContent,
                 },
                 pinned_events::RoomPinnedEventsEventContent,
+                ImageInfo,
             },
+            Mentions,
         },
         // (ReactionEventContent and Annotation kept for join-phase reactions)
+        OwnedEventId,
+        OwnedMxcUri,
+        OwnedUserId,
+        UInt,
     },
+    Client, Room,
 };
 use rand::seq::SliceRandom;
 use tracing::{error, info, warn};
 
 use crate::{
-    BotContext,
-    countries,
-    format,
+    countries, format,
     sources::GeoImage,
     state::{ActiveDmParticipant, ActiveRoundState, PendingJoin},
+    BotContext,
 };
 
 /// Metadata about an image that has been uploaded to the Matrix media store.
 struct UploadedMedia {
-    uri:  OwnedMxcUri,
+    uri: OwnedMxcUri,
     mime: mime::Mime,
-    w:    u32,
-    h:    u32,
+    w: u32,
+    h: u32,
     size: usize,
 }
 
@@ -50,18 +52,18 @@ pub struct GameOverrides {
     /// Override for how long before game time the join message fires (seconds).
     pub reminder_before_secs: Option<u64>,
     /// Override for how long players have to answer (seconds).
-    pub answer_timeout_secs:  Option<u64>,
+    pub answer_timeout_secs: Option<u64>,
     /// Override for how many guesses (locations) per round.
-    pub guesses_per_round:    Option<u32>,
+    pub guesses_per_round: Option<u32>,
 }
 
 // ── Free-guess answer ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct FreeGuess {
-    pub text:         String,
-    pub lat:          f64,
-    pub lon:          f64,
+    pub text: String,
+    pub lat: f64,
+    pub lon: f64,
     pub submitted_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -70,13 +72,13 @@ pub struct FreeGuess {
 #[derive(Clone, Debug)]
 pub struct ActiveGame {
     pub event_id: OwnedEventId,
-    pub mode:     ActiveGameMode,
+    pub mode: ActiveGameMode,
 }
 
 #[derive(Clone, Debug)]
 pub enum ActiveGameMode {
     FreeGuess {
-        guesses:    HashMap<String, FreeGuess>,
+        guesses: HashMap<String, FreeGuess>,
         actual_lat: f64,
         actual_lon: f64,
     },
@@ -85,8 +87,15 @@ pub enum ActiveGameMode {
 impl ActiveGame {
     /// Record a guess for `user_id`.  Returns `true` if accepted, `false` if
     /// the player has already guessed and `max_guesses` > 0.
-    pub fn record_free_guess(&mut self, user_id: String, guess: FreeGuess, max_guesses: u32) -> bool {
-        let ActiveGameMode::FreeGuess { ref mut guesses, .. } = self.mode;
+    pub fn record_free_guess(
+        &mut self,
+        user_id: String,
+        guess: FreeGuess,
+        max_guesses: u32,
+    ) -> bool {
+        let ActiveGameMode::FreeGuess {
+            ref mut guesses, ..
+        } = self.mode;
         if max_guesses > 0 && guesses.contains_key(&user_id) {
             return false;
         }
@@ -98,167 +107,171 @@ impl ActiveGame {
 // ── Round entry point ─────────────────────────────────────────────────────────
 
 pub async fn start_round(
-    ctx:       BotContext,
-    client:    Client,
-    manual:    bool,
-    slot:      Option<String>,
+    ctx: BotContext,
+    client: Client,
+    manual: bool,
+    slot: Option<String>,
     overrides: Option<GameOverrides>,
 ) -> anyhow::Result<()> {
     let room = match client.get_room(&ctx.room_id) {
         Some(r) => r,
-        None    => {
+        None => {
             warn!("GeoGuessr: room {} not joined", ctx.room_id);
             return Ok(());
         }
     };
 
-    let n = overrides.as_ref()
+    let n = overrides
+        .as_ref()
         .and_then(|o| o.guesses_per_round)
         .map(|v| v as usize)
         .unwrap_or(ctx.effective_guesses_per_round().await);
     let triggered_by = if manual { "manual" } else { "scheduler" };
 
     // Apply per-round overrides (from !schedulegeo).
-    let reminder_before_secs_cfg = overrides.as_ref()
+    let reminder_before_secs_cfg = overrides
+        .as_ref()
         .and_then(|o| o.reminder_before_secs)
         .unwrap_or(ctx.config.schedule.reminder_before_secs);
-    let answer_timeout_secs_cfg = overrides.as_ref()
+    let answer_timeout_secs_cfg = overrides
+        .as_ref()
         .and_then(|o| o.answer_timeout_secs)
         .unwrap_or(ctx.config.schedule.answer_timeout_secs);
 
     // ── Join phase (scheduled only) ───────────────────────────────────────────
     // When reminder_before_secs > 0, post a "who wants to play?" message,
     // react to it, and wait for participants.
-    let participants: Vec<OwnedUserId> =
-        if !manual && reminder_before_secs_cfg > 0 {
-            let reminder_secs = reminder_before_secs_cfg;
-            let emoji         = ctx.config.schedule.join_emoji.clone();
+    let participants: Vec<OwnedUserId> = if !manual && reminder_before_secs_cfg > 0 {
+        let reminder_secs = reminder_before_secs_cfg;
+        let emoji = ctx.config.schedule.join_emoji.clone();
 
-            // Post the join-prompt message.
-            let flags_str = JOIN_REACTION_FLAGS.join(" ");
-            let join_msg = format!(
-                "🌍 GeoGuessr starts in {}! @room\n\
+        // Post the join-prompt message.
+        let flags_str = JOIN_REACTION_FLAGS.join(" ");
+        let join_msg = format!(
+            "🌍 GeoGuessr starts in {}! @room\n\
                  React with your flag to join and set the map language:\n\
                  {}",
-                format_duration(reminder_secs),
-                flags_str,
-            );
-            let mut join_content = format::mentionify(&join_msg);
-            join_content = join_content.add_mentions({
-                let mut m = Mentions::new();
-                m.room = true;
-                m
-            });
-            let join_event    = room.send(join_content).await?;
-            let join_event_id = join_event.response.event_id.clone();
-            set_pinned(&room, &join_event_id).await;
+            format_duration(reminder_secs),
+            flags_str,
+        );
+        let mut join_content = format::mentionify(&join_msg);
+        join_content = join_content.add_mentions({
+            let mut m = Mentions::new();
+            m.room = true;
+            m
+        });
+        let join_event = room.send(join_content).await?;
+        let join_event_id = join_event.response.event_id.clone();
+        set_pinned(&room, &join_event_id).await;
 
-            // Bot primes the flag reactions so clients show them as tappable buttons.
-            for flag in JOIN_REACTION_FLAGS {
-                room.send(ReactionEventContent::new(Annotation::new(
-                    join_event_id.clone(),
-                    flag.to_string(),
-                )))
-                .await
-                .ok();
-            }
-
-            // Register the join event so the reaction handler populates participants.
-            {
-                let mut js = ctx.join_state.lock().await;
-                js.message_event_id = Some(join_event_id.clone());
-                js.join_emoji       = emoji.clone();
-                js.participants.clear();
-            }
-
-            // Persist the join phase so a restart can resume it.
-            {
-                let game_at_utc = chrono::Utc::now()
-                    + chrono::Duration::seconds(reminder_secs as i64);
-                let mut st = ctx.state.lock().await;
-                st.pending_join = Some(PendingJoin {
-                    event_id:           join_event_id.to_string(),
-                    join_emoji:         emoji.clone(),
-                    slot:               slot.clone(),
-                    game_at_utc,
-                    answer_timeout_secs: answer_timeout_secs_cfg,
-                });
-                st.save(&ctx.state_path).await.ok();
-            }
-
-            // Wait for the join window.
-            tokio::time::sleep(tokio::time::Duration::from_secs(reminder_secs)).await;
-
-            // Collect participants from in-memory tracking …
-            let mut participants: HashSet<OwnedUserId> = {
-                let mut js = ctx.join_state.lock().await;
-                js.message_event_id = None;
-                std::mem::take(&mut js.participants)
-            };
-
-            // … and also reconcile with the server in case we missed any reactions.
-            let bot_uid = client.user_id().map(|u| u.to_owned());
-            reconcile_join_reactions(
-                &client,
-                &room,
-                &join_event_id,
-                bot_uid.as_deref(),
-                &mut participants,
-            )
-            .await;
-
-            // Clear pending_join — join window is over.
-            {
-                let mut st = ctx.state.lock().await;
-                st.pending_join = None;
-                st.save(&ctx.state_path).await.ok();
-            }
-
-            if participants.is_empty() {
-                room.send(format::mentionify(
-                    "😴 Nobody joined · skipping.",
-                ))
-                .await
-                .ok();
-                // Mark slot as done so we don't retry.
-                if let Some(slot) = slot {
-                    let tz: Tz = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
-                    let today  = chrono::Utc::now().with_timezone(&tz).date_naive();
-                    let mut st = ctx.state.lock().await;
-                    st.last_game_dates.insert(slot, today);
-                    st.save(&ctx.state_path).await.ok();
-                }
-                return Ok(());
-            }
-
-            let mut sorted: Vec<OwnedUserId> = participants.into_iter().collect();
-            sorted.sort();
-
-            let participant_list: Vec<String> = sorted.iter().map(|u| u.to_string()).collect();
-            let participant_ids: Vec<OwnedUserId> = sorted.clone();
-            let n = sorted.len();
-            room.send(
-                format::mentionify(&format!(
-                    "🌍 GeoGuessr starting now! {} player{}: {}",
-                    n,
-                    if n == 1 { "" } else { "s" },
-                    participant_list.join(", "),
-                ))
-                .add_mentions(Mentions::with_user_ids(participant_ids)),
-            )
+        // Bot primes the flag reactions so clients show them as tappable buttons.
+        for flag in JOIN_REACTION_FLAGS {
+            room.send(ReactionEventContent::new(Annotation::new(
+                join_event_id.clone(),
+                flag.to_string(),
+            )))
             .await
             .ok();
+        }
 
-            sorted
+        // Register the join event so the reaction handler populates participants.
+        {
+            let mut js = ctx.join_state.lock().await;
+            js.message_event_id = Some(join_event_id.clone());
+            js.join_emoji = emoji.clone();
+            js.participants.clear();
+        }
 
-        } else {
-            Vec::new()
+        // Persist the join phase so a restart can resume it.
+        {
+            let game_at_utc = chrono::Utc::now() + chrono::Duration::seconds(reminder_secs as i64);
+            let mut st = ctx.state.lock().await;
+            st.pending_join = Some(PendingJoin {
+                event_id: join_event_id.to_string(),
+                join_emoji: emoji.clone(),
+                slot: slot.clone(),
+                game_at_utc,
+                answer_timeout_secs: answer_timeout_secs_cfg,
+            });
+            st.save(&ctx.state_path).await.ok();
+        }
+
+        // Wait for the join window.
+        tokio::time::sleep(tokio::time::Duration::from_secs(reminder_secs)).await;
+
+        // Collect participants from in-memory tracking …
+        let mut participants: HashSet<OwnedUserId> = {
+            let mut js = ctx.join_state.lock().await;
+            js.message_event_id = None;
+            std::mem::take(&mut js.participants)
         };
+
+        // … and also reconcile with the server in case we missed any reactions.
+        let bot_uid = client.user_id().map(|u| u.to_owned());
+        reconcile_join_reactions(
+            &client,
+            &room,
+            &join_event_id,
+            bot_uid.as_deref(),
+            &mut participants,
+        )
+        .await;
+
+        // Clear pending_join — join window is over.
+        {
+            let mut st = ctx.state.lock().await;
+            st.pending_join = None;
+            st.save(&ctx.state_path).await.ok();
+        }
+
+        if participants.is_empty() {
+            room.send(format::mentionify("😴 Nobody joined · skipping."))
+                .await
+                .ok();
+            // Mark slot as done so we don't retry.
+            if let Some(slot) = slot {
+                let tz: Tz = ctx
+                    .config
+                    .schedule
+                    .timezone
+                    .parse()
+                    .unwrap_or(chrono_tz::UTC);
+                let today = chrono::Utc::now().with_timezone(&tz).date_naive();
+                let mut st = ctx.state.lock().await;
+                st.last_game_dates.insert(slot, today);
+                st.save(&ctx.state_path).await.ok();
+            }
+            return Ok(());
+        }
+
+        let mut sorted: Vec<OwnedUserId> = participants.into_iter().collect();
+        sorted.sort();
+
+        let participant_list: Vec<String> = sorted.iter().map(|u| u.to_string()).collect();
+        let participant_ids: Vec<OwnedUserId> = sorted.clone();
+        let n = sorted.len();
+        room.send(
+            format::mentionify(&format!(
+                "🌍 GeoGuessr starting now! {} player{}: {}",
+                n,
+                if n == 1 { "" } else { "s" },
+                participant_list.join(", "),
+            ))
+            .add_mentions(Mentions::with_user_ids(participant_ids)),
+        )
+        .await
+        .ok();
+
+        sorted
+    } else {
+        Vec::new()
+    };
 
     // ── Pre-fetch + pop images upfront ────────────────────────────────────────
     prefetch_if_needed(&ctx, n).await;
 
-    let round_id = ctx.db
+    let round_id = ctx
+        .db
         .start_round(ctx.room_id.as_str(), n as u32, triggered_by)
         .await?;
 
@@ -273,14 +286,16 @@ pub async fn start_round(
     let pop_db_coords = ctx.db.recent_played_coords().await.unwrap_or_default();
     let n_photos = ctx.effective_photos_per_location().await;
     let mut image_queue: VecDeque<GeoImage> = {
-        let mut st    = ctx.state.lock().await;
-        let mut q     = VecDeque::new();
-        let limit     = st.cached_guesses.len();
+        let mut st = ctx.state.lock().await;
+        let mut q = VecDeque::new();
+        let limit = st.cached_guesses.len();
         let mut checked = 0;
         while q.len() < n && checked < limit {
             let img = st.cached_guesses.pop_front().expect("bounded by limit");
             checked += 1;
-            let far_enough = img.lat.zip(img.lon)
+            let far_enough = img
+                .lat
+                .zip(img.lon)
                 .map(|(la, lo)| {
                     crate::sources::min_dist_to_existing(la, lo, &pop_db_coords)
                         >= crate::sources::MIN_DISTANCE_KM
@@ -322,23 +337,29 @@ pub async fn start_round(
         // Save active round state so a restart can resume.
         {
             let mut st = ctx.state.lock().await;
-            let dm_state = participants.iter().map(|uid| {
-                (uid.to_string(), ActiveDmParticipant {
-                    dm_room_id:      String::new(),
-                    prompt_event_id: None,
-                    answer_acked:    false,
+            let dm_state = participants
+                .iter()
+                .map(|uid| {
+                    (
+                        uid.to_string(),
+                        ActiveDmParticipant {
+                            dm_room_id: String::new(),
+                            prompt_event_id: None,
+                            answer_acked: false,
+                        },
+                    )
                 })
-            }).collect();
+                .collect();
             st.active_round = Some(ActiveRoundState {
                 round_id,
                 guess_num,
-                total_guesses:       n as u32,
-                current_image:       img.clone(),
-                remaining_images:    image_queue.clone(),
-                guess_started_at:    chrono::Utc::now(),
+                total_guesses: n as u32,
+                current_image: img.clone(),
+                remaining_images: image_queue.clone(),
+                guess_started_at: chrono::Utc::now(),
                 answer_timeout_secs: answer_timeout_secs_cfg,
-                dm_participants:     dm_state,
-                round_scores:        round_scores_free.clone(),
+                dm_participants: dm_state,
+                round_scores: round_scores_free.clone(),
             });
             st.save(&ctx.state_path).await.ok();
         }
@@ -346,21 +367,31 @@ pub async fn start_round(
         if !first_guess {
             tokio::time::sleep(tokio::time::Duration::from_secs(
                 ctx.config.schedule.inter_guess_secs,
-            )).await;
+            ))
+            .await;
         }
         first_guess = false;
 
         play_free_guess(
-            &ctx, &client, &room,
-            round_id, guess_num, n as u32,
-            &img, &mut round_scores_free, &participants,
+            &ctx,
+            &client,
+            &room,
+            round_id,
+            guess_num,
+            n as u32,
+            &img,
+            &mut round_scores_free,
+            &participants,
             answer_timeout_secs_cfg,
-        ).await?;
+        )
+        .await?;
     }
 
     // ── Finalise round ────────────────────────────────────────────────────────
     ctx.db.finish_round(round_id).await?;
-    ctx.db.upsert_round_scores_free_guess(round_id, &round_scores_free).await?;
+    ctx.db
+        .upsert_round_scores_free_guess(round_id, &round_scores_free)
+        .await?;
 
     // Background refill — placed here so all DB writes for this round (including
     // every start_guess call) are committed before recent_played_coords() is read
@@ -369,21 +400,25 @@ pub async fn start_round(
     // current round's locations.
     {
         let ctx2 = ctx.clone();
-        tokio::spawn(async move { prefetch_if_needed(&ctx2, n + 2).await; });
+        tokio::spawn(async move {
+            prefetch_if_needed(&ctx2, n + 2).await;
+        });
     }
 
     if let Some(slot) = slot {
-        let tz: Tz = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
-        let today  = chrono::Utc::now().with_timezone(&tz).date_naive();
+        let tz: Tz = ctx
+            .config
+            .schedule
+            .timezone
+            .parse()
+            .unwrap_or(chrono_tz::UTC);
+        let today = chrono::Utc::now().with_timezone(&tz).date_naive();
         let mut st = ctx.state.lock().await;
         st.last_game_dates.insert(slot, today);
         st.save(&ctx.state_path).await.ok();
     }
 
-    post_round_summary_free_guess(
-        &ctx, &client, &room,
-        round_id, &round_scores_free,
-    ).await;
+    post_round_summary_free_guess(&ctx, &client, &room, round_id, &round_scores_free).await;
 
     {
         let mut st = ctx.state.lock().await;
@@ -397,41 +432,51 @@ pub async fn start_round(
 // ── Single image — free guess ─────────────────────────────────────────────────
 
 async fn play_free_guess(
-    ctx:                 &BotContext,
-    client:              &Client,
-    room:                &Room,
-    round_id:            i64,
-    guess_num:           u32,
-    n_total:             u32,
-    img:                 &GeoImage,
-    round_scores:        &mut HashMap<String, i64>,
-    participants:        &[OwnedUserId],
+    ctx: &BotContext,
+    client: &Client,
+    room: &Room,
+    round_id: i64,
+    guess_num: u32,
+    n_total: u32,
+    img: &GeoImage,
+    round_scores: &mut HashMap<String, i64>,
+    participants: &[OwnedUserId],
     answer_timeout_secs: u64,
 ) -> anyhow::Result<()> {
     let (actual_lat, actual_lon) = match (img.lat, img.lon) {
         (Some(lat), Some(lon)) => (lat, lon),
-        _ => {
-            countries::COUNTRIES.iter()
-                .find(|c| c.name == img.country)
-                .map(|c| (c.lat, c.lon))
-                .unwrap_or((0.0, 0.0))
+        _ => countries::COUNTRIES
+            .iter()
+            .find(|c| c.name == img.country)
+            .map(|c| (c.lat, c.lon))
+            .unwrap_or((0.0, 0.0)),
+    };
+
+    let guess_id = match ctx.db.find_guess_id(round_id, guess_num).await {
+        Some(id) => id,
+        None => {
+            ctx.db
+                .start_guess(
+                    round_id,
+                    guess_num,
+                    &img.country,
+                    &img.region,
+                    img.city.as_deref(),
+                    &img.source,
+                    img.attribution.as_deref(),
+                    &[],
+                    0,
+                    answer_timeout_secs,
+                    Some(actual_lat),
+                    Some(actual_lon),
+                )
+                .await?
         }
     };
 
-    let guess_id = ctx.db
-        .start_guess(
-            round_id, guess_num,
-            &img.country, &img.region, img.city.as_deref(),
-            &img.source, img.attribution.as_deref(),
-            &[], 0,
-            answer_timeout_secs,
-            Some(actual_lat), Some(actual_lon),
-        )
-        .await?;
-
     // Upload all images once; reuse mxc_uris across main room + all DMs.
     let all_images = match upload_all_images(client, img).await {
-        Ok(v)  => v,
+        Ok(v) => v,
         Err(e) => {
             error!("GeoGuessr free-guess: failed to upload image: {e}");
             return Ok(());
@@ -443,15 +488,26 @@ async fn play_free_guess(
     // Post all images to the main room.
     for (i, media) in all_images.iter().enumerate() {
         let label = if i == 0 {
-            if n_imgs == 1 { "📍 Reference location".to_owned() }
-            else           { format!("📍 Reference location (1/{n_imgs})") }
+            if n_imgs == 1 {
+                "📍 Reference location".to_owned()
+            } else {
+                format!("📍 Reference location (1/{n_imgs})")
+            }
         } else {
             format!("📍 Context image ({}/{})", i + 1, n_imgs)
         };
-        room.send(image_content_with_info(label, media.uri.clone(), &media.mime, media.w, media.h, media.size)).await?;
+        room.send(image_content_with_info(
+            label,
+            media.uri.clone(),
+            &media.mime,
+            media.w,
+            media.h,
+            media.size,
+        ))
+        .await?;
     }
 
-    let total_secs  = answer_timeout_secs;
+    let total_secs = answer_timeout_secs;
     let timeout_str = format_duration(total_secs);
 
     // Generate per-player web tokens and post the initial links message.
@@ -461,23 +517,35 @@ async fn play_free_guess(
             {
                 let mut store = ctx.web_tokens.lock().await;
                 for uid in participants {
-                    let lang = ctx.state.lock().await
-                        .user_langs.get(uid.as_str()).cloned()
+                    let lang = ctx
+                        .state
+                        .lock()
+                        .await
+                        .user_langs
+                        .get(uid.as_str())
+                        .cloned()
                         .unwrap_or_else(|| "en".to_owned());
                     let token = crate::web::generate_token();
-                    store.tokens.insert(token.clone(), crate::web::GuessToken {
-                        user_id:   uid.clone(),
-                        round_id,
-                        guess_num,
-                        lang,
-                    });
+                    store.tokens.insert(
+                        token.clone(),
+                        crate::web::GuessToken {
+                            user_id: uid.clone(),
+                            round_id,
+                            guess_num,
+                            lang,
+                        },
+                    );
                     tmap.insert(uid.clone(), token);
                 }
 
-                let links_line = participants.iter().map(|uid| {
-                    let tok = &tmap[uid];
-                    format!("[🗺️ {}]({}/g/{})", uid.localpart(), public_url, tok)
-                }).collect::<Vec<_>>().join("  ·  ");
+                let links_line = participants
+                    .iter()
+                    .map(|uid| {
+                        let tok = &tmap[uid];
+                        format!("[🗺️ {}]({}/g/{})", uid.localpart(), public_url, tok)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("  ·  ");
 
                 if let Ok(ev) = room.send(format::mentionify(&links_line)).await {
                     set_pinned(&room, &ev.response.event_id).await;
@@ -485,7 +553,7 @@ async fn play_free_guess(
                         (round_id, guess_num),
                         crate::web::GuessSession {
                             links_event_id: ev.response.event_id.clone(),
-                            participants:   participants.to_vec(),
+                            participants: participants.to_vec(),
                         },
                     );
                 }
@@ -503,16 +571,21 @@ async fn play_free_guess(
     let q_event = if !web_token_map.is_empty() {
         room.send(format::mentionify(&format!(
             "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}",
-        ))).await?
+        )))
+        .await?
     } else {
         room.send(format::mentionify(&format!(
             "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}\n\
              📍 Where is this? Type: **!guess** city, country, or lat,lon",
-        ))).await?
+        )))
+        .await?
     };
     let q_event_id = q_event.response.event_id.clone();
 
-    ctx.db.set_guess_event_id(guess_id, q_event_id.as_str()).await.ok();
+    ctx.db
+        .set_guess_event_id(guess_id, q_event_id.as_str())
+        .await
+        .ok();
 
     // Register active game.
     {
@@ -520,7 +593,7 @@ async fn play_free_guess(
         *ag = Some(ActiveGame {
             event_id: q_event_id.clone(),
             mode: ActiveGameMode::FreeGuess {
-                guesses:    HashMap::new(),
+                guesses: HashMap::new(),
                 actual_lat,
                 actual_lon,
             },
@@ -532,7 +605,7 @@ async fn play_free_guess(
     // Early-exit: after each tick, check if every DM participant has already submitted.
     let edit_interval = (total_secs / 20).clamp(15, 900);
     let mut remaining = total_secs;
-    let mut all_in    = false;
+    let mut all_in = false;
 
     loop {
         let sleep_secs = remaining.min(edit_interval);
@@ -543,18 +616,24 @@ async fn play_free_guess(
         if !participants.is_empty() {
             let ag = ctx.active_game.lock().await;
             if let Some(ActiveGame {
-                mode: ActiveGameMode::FreeGuess { ref guesses, .. }, ..
+                mode: ActiveGameMode::FreeGuess { ref guesses, .. },
+                ..
             }) = *ag
             {
-                if participants.iter().all(|uid| guesses.contains_key(uid.as_str())) {
+                if participants
+                    .iter()
+                    .all(|uid| guesses.contains_key(uid.as_str()))
+                {
                     all_in = true;
                 }
             }
         }
 
-        if all_in || remaining == 0 { break; }
+        if all_in || remaining == 0 {
+            break;
+        }
 
-        let bar      = time_bar(remaining, total_secs);
+        let bar = time_bar(remaining, total_secs);
         let time_str = format_duration(remaining);
         let edit_msg = if !web_token_map.is_empty() {
             format::mentionify(&format!(
@@ -567,8 +646,8 @@ async fn play_free_guess(
             ))
         };
         if let Some(r) = client.get_room(&ctx.room_id) {
-            let edit = edit_msg
-                .make_replacement(ReplacementMetadata::new(q_event_id.clone(), None));
+            let edit =
+                edit_msg.make_replacement(ReplacementMetadata::new(q_event_id.clone(), None));
             r.send(edit).await.ok();
         }
     }
@@ -594,7 +673,9 @@ async fn play_free_guess(
     // Clear web tokens for this guess so the links expire immediately.
     if !web_token_map.is_empty() {
         let mut store = ctx.web_tokens.lock().await;
-        store.tokens.retain(|_, t| !(t.round_id == round_id && t.guess_num == guess_num));
+        store
+            .tokens
+            .retain(|_, t| !(t.round_id == round_id && t.guess_num == guess_num));
         store.sessions.remove(&(round_id, guess_num));
     }
 
@@ -603,7 +684,7 @@ async fn play_free_guess(
     let mut scored: Vec<(String, FreeGuess, f64, i64)> = guesses
         .into_iter()
         .map(|(uid, guess)| {
-            let dist  = haversine_km(guess.lat, guess.lon, actual_lat, actual_lon);
+            let dist = haversine_km(guess.lat, guess.lon, actual_lat, actual_lon);
             let score = distance_score(dist, half_life);
             (uid, guess, dist, score)
         })
@@ -618,11 +699,11 @@ async fn play_free_guess(
 
     let db_rows: Vec<(String, String, f64, f64, f64, i64)> = scored
         .iter()
-        .map(|(uid, g, dist, score)| {
-            (uid.clone(), g.text.clone(), g.lat, g.lon, *dist, *score)
-        })
+        .map(|(uid, g, dist, score)| (uid.clone(), g.text.clone(), g.lat, g.lon, *dist, *score))
         .collect();
-    ctx.db.record_free_guess_answers(guess_id, round_id, db_rows).await?;
+    ctx.db
+        .record_free_guess_answers(guess_id, round_id, db_rows)
+        .await?;
     ctx.db.finish_guess(guess_id, n_answers, 0).await?;
 
     for (uid, _, _, score) in &scored {
@@ -630,20 +711,26 @@ async fn play_free_guess(
     }
 
     let user_ids: Vec<&str> = scored.iter().map(|(uid, _, _, _)| uid.as_str()).collect();
-    let names        = fetch_names(room, &user_ids).await;
-    let raw_avatars  = crate::avatar::fetch_player_avatars(room, &user_ids).await;
+    let names = fetch_names(room, &user_ids).await;
+    let raw_avatars = crate::avatar::fetch_player_avatars(room, &user_ids).await;
     // Build data: URLs from the already-downloaded avatar bytes so reveal.html
     // can show real photos without needing authenticated media access.
-    let avatar_mxcs: HashMap<String, String> = raw_avatars.iter()
+    let avatar_mxcs: HashMap<String, String> = raw_avatars
+        .iter()
         .filter_map(|(uid, bytes)| {
-            crate::avatar::avatar_bytes_to_data_url(bytes)
-                .map(|url| (uid.clone(), url))
+            crate::avatar::avatar_bytes_to_data_url(bytes).map(|url| (uid.clone(), url))
         })
         .collect();
     post_reveal_free_guess(
-        ctx, client, img,
-        actual_lat, actual_lon,
-        &scored, &names, &raw_avatars, &avatar_mxcs,
+        ctx,
+        client,
+        img,
+        actual_lat,
+        actual_lon,
+        &scored,
+        &names,
+        &raw_avatars,
+        &avatar_mxcs,
     )
     .await;
 
@@ -651,19 +738,19 @@ async fn play_free_guess(
 }
 
 async fn post_reveal_free_guess(
-    ctx:         &BotContext,
-    client:      &Client,
-    img:         &GeoImage,
-    actual_lat:  f64,
-    actual_lon:  f64,
-    scored:      &[(String, FreeGuess, f64, i64)],
-    names:       &HashMap<String, String>,
+    ctx: &BotContext,
+    client: &Client,
+    img: &GeoImage,
+    actual_lat: f64,
+    actual_lon: f64,
+    scored: &[(String, FreeGuess, f64, i64)],
+    names: &HashMap<String, String>,
     raw_avatars: &HashMap<String, Vec<u8>>,
     avatar_mxcs: &HashMap<String, String>,
 ) {
     let location_str = match &img.city {
         Some(city) => format!("{}, {}", city, img.country),
-        None       => img.country.clone(),
+        None => img.country.clone(),
     };
 
     let maps_url = format!(
@@ -673,21 +760,41 @@ async fn post_reveal_free_guess(
 
     // ── Reverse-geocode each guess for human-readable labels ─────────────────
     // overview_entries: (uid, lat, lon, r, g, b, score, dist_km, mxc_url)
-    let mut guess_labels:     Vec<String>                                        = Vec::with_capacity(scored.len());
-    let mut overview_entries: Vec<(&str, f64, f64, u8, u8, u8, i64, f64, String)> = Vec::with_capacity(scored.len());
+    let mut guess_labels: Vec<String> = Vec::with_capacity(scored.len());
+    let mut overview_entries: Vec<(&str, f64, f64, u8, u8, u8, i64, f64, String)> =
+        Vec::with_capacity(scored.len());
     for (i, (uid, guess, dist, score)) in scored.iter().enumerate() {
         let (r, g, b, _) = crate::mapimage::PLAYER_COLORS[i % crate::mapimage::PLAYER_COLORS.len()];
         let mxc = avatar_mxcs.get(uid.as_str()).cloned().unwrap_or_default();
         let map_url = build_guess_map_url(
             display_name(names, uid),
-            guess.lat, guess.lon, actual_lat, actual_lon, r, g, b, "en",
-            &mxc, *score, *dist,
+            guess.lat,
+            guess.lon,
+            actual_lat,
+            actual_lon,
+            r,
+            g,
+            b,
+            "en",
+            &mxc,
+            *score,
+            *dist,
         );
         let label = crate::geocode::reverse_geocode(guess.lat, guess.lon, "en")
             .await
             .unwrap_or_else(|| format!("{:.2}, {:.2}", guess.lat, guess.lon));
         guess_labels.push(format!("[{label}]({map_url})"));
-        overview_entries.push((uid.as_str(), guess.lat, guess.lon, r, g, b, *score, *dist, mxc));
+        overview_entries.push((
+            uid.as_str(),
+            guess.lat,
+            guess.lon,
+            r,
+            g,
+            b,
+            *score,
+            *dist,
+            mxc,
+        ));
     }
 
     // ── Build "all guesses" overview map URL ──────────────────────────────────
@@ -698,9 +805,16 @@ async fn post_reveal_free_guess(
     };
 
     // ── Main-room reveal ──────────────────────────────────────────────────────
-    let header_map_label = if scored.is_empty() { "Map" } else { "All guesses" };
+    let header_map_label = if scored.is_empty() {
+        "Map"
+    } else {
+        "All guesses"
+    };
     let mut lines = vec![
-        format!("📍 **{}** [{header_map_label}]({})", location_str, overview_url),
+        format!(
+            "📍 **{}** [{header_map_label}]({})",
+            location_str, overview_url
+        ),
         String::new(),
     ];
 
@@ -710,7 +824,12 @@ async fn post_reveal_free_guess(
         for (i, ((uid, _guess, dist, score), guess_link)) in
             scored.iter().zip(guess_labels.iter()).enumerate()
         {
-            let medal    = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
+            let medal = match i {
+                0 => "🥇",
+                1 => "🥈",
+                2 => "🥉",
+                _ => "  ",
+            };
             let dist_str = format_dist(*dist);
             lines.push(format!(
                 "{medal} {} · {guess_link} · {} · {} pts",
@@ -739,7 +858,12 @@ async fn post_reveal_free_guess(
                     String::new(),
                 ];
                 for (i, (uid, _guess, dist, score)) in scored.iter().enumerate() {
-                    let medal    = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
+                    let medal = match i {
+                        0 => "🥇",
+                        1 => "🥈",
+                        2 => "🥉",
+                        _ => "  ",
+                    };
                     let dist_str = format_dist(*dist);
                     sl.push(format!("{medal} {} · {} · {} pts", uid, dist_str, score));
                 }
@@ -748,12 +872,13 @@ async fn post_reveal_free_guess(
             let summary = make_summary(&overview_url);
             let summary = if summary.len() > MATRIX_SPLIT_THRESHOLD {
                 // Last resort: rebuild overview URL without avatars.
-                let stripped: Vec<(&str, f64, f64, u8, u8, u8, i64, f64, String)> = overview_entries
-                    .iter()
-                    .map(|(uid, lat, lon, r, g, b, score, dist, _)| {
-                        (*uid, *lat, *lon, *r, *g, *b, *score, *dist, String::new())
-                    })
-                    .collect();
+                let stripped: Vec<(&str, f64, f64, u8, u8, u8, i64, f64, String)> =
+                    overview_entries
+                        .iter()
+                        .map(|(uid, lat, lon, r, g, b, score, dist, _)| {
+                            (*uid, *lat, *lon, *r, *g, *b, *score, *dist, String::new())
+                        })
+                        .collect();
                 let slim_url = build_all_guesses_map_url(&stripped, actual_lat, actual_lon, names);
                 make_summary(&slim_url)
             } else {
@@ -762,12 +887,22 @@ async fn post_reveal_free_guess(
             r.send(format::mentionify(&summary)).await.ok();
 
             // Build all individual map links as one block of text.
-            let link_lines: Vec<String> = scored.iter().zip(guess_labels.iter())
+            let link_lines: Vec<String> = scored
+                .iter()
+                .zip(guess_labels.iter())
                 .enumerate()
                 .map(|(i, ((uid, _guess, dist, score), guess_link))| {
-                    let medal    = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
+                    let medal = match i {
+                        0 => "🥇",
+                        1 => "🥈",
+                        2 => "🥉",
+                        _ => "  ",
+                    };
                     let dist_str = format_dist(*dist);
-                    format!("{medal} {} · {guess_link} · {} · {} pts", uid, dist_str, score)
+                    format!(
+                        "{medal} {} · {guess_link} · {} · {} pts",
+                        uid, dist_str, score
+                    )
                 })
                 .collect();
             let links_text = link_lines.join("\n");
@@ -792,7 +927,9 @@ async fn post_reveal_free_guess(
         let (g_lat, g_lon, d) = (winner_guess.lat, winner_guess.lon, *winner_dist);
         if let Ok(Some(png)) = tokio::task::spawn_blocking(move || {
             let pin = crate::avatar::render_avatar_pin(winner_raw.as_deref(), pr, pg, pb);
-            crate::mapimage::render_guess_map(g_lat, g_lon, actual_lat, actual_lon, d, pin, pr, pg, pb)
+            crate::mapimage::render_guess_map(
+                g_lat, g_lon, actual_lat, actual_lon, d, pin, pr, pg, pb,
+            )
         })
         .await
         {
@@ -801,7 +938,16 @@ async fn post_reveal_free_guess(
             if let Ok(resp) = client.media().upload(&map_mime, png, None).await {
                 let label = format!("🥇 Best guess · {} away", format_dist(d));
                 if let Some(r) = client.get_room(&ctx.room_id) {
-                    r.send(image_content_with_info(label, resp.content_uri, &map_mime, w, h, size)).await.ok();
+                    r.send(image_content_with_info(
+                        label,
+                        resp.content_uri,
+                        &map_mime,
+                        w,
+                        h,
+                        size,
+                    ))
+                    .await
+                    .ok();
                 }
             }
         }
@@ -815,7 +961,12 @@ async fn post_reveal_free_guess(
             .iter()
             .map(|(uid, guess, _, _)| {
                 let raw = raw_avatars.get(uid.as_str()).cloned();
-                (display_name(names, uid).to_owned(), guess.lat, guess.lon, raw)
+                (
+                    display_name(names, uid).to_owned(),
+                    guess.lat,
+                    guess.lon,
+                    raw,
+                )
             })
             .collect();
 
@@ -827,9 +978,7 @@ async fn post_reveal_free_guess(
                 .enumerate()
                 .map(|(idx, (name, lat, lon, raw))| {
                     let (pr, pg, pb, _) = PLAYER_COLORS[idx % PLAYER_COLORS.len()];
-                    let pin = crate::avatar::render_avatar_pin(
-                        raw.as_deref(), pr, pg, pb,
-                    );
+                    let pin = crate::avatar::render_avatar_pin(raw.as_deref(), pr, pg, pb);
                     (name, lat, lon, pin)
                 })
                 .collect();
@@ -842,7 +991,16 @@ async fn post_reveal_free_guess(
             if let Ok(resp) = client.media().upload(&map_mime, png, None).await {
                 let label = format!("🗺️ All {} guesses this round", scored.len());
                 if let Some(r) = client.get_room(&ctx.room_id) {
-                    r.send(image_content_with_info(label, resp.content_uri, &map_mime, w, h, size)).await.ok();
+                    r.send(image_content_with_info(
+                        label,
+                        resp.content_uri,
+                        &map_mime,
+                        w,
+                        h,
+                        size,
+                    ))
+                    .await
+                    .ok();
 
                     // Legend: 🔵 @alice:s  🔴 @bob:s  ⬛ actual
                     let mut parts: Vec<String> = scored
@@ -851,26 +1009,26 @@ async fn post_reveal_free_guess(
                         .map(|((uid, _, _, _), (_, emoji))| format!("{} {}", emoji, uid))
                         .collect();
                     parts.push("⬛ actual location".to_owned());
-                    r.send(format::mentionify(&parts.join("   ")))
-                        .await
-                        .ok();
+                    r.send(format::mentionify(&parts.join("   "))).await.ok();
                 }
             }
         }
     }
-
 }
 
 async fn post_round_summary_free_guess(
-    ctx:      &BotContext,
-    client:   &Client,
-    _room:    &Room,
+    ctx: &BotContext,
+    client: &Client,
+    _room: &Room,
     round_id: i64,
-    scores:   &HashMap<String, i64>,
+    scores: &HashMap<String, i64>,
 ) {
     if scores.is_empty() {
         if let Some(r) = client.get_room(&ctx.room_id) {
-            if let Ok(ev) = r.send(format::mentionify("🌍 Round over · nobody played.")).await {
+            if let Ok(ev) = r
+                .send(format::mentionify("🌍 Round over · nobody played."))
+                .await
+            {
                 set_pinned(&r, &ev.response.event_id).await;
             }
         }
@@ -879,7 +1037,7 @@ async fn post_round_summary_free_guess(
 
     // ── Round results (this round only) ──────────────────────────────────────
     let n_guesses = ctx.effective_guesses_per_round().await;
-    let max_pts   = 5000i64 * n_guesses as i64;
+    let max_pts = 5000i64 * n_guesses as i64;
 
     // Fetch per-user stats for this round from DB.
     let round_stats = ctx.db.round_stats(round_id).await.unwrap_or_default();
@@ -887,7 +1045,10 @@ async fn post_round_summary_free_guess(
     const BAR_W: usize = 10;
 
     let mut lines = vec![
-        format!("🌍 **Round over!** {} guess(es) · max {} pts", n_guesses, max_pts),
+        format!(
+            "🌍 **Round over!** {} guess(es) · max {} pts",
+            n_guesses, max_pts
+        ),
         String::new(),
     ];
 
@@ -896,30 +1057,61 @@ async fn post_round_summary_free_guess(
     ranking.sort_by(|a, b| {
         b.1.cmp(&a.1)
             .then_with(|| {
-                let da = round_stats.iter().find(|e| e.user_id == a.0).map(|e| e.avg_distance_km).unwrap_or(f64::MAX);
-                let db = round_stats.iter().find(|e| e.user_id == b.0).map(|e| e.avg_distance_km).unwrap_or(f64::MAX);
+                let da = round_stats
+                    .iter()
+                    .find(|e| e.user_id == a.0)
+                    .map(|e| e.avg_distance_km)
+                    .unwrap_or(f64::MAX);
+                let db = round_stats
+                    .iter()
+                    .find(|e| e.user_id == b.0)
+                    .map(|e| e.avg_distance_km)
+                    .unwrap_or(f64::MAX);
                 da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
             })
             .then(a.0.cmp(&b.0))
     });
 
     for (i, (uid, score)) in ranking.iter().enumerate() {
-        let medal = match i { 0 => "🥇", 1 => "🥈", 2 => "🥉", _ => "  " };
+        let medal = match i {
+            0 => "🥇",
+            1 => "🥈",
+            2 => "🥉",
+            _ => "  ",
+        };
 
         // Bar: fraction of max possible score.
         let filled = ((*score as f64 / max_pts as f64) * BAR_W as f64).round() as usize;
-        let bar    = format!("{}{}", "█".repeat(filled.min(BAR_W)), "░".repeat(BAR_W - filled.min(BAR_W)));
+        let bar = format!(
+            "{}{}",
+            "█".repeat(filled.min(BAR_W)),
+            "░".repeat(BAR_W - filled.min(BAR_W))
+        );
 
-        let pts_per_guess = if n_guesses > 0 { score / n_guesses as i64 } else { 0 };
+        let pts_per_guess = if n_guesses > 0 {
+            score / n_guesses as i64
+        } else {
+            0
+        };
 
         // Distance stats from DB if available for this user.
         let (avg_dist, best_dist) = round_stats
             .iter()
             .find(|e| e.user_id == *uid)
-            .map(|e| (format_dist(e.avg_distance_km), format_dist(e.best_distance_km)))
+            .map(|e| {
+                (
+                    format_dist(e.avg_distance_km),
+                    format_dist(e.best_distance_km),
+                )
+            })
             .unwrap_or_else(|| ("n/a".to_owned(), "n/a".to_owned()));
 
-        lines.push(format!("{medal} {:>2}. {} : {} pts/guess", i + 1, uid, pts_per_guess));
+        lines.push(format!(
+            "{medal} {:>2}. {} : {} pts/guess",
+            i + 1,
+            uid,
+            pts_per_guess
+        ));
         lines.push(format!("      {bar}  ⌀ {}  🏅 {}", avg_dist, best_dist));
     }
 
@@ -976,12 +1168,16 @@ pub async fn geocode(query: &str) -> Option<(f64, f64)> {
     }
 
     // Percent-encode at the byte level (correct for UTF-8 multibyte chars).
-    let encoded: String = query.bytes().map(|b| match b {
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-        | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-        b' ' => '+'.to_string(),
-        _    => format!("%{:02X}", b),
-    }).collect();
+    let encoded: String = query
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            b' ' => '+'.to_string(),
+            _ => format!("%{:02X}", b),
+        })
+        .collect();
 
     let url = format!(
         "https://nominatim.openstreetmap.org/search?q={encoded}&format=json&limit=1&addressdetails=1"
@@ -1039,32 +1235,32 @@ const JOIN_REACTION_FLAGS: &[&str] = &["🇬🇧", "🇩🇪", "🇺🇦", "🇫
 pub fn flag_to_lang(flag: &str) -> Option<&'static str> {
     match flag {
         "🇬🇧" | "🇺🇸" | "🇦🇺" | "🇨🇦" | "🇮🇪" | "🇳🇿" => Some("en"),
-        "🇩🇪" | "🇦🇹"                                    => Some("de"),
-        "🇺🇦"                                            => Some("uk"),
-        "🇫🇷" | "🇧🇪" | "🇲🇨"                           => Some("fr"),
-        "🇪🇸" | "🇲🇽" | "🇦🇷" | "🇨🇴" | "🇨🇱"          => Some("es"),
-        "🇷🇺" | "🇧🇾"                                    => Some("ru"),
-        "🇮🇹" | "🇸🇲"                                    => Some("it"),
-        "🇵🇱"                                            => Some("pl"),
-        "🇳🇱"                                            => Some("nl"),
-        "🇵🇹" | "🇧🇷"                                    => Some("pt"),
-        "🇯🇵"                                            => Some("ja"),
-        "🇨🇳" | "🇹🇼" | "🇭🇰"                           => Some("zh"),
-        "🇸🇦" | "🇦🇪" | "🇪🇬" | "🇲🇦" | "🇩🇿"          => Some("ar"),
-        "🇹🇷"                                            => Some("tr"),
-        "🇸🇪"                                            => Some("sv"),
-        "🇫🇮"                                            => Some("fi"),
-        "🇩🇰"                                            => Some("da"),
-        "🇨🇿"                                            => Some("cs"),
-        "🇭🇺"                                            => Some("hu"),
-        "🇷🇴"                                            => Some("ro"),
-        "🇬🇷"                                            => Some("el"),
-        "🇮🇱"                                            => Some("he"),
-        "🇰🇷"                                            => Some("ko"),
-        "🇹🇭"                                            => Some("th"),
-        "🇻🇳"                                            => Some("vi"),
-        "🇮🇩" | "🇲🇾"                                   => Some("id"),
-        _                                                => None,
+        "🇩🇪" | "🇦🇹" => Some("de"),
+        "🇺🇦" => Some("uk"),
+        "🇫🇷" | "🇧🇪" | "🇲🇨" => Some("fr"),
+        "🇪🇸" | "🇲🇽" | "🇦🇷" | "🇨🇴" | "🇨🇱" => Some("es"),
+        "🇷🇺" | "🇧🇾" => Some("ru"),
+        "🇮🇹" | "🇸🇲" => Some("it"),
+        "🇵🇱" => Some("pl"),
+        "🇳🇱" => Some("nl"),
+        "🇵🇹" | "🇧🇷" => Some("pt"),
+        "🇯🇵" => Some("ja"),
+        "🇨🇳" | "🇹🇼" | "🇭🇰" => Some("zh"),
+        "🇸🇦" | "🇦🇪" | "🇪🇬" | "🇲🇦" | "🇩🇿" => Some("ar"),
+        "🇹🇷" => Some("tr"),
+        "🇸🇪" => Some("sv"),
+        "🇫🇮" => Some("fi"),
+        "🇩🇰" => Some("da"),
+        "🇨🇿" => Some("cs"),
+        "🇭🇺" => Some("hu"),
+        "🇷🇴" => Some("ro"),
+        "🇬🇷" => Some("el"),
+        "🇮🇱" => Some("he"),
+        "🇰🇷" => Some("ko"),
+        "🇹🇭" => Some("th"),
+        "🇻🇳" => Some("vi"),
+        "🇮🇩" | "🇲🇾" => Some("id"),
+        _ => None,
     }
 }
 
@@ -1072,15 +1268,32 @@ pub fn flag_to_lang(flag: &str) -> Option<&'static str> {
 /// Accepts lowercase codes; returns `None` for unsupported codes.
 pub fn text_code_to_lang(code: &str) -> Option<&'static str> {
     match code {
-        "en" => Some("en"), "de" => Some("de"), "uk" => Some("uk"),
-        "fr" => Some("fr"), "es" => Some("es"), "ru" => Some("ru"),
-        "it" => Some("it"), "pl" => Some("pl"), "nl" => Some("nl"),
-        "pt" => Some("pt"), "ja" => Some("ja"), "zh" => Some("zh"),
-        "ar" => Some("ar"), "tr" => Some("tr"), "sv" => Some("sv"),
-        "fi" => Some("fi"), "da" => Some("da"), "cs" => Some("cs"),
-        "hu" => Some("hu"), "ro" => Some("ro"), "el" => Some("el"),
-        "he" => Some("he"), "ko" => Some("ko"), "th" => Some("th"),
-        "vi" => Some("vi"), "id" => Some("id"),
+        "en" => Some("en"),
+        "de" => Some("de"),
+        "uk" => Some("uk"),
+        "fr" => Some("fr"),
+        "es" => Some("es"),
+        "ru" => Some("ru"),
+        "it" => Some("it"),
+        "pl" => Some("pl"),
+        "nl" => Some("nl"),
+        "pt" => Some("pt"),
+        "ja" => Some("ja"),
+        "zh" => Some("zh"),
+        "ar" => Some("ar"),
+        "tr" => Some("tr"),
+        "sv" => Some("sv"),
+        "fi" => Some("fi"),
+        "da" => Some("da"),
+        "cs" => Some("cs"),
+        "hu" => Some("hu"),
+        "ro" => Some("ro"),
+        "el" => Some("el"),
+        "he" => Some("he"),
+        "ko" => Some("ko"),
+        "th" => Some("th"),
+        "vi" => Some("vi"),
+        "id" => Some("id"),
         _ => None,
     }
 }
@@ -1088,29 +1301,46 @@ pub fn text_code_to_lang(code: &str) -> Option<&'static str> {
 /// Human-readable name for a BCP-47 language code.
 pub fn lang_label(code: &str) -> &'static str {
     match code {
-        "en" => "English",  "de" => "German",     "uk" => "Ukrainian",
-        "fr" => "French",   "es" => "Spanish",    "ru" => "Russian",
-        "it" => "Italian",  "pl" => "Polish",     "nl" => "Dutch",
-        "pt" => "Portuguese","ja" => "Japanese",  "zh" => "Chinese",
-        "ar" => "Arabic",   "tr" => "Turkish",    "sv" => "Swedish",
-        "fi" => "Finnish",  "da" => "Danish",     "cs" => "Czech",
-        "hu" => "Hungarian","ro" => "Romanian",   "el" => "Greek",
-        "he" => "Hebrew",   "ko" => "Korean",     "th" => "Thai",
-        "vi" => "Vietnamese","id" => "Indonesian",
+        "en" => "English",
+        "de" => "German",
+        "uk" => "Ukrainian",
+        "fr" => "French",
+        "es" => "Spanish",
+        "ru" => "Russian",
+        "it" => "Italian",
+        "pl" => "Polish",
+        "nl" => "Dutch",
+        "pt" => "Portuguese",
+        "ja" => "Japanese",
+        "zh" => "Chinese",
+        "ar" => "Arabic",
+        "tr" => "Turkish",
+        "sv" => "Swedish",
+        "fi" => "Finnish",
+        "da" => "Danish",
+        "cs" => "Czech",
+        "hu" => "Hungarian",
+        "ro" => "Romanian",
+        "el" => "Greek",
+        "he" => "Hebrew",
+        "ko" => "Korean",
+        "th" => "Thai",
+        "vi" => "Vietnamese",
+        "id" => "Indonesian",
         _ => "unknown",
     }
 }
 
 async fn reconcile_join_reactions(
-    client:        &Client,
-    room:          &Room,
+    client: &Client,
+    room: &Room,
     join_event_id: &OwnedEventId,
-    bot_user_id:   Option<&matrix_sdk::ruma::UserId>,
-    participants:  &mut HashSet<OwnedUserId>,
+    bot_user_id: Option<&matrix_sdk::ruma::UserId>,
+    participants: &mut HashSet<OwnedUserId>,
 ) {
     use matrix_sdk::ruma::{
         api::client::relations::get_relating_events_with_rel_type_and_event_type::v1 as api,
-        events::{AnyMessageLikeEvent, TimelineEventType, relation::RelationType},
+        events::{relation::RelationType, AnyMessageLikeEvent, TimelineEventType},
     };
 
     let mut from: Option<String> = None;
@@ -1125,16 +1355,22 @@ async fn reconcile_join_reactions(
         match client.send(req).await {
             Ok(resp) => {
                 for raw in &resp.chunk {
-                    let Ok(AnyMessageLikeEvent::Reaction(ev)) = raw.deserialize() else { continue };
-                    let Some(orig) = ev.as_original() else { continue };
-                    if bot_user_id.map(|b| b == orig.sender).unwrap_or(false) { continue; }
+                    let Ok(AnyMessageLikeEvent::Reaction(ev)) = raw.deserialize() else {
+                        continue;
+                    };
+                    let Some(orig) = ev.as_original() else {
+                        continue;
+                    };
+                    if bot_user_id.map(|b| b == orig.sender).unwrap_or(false) {
+                        continue;
+                    }
                     if flag_to_lang(&orig.content.relates_to.key).is_some() {
                         participants.insert(orig.sender.clone());
                     }
                 }
                 match resp.next_batch {
                     Some(t) => from = Some(t),
-                    None    => break,
+                    None => break,
                 }
             }
             Err(e) => {
@@ -1150,16 +1386,13 @@ async fn reconcile_join_reactions(
 /// Upload the primary image and all extra images.
 /// Returns a vec of `UploadedMedia` — primary first.
 /// Extra images that fail to upload are silently skipped (logged as warnings).
-async fn upload_all_images(
-    client: &Client,
-    img:    &GeoImage,
-) -> anyhow::Result<Vec<UploadedMedia>> {
+async fn upload_all_images(client: &Client, img: &GeoImage) -> anyhow::Result<Vec<UploadedMedia>> {
     let primary = upload_image(client, img).await?;
     let mut results = vec![primary];
 
     for url in &img.extra_image_urls {
         match upload_http_url(client, url).await {
-            Ok(r)  => results.push(r),
+            Ok(r) => results.push(r),
             Err(e) => warn!("GeoGuessr: failed to upload extra image: {e}"),
         }
     }
@@ -1167,10 +1400,7 @@ async fn upload_all_images(
 }
 
 /// Download an image from an HTTP(S) URL and upload it to the Matrix media store.
-async fn upload_http_url(
-    client: &Client,
-    url:    &str,
-) -> anyhow::Result<UploadedMedia> {
+async fn upload_http_url(client: &Client, url: &str) -> anyhow::Result<UploadedMedia> {
     let resp = reqwest::Client::builder()
         .user_agent("geoguessr-bot/0.1")
         .build()?
@@ -1192,13 +1422,16 @@ async fn upload_http_url(
     let (w, h) = image_dimensions(&data);
     let size = data.len();
     let response = client.media().upload(&mime, data, None).await?;
-    Ok(UploadedMedia { uri: response.content_uri, mime, w, h, size })
+    Ok(UploadedMedia {
+        uri: response.content_uri,
+        mime,
+        w,
+        h,
+        size,
+    })
 }
 
-async fn upload_image(
-    client: &Client,
-    img:    &GeoImage,
-) -> anyhow::Result<UploadedMedia> {
+async fn upload_image(client: &Client, img: &GeoImage) -> anyhow::Result<UploadedMedia> {
     if img.image_url.starts_with('/') || img.image_url.starts_with("file://") {
         let path = img.image_url.trim_start_matches("file://");
         let data = tokio::fs::read(path).await?;
@@ -1206,16 +1439,26 @@ async fn upload_image(
         let (w, h) = image_dimensions(&data);
         let size = data.len();
         let response = client.media().upload(&mime, data, None).await?;
-        Ok(UploadedMedia { uri: response.content_uri, mime, w, h, size })
+        Ok(UploadedMedia {
+            uri: response.content_uri,
+            mime,
+            w,
+            h,
+            size,
+        })
     } else {
         upload_http_url(client, &img.image_url).await
     }
 }
 
 fn detect_mime(data: &[u8]) -> mime::Mime {
-    if data.starts_with(b"\x89PNG")     { mime::IMAGE_PNG }
-    else if data.starts_with(b"\xff\xd8\xff") { mime::IMAGE_JPEG }
-    else                                { mime::IMAGE_JPEG }
+    if data.starts_with(b"\x89PNG") {
+        mime::IMAGE_PNG
+    } else if data.starts_with(b"\xff\xd8\xff") {
+        mime::IMAGE_JPEG
+    } else {
+        mime::IMAGE_JPEG
+    }
 }
 
 /// Extract pixel dimensions from image bytes without full decode.
@@ -1234,15 +1477,21 @@ fn image_dimensions(data: &[u8]) -> (u32, u32) {
 /// the event to the image renderer; without it they fall back to plain text body.
 fn image_content_with_info(
     label: String,
-    uri:   OwnedMxcUri,
-    mime:  &mime::Mime,
-    w:     u32,
-    h:     u32,
-    size:  usize,
+    uri: OwnedMxcUri,
+    mime: &mime::Mime,
+    w: u32,
+    h: u32,
+    size: usize,
 ) -> RoomMessageEventContent {
     let ext = match mime.subtype().as_str() {
         "jpeg" => ".jpg",
-        sub    => if matches!(sub, "png" | "webp" | "gif") { &format!(".{sub}") } else { "" },
+        sub => {
+            if matches!(sub, "png" | "webp" | "gif") {
+                &format!(".{sub}")
+            } else {
+                ""
+            }
+        }
     };
     // Per Matrix spec: when `filename` differs from `body`, clients render
     // `body` as a visible caption and use `filename` only as the download name.
@@ -1251,12 +1500,16 @@ fn image_content_with_info(
 
     let mut info = ImageInfo::new();
     info.mimetype = Some(mime.to_string());
-    info.width    = if w > 0    { UInt::new(w as u64)    } else { None };
-    info.height   = if h > 0    { UInt::new(h as u64)    } else { None };
-    info.size     = if size > 0 { UInt::new(size as u64) } else { None };
+    info.width = if w > 0 { UInt::new(w as u64) } else { None };
+    info.height = if h > 0 { UInt::new(h as u64) } else { None };
+    info.size = if size > 0 {
+        UInt::new(size as u64)
+    } else {
+        None
+    };
     let mut content = ImageMessageEventContent::plain(label, uri);
     content.filename = Some(safe_filename);
-    content.info     = Some(Box::new(info));
+    content.info = Some(Box::new(info));
     RoomMessageEventContent::new(MessageType::Image(content))
 }
 
@@ -1264,7 +1517,7 @@ fn image_content_with_info(
 
 fn time_bar(remaining: u64, total: u64) -> String {
     const W: usize = 10;
-    let denom  = total.max(1);
+    let denom = total.max(1);
     let filled = ((remaining.min(denom) * W as u64) / denom) as usize;
     format!("{}{}", "█".repeat(filled), "░".repeat(W - filled))
 }
@@ -1275,11 +1528,19 @@ pub fn format_duration(secs: u64) -> String {
     if secs >= 3600 {
         let h = secs / 3600;
         let m = (secs % 3600) / 60;
-        if m == 0 { format!("{h}h") } else { format!("{h}h {m}m") }
+        if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h {m}m")
+        }
     } else if secs >= 60 {
         let m = secs / 60;
         let s = secs % 60;
-        if s == 0 { format!("{m}m") } else { format!("{m}m {s}s") }
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m {s}s")
+        }
     } else {
         format!("{secs}s")
     }
@@ -1299,9 +1560,9 @@ pub fn format_duration(secs: u64) -> String {
 /// browser's `DecompressionStream('deflate-raw')` API.  Base64url (no padding)
 /// keeps the fragment URL-safe without further percent-encoding.
 fn compress_to_hash(params: &str) -> String {
-    use flate2::{Compression, write::DeflateEncoder};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use flate2::{write::DeflateEncoder, Compression};
     use std::io::Write as _;
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
     let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
     enc.write_all(params.as_bytes()).expect("deflate write");
@@ -1316,14 +1577,18 @@ fn compress_to_hash(params: &str) -> String {
 /// `glat`/`glon` handling needed.  The `mxc` data: URL is included raw (no
 /// percent-encoding) because it never contains `|` or `&`.
 fn build_guess_map_url(
-    name:       &str,
-    guess_lat:  f64, guess_lon:  f64,
-    actual_lat: f64, actual_lon: f64,
-    r: u8, g: u8, b: u8,
-    lang:       &str,
-    mxc:        &str,
-    score:      i64,
-    dist_km:    f64,
+    name: &str,
+    guess_lat: f64,
+    guess_lon: f64,
+    actual_lat: f64,
+    actual_lon: f64,
+    r: u8,
+    g: u8,
+    b: u8,
+    lang: &str,
+    mxc: &str,
+    score: i64,
+    dist_km: f64,
 ) -> String {
     let enc_name = url_encode_component(name);
     let params = format!(
@@ -1345,10 +1610,10 @@ fn build_guess_map_url(
 /// JPEG q=55 ≈ 0.5–1 KB each).
 /// Entry tuple: (uid, lat, lon, r, g, b, score, dist_km, mxc_data_url)
 fn build_all_guesses_map_url(
-    entries:    &[(&str, f64, f64, u8, u8, u8, i64, f64, String)],
+    entries: &[(&str, f64, f64, u8, u8, u8, i64, f64, String)],
     actual_lat: f64,
     actual_lon: f64,
-    names:      &HashMap<String, String>,
+    names: &HashMap<String, String>,
 ) -> String {
     let mut params = format!("lang=en&alat={actual_lat:.4}&alon={actual_lon:.4}");
     for (uid, lat, lon, r, g, b, score, dist, mxc) in entries {
@@ -1370,9 +1635,12 @@ fn url_encode_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            _ => { let _ = write!(out, "%{b:02X}"); }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
         }
     }
     out
@@ -1388,11 +1656,11 @@ async fn set_pinned(room: &Room, event_id: &OwnedEventId) {
 }
 
 fn display_name<'a>(names: &'a HashMap<String, String>, uid: &'a str) -> &'a str {
-    names.get(uid).map(|s| s.as_str()).unwrap_or_else(|| {
-        uid.split(':').next().unwrap_or("").trim_start_matches('@')
-    })
+    names
+        .get(uid)
+        .map(|s| s.as_str())
+        .unwrap_or_else(|| uid.split(':').next().unwrap_or("").trim_start_matches('@'))
 }
-
 
 async fn fetch_names(room: &Room, user_ids: &[&str]) -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -1422,24 +1690,27 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
     {
         let mut st = ctx.state.lock().await;
         let before = st.cached_guesses.len();
-        st.cached_guesses.retain(|img| {
-            match img.lat.zip(img.lon) {
-                None => true,
-                Some((lat, lon)) =>
-                    crate::sources::min_dist_to_existing(lat, lon, &db_coords)
-                        >= crate::sources::MIN_DISTANCE_KM,
+        st.cached_guesses.retain(|img| match img.lat.zip(img.lon) {
+            None => true,
+            Some((lat, lon)) => {
+                crate::sources::min_dist_to_existing(lat, lon, &db_coords)
+                    >= crate::sources::MIN_DISTANCE_KM
             }
         });
         let evicted = before - st.cached_guesses.len();
         if evicted > 0 {
-            warn!("GeoGuessr: evicted {evicted} stale cached image(s) too close to a played location");
+            warn!(
+                "GeoGuessr: evicted {evicted} stale cached image(s) too close to a played location"
+            );
             st.save(&ctx.state_path).await.ok();
         }
     }
 
     let current = ctx.state.lock().await.cached_guesses.len();
-    let needed  = target.saturating_sub(current);
-    if needed == 0 { return; }
+    let needed = target.saturating_sub(current);
+    if needed == 0 {
+        return;
+    }
 
     info!("GeoGuessr: prefetching {needed} images");
 
@@ -1450,7 +1721,8 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
     // earlier in the same batch, or played in recent rounds.
     let (mut existing_coords, mut existing_seqs): (Vec<(f64, f64)>, Vec<Option<String>>) = {
         let st = ctx.state.lock().await;
-        st.cached_guesses.iter()
+        st.cached_guesses
+            .iter()
             .map(|img| {
                 let coord = img.lat.zip(img.lon);
                 (coord, img.sequence.clone())
@@ -1466,33 +1738,44 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
     }
 
     // Detect geographic collapse and enable exploration mode if needed.
-    let diversity     = crate::sources::diversity::DiversityTracker::from_coords(&existing_coords);
+    let diversity = crate::sources::diversity::DiversityTracker::from_coords(&existing_coords);
     let is_homogeneous = diversity.is_homogeneous();
     if is_homogeneous {
-        warn!("GeoGuessr: prefetch cache is geographically homogeneous — enabling exploration mode");
+        warn!(
+            "GeoGuessr: prefetch cache is geographically homogeneous — enabling exploration mode"
+        );
     }
 
     // Restore the anti-starvation streak; enable exploration when homogeneous.
     let mut filter = crate::sources::quality_filter::FilterState::with_streak_and_exploration(
-        ctx.prefetch_streak.load(std::sync::atomic::Ordering::Relaxed),
+        ctx.prefetch_streak
+            .load(std::sync::atomic::Ordering::Relaxed),
         is_homogeneous,
     );
 
     // Countries seen too often recently — skip at seed-selection time.
     // Combines DB history (last 90 days) with what is already in the cache.
     let skip_countries: HashSet<String> = {
-        let mut freq: HashMap<String, u32> = ctx.db.recent_country_counts().await.unwrap_or_default();
+        let mut freq: HashMap<String, u32> =
+            ctx.db.recent_country_counts().await.unwrap_or_default();
         let st = ctx.state.lock().await;
         for img in &st.cached_guesses {
             *freq.entry(img.country.clone()).or_insert(0) += 1;
         }
-        freq.into_iter().filter(|(_, n)| *n >= 3).map(|(k, _)| k).collect()
+        freq.into_iter()
+            .filter(|(_, n)| *n >= 3)
+            .map(|(k, _)| k)
+            .collect()
     };
 
     for _ in 0..needed {
         let source = {
             let mut rng = rand::thread_rng();
-            sources.choose(&mut rng).map(|s| s.as_str()).unwrap_or("mapillary").to_owned()
+            sources
+                .choose(&mut rng)
+                .map(|s| s.as_str())
+                .unwrap_or("mapillary")
+                .to_owned()
         };
 
         let n_photos = ctx.effective_photos_per_location().await;
@@ -1506,17 +1789,16 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
                     &mut filter,
                     &ctx.blur_cache,
                     &skip_countries,
-                ).await
+                )
+                .await
             }
-            "local" => {
-                match &ctx.config.sources.local.path {
-                    Some(p) => crate::sources::local::fetch(p).await,
-                    None    => {
-                        warn!("GeoGuessr: local source enabled but no path configured");
-                        continue;
-                    }
+            "local" => match &ctx.config.sources.local.path {
+                Some(p) => crate::sources::local::fetch(p).await,
+                None => {
+                    warn!("GeoGuessr: local source enabled but no path configured");
+                    continue;
                 }
-            }
+            },
             _ => {
                 warn!("GeoGuessr: unknown source '{}' — skipping", source);
                 continue;
@@ -1546,7 +1828,8 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
     }
 
     // Persist the rejection streak for the next prefetch batch.
-    ctx.prefetch_streak.store(filter.streak(), std::sync::atomic::Ordering::Relaxed);
+    ctx.prefetch_streak
+        .store(filter.streak(), std::sync::atomic::Ordering::Relaxed);
 }
 
 // ── Resume after restart ──────────────────────────────────────────────────────
@@ -1563,132 +1846,47 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
 
     let room = match client.get_room(&ctx.room_id) {
         Some(r) => r,
-        None    => {
+        None => {
             warn!("resume_active_round: main room not joined");
             return;
         }
     };
 
     // Rebuild sorted participant list from persisted state.
-    let mut participants: Vec<OwnedUserId> = ar.dm_participants
+    let mut participants: Vec<OwnedUserId> = ar
+        .dm_participants
         .keys()
         .filter_map(|s| s.parse::<OwnedUserId>().ok())
         .collect();
     participants.sort();
 
-    let (actual_lat, actual_lon) = match (ar.current_image.lat, ar.current_image.lon) {
-        (Some(lat), Some(lon)) => (lat, lon),
-        _ => countries::COUNTRIES.iter()
-            .find(|c| c.name == ar.current_image.country)
-            .map(|c| (c.lat, c.lon))
-            .unwrap_or((0.0, 0.0)),
-    };
-
-    // Seed the in-memory active game (no DM history to recover from).
-    {
-        let mut ag = ctx.active_game.lock().await;
-        let guess_event_id = OwnedEventId::try_from("$placeholder:recovery").unwrap_or_else(|_| {
-            OwnedEventId::try_from(format!("$recovery_{}:{}", ar.round_id, ar.guess_num)).unwrap()
-        });
-        *ag = Some(ActiveGame {
-            event_id: guess_event_id,
-            mode: ActiveGameMode::FreeGuess {
-                guesses: HashMap::new(),
-                actual_lat,
-                actual_lon,
-            },
-        });
-    }
-
     room.send(format::mentionify(&format!(
-        "⚠️ Bot restarted mid-round — resuming guess {}/{} ({})",
-        ar.guess_num, ar.total_guesses,
+        "⚠️ Bot restarted mid-round — replaying guess {}/{} with a fresh {} timer.",
+        ar.guess_num,
+        ar.total_guesses,
         format_duration(ar.answer_timeout_secs),
-    ))).await.ok();
-
-    // Compute remaining timeout.
-    let elapsed_secs = chrono::Utc::now()
-        .signed_duration_since(ar.guess_started_at)
-        .num_seconds()
-        .max(0) as u64;
-    let remaining_secs = ar.answer_timeout_secs.saturating_sub(elapsed_secs);
-
-    // Wait out the remaining time (reusing the countdown logic inline).
-    if remaining_secs > 0 {
-        let edit_interval = (remaining_secs / 20).clamp(15, 900);
-        let mut remaining = remaining_secs;
-        loop {
-            let sleep_secs = remaining.min(edit_interval);
-            tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
-            remaining -= sleep_secs;
-
-            if !participants.is_empty() {
-                let ag = ctx.active_game.lock().await;
-                if let Some(ActiveGame { mode: ActiveGameMode::FreeGuess { ref guesses, .. }, .. }) = *ag {
-                    if participants.iter().all(|uid| guesses.contains_key(uid.as_str())) {
-                        break;
-                    }
-                }
-            }
-            if remaining == 0 { break; }
-        }
-    }
-
-    // Re-use the DB guess row created by play_free_guess before the crash.
-    // Never insert a duplicate — the original row already exists.
-    let guess_id = ctx.db
-        .find_guess_id(ar.round_id, ar.guess_num)
-        .await
-        .unwrap_or(-1);
-
-    let guesses = {
-        let mut ag = ctx.active_game.lock().await;
-        match ag.take().map(|g| g.mode) {
-            Some(ActiveGameMode::FreeGuess { guesses, .. }) => guesses,
-            _ => HashMap::new(),
-        }
-    };
-
-    let half_life = ctx.config.schedule.score_half_life_km;
-    let mut scored: Vec<(String, FreeGuess, f64, i64)> = guesses
-        .into_iter()
-        .map(|(uid, guess)| {
-            let dist  = haversine_km(guess.lat, guess.lon, actual_lat, actual_lon);
-            let score = distance_score(dist, half_life);
-            (uid, guess, dist, score)
-        })
-        .collect();
-    scored.sort_by(|a, b| {
-        b.3.cmp(&a.3)
-            .then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
-            .then(a.0.cmp(&b.0))
-    });
-
-    let n_answers = scored.len();
-    let db_rows: Vec<(String, String, f64, f64, f64, i64)> = scored.iter()
-        .map(|(uid, g, dist, score)| (uid.clone(), g.text.clone(), g.lat, g.lon, *dist, *score))
-        .collect();
-    if guess_id > 0 {
-        ctx.db.record_free_guess_answers(guess_id, ar.round_id, db_rows).await.ok();
-        ctx.db.finish_guess(guess_id, n_answers, 0).await.ok();
-    }
+    )))
+    .await
+    .ok();
 
     let mut round_scores_free: HashMap<String, i64> = ar.round_scores.clone();
-    for (uid, _, _, score) in &scored {
-        *round_scores_free.entry(uid.clone()).or_insert(0) += score;
-    }
 
-    let user_ids: Vec<&str>     = scored.iter().map(|(uid, _, _, _)| uid.as_str()).collect();
-    let names                   = fetch_names(&room, &user_ids).await;
-    let raw_avatars             = crate::avatar::fetch_player_avatars(&room, &user_ids).await;
-    let avatar_mxcs: HashMap<String, String> = raw_avatars.iter()
-        .filter_map(|(uid, bytes)| crate::avatar::avatar_bytes_to_data_url(bytes).map(|u| (uid.clone(), u)))
-        .collect();
-    post_reveal_free_guess(
-        &ctx, &client, &ar.current_image,
-        actual_lat, actual_lon,
-        &scored, &names, &raw_avatars, &avatar_mxcs,
-    ).await;
+    if let Err(e) = play_free_guess(
+        &ctx,
+        &client,
+        &room,
+        ar.round_id,
+        ar.guess_num,
+        ar.total_guesses,
+        &ar.current_image,
+        &mut round_scores_free,
+        &participants,
+        ar.answer_timeout_secs,
+    )
+    .await
+    {
+        error!("resume_active_round: replayed guess error: {e}");
+    }
 
     // ── Continue with remaining guesses ───────────────────────────────────────
     let mut image_queue = ar.remaining_images.clone();
@@ -1698,44 +1896,62 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
 
         {
             let mut st = ctx.state.lock().await;
-            let dm_state = participants.iter().map(|uid| {
-                (uid.to_string(), ActiveDmParticipant {
-                    dm_room_id:      String::new(),
-                    prompt_event_id: None,
-                    answer_acked:    false,
+            let dm_state = participants
+                .iter()
+                .map(|uid| {
+                    (
+                        uid.to_string(),
+                        ActiveDmParticipant {
+                            dm_room_id: String::new(),
+                            prompt_event_id: None,
+                            answer_acked: false,
+                        },
+                    )
                 })
-            }).collect();
+                .collect();
             st.active_round = Some(ActiveRoundState {
-                round_id:            ar.round_id,
+                round_id: ar.round_id,
                 guess_num,
-                total_guesses:       ar.total_guesses,
-                current_image:       img.clone(),
-                remaining_images:    image_queue.clone(),
-                guess_started_at:    chrono::Utc::now(),
+                total_guesses: ar.total_guesses,
+                current_image: img.clone(),
+                remaining_images: image_queue.clone(),
+                guess_started_at: chrono::Utc::now(),
                 answer_timeout_secs: ar.answer_timeout_secs,
-                dm_participants:     dm_state,
-                round_scores:        round_scores_free.clone(),
+                dm_participants: dm_state,
+                round_scores: round_scores_free.clone(),
             });
             st.save(&ctx.state_path).await.ok();
         }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(
             ctx.config.schedule.inter_guess_secs,
-        )).await;
+        ))
+        .await;
 
         if let Err(e) = play_free_guess(
-            &ctx, &client, &room,
-            ar.round_id, guess_num, ar.total_guesses,
-            &img, &mut round_scores_free, &participants,
+            &ctx,
+            &client,
+            &room,
+            ar.round_id,
+            guess_num,
+            ar.total_guesses,
+            &img,
+            &mut round_scores_free,
+            &participants,
             ar.answer_timeout_secs,
-        ).await {
+        )
+        .await
+        {
             error!("resume_active_round: play_free_guess error: {e}");
         }
     }
 
     // Finalise.
     ctx.db.finish_round(ar.round_id).await.ok();
-    ctx.db.upsert_round_scores_free_guess(ar.round_id, &round_scores_free).await.ok();
+    ctx.db
+        .upsert_round_scores_free_guess(ar.round_id, &round_scores_free)
+        .await
+        .ok();
 
     post_round_summary_free_guess(&ctx, &client, &room, ar.round_id, &round_scores_free).await;
 
@@ -1749,7 +1965,7 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
 
 pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoin) {
     // Wait until game_at_utc.
-    let now_utc   = chrono::Utc::now();
+    let now_utc = chrono::Utc::now();
     let wait_secs = (pj.game_at_utc - now_utc)
         .max(chrono::Duration::zero())
         .num_seconds() as u64;
@@ -1760,7 +1976,7 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
 
     let room = match client.get_room(&ctx.room_id) {
         Some(r) => r,
-        None    => {
+        None => {
             warn!("resume_pending_join: room {} not joined", ctx.room_id);
             let mut st = ctx.state.lock().await;
             st.pending_join = None;
@@ -1805,16 +2021,22 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         st.save(&ctx.state_path).await.ok();
     }
 
-    let n            = ctx.effective_guesses_per_round().await;
-    let n_photos     = ctx.effective_photos_per_location().await;
+    let n = ctx.effective_guesses_per_round().await;
+    let n_photos = ctx.effective_photos_per_location().await;
     let triggered_by = "scheduler";
 
     if participants.is_empty() {
         room.send(format::mentionify("😴 Nobody joined · skipping."))
-            .await.ok();
+            .await
+            .ok();
         if let Some(slot) = &pj.slot {
-            let tz: Tz = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
-            let today  = chrono::Utc::now().with_timezone(&tz).date_naive();
+            let tz: Tz = ctx
+                .config
+                .schedule
+                .timezone
+                .parse()
+                .unwrap_or(chrono_tz::UTC);
+            let today = chrono::Utc::now().with_timezone(&tz).date_naive();
             let mut st = ctx.state.lock().await;
             st.last_game_dates.insert(slot.clone(), today);
             st.save(&ctx.state_path).await.ok();
@@ -1836,12 +2058,15 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
             participant_list.join(", "),
         ))
         .add_mentions(Mentions::with_user_ids(participant_ids)),
-    ).await.ok();
+    )
+    .await
+    .ok();
 
     // Pre-fetch and run images.
     prefetch_if_needed(&ctx, n + 2).await;
 
-    let round_id = match ctx.db
+    let round_id = match ctx
+        .db
         .start_round(ctx.room_id.as_str(), n as u32, triggered_by)
         .await
     {
@@ -1859,11 +2084,14 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
     // play phase of a resumed-join-round also crash-safe.
     let mut image_queue: VecDeque<GeoImage> = {
         let mut st = ctx.state.lock().await;
-        let mut q  = VecDeque::new();
+        let mut q = VecDeque::new();
         while q.len() < n {
             match st.cached_guesses.pop_front() {
                 None => {
-                    warn!("resume_pending_join: guess cache empty after {} image(s)", q.len());
+                    warn!(
+                        "resume_pending_join: guess cache empty after {} image(s)",
+                        q.len()
+                    );
                     break;
                 }
                 Some(img) => {
@@ -1882,9 +2110,9 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         q
     };
 
-    let total              = image_queue.len();
+    let total = image_queue.len();
     let mut round_scores_free: HashMap<String, i64> = HashMap::new();
-    let mut first_guess    = true;
+    let mut first_guess = true;
 
     while let Some(img) = image_queue.pop_front() {
         let guess_num = (total - image_queue.len()) as u32; // 1-based after pop
@@ -1893,23 +2121,29 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         // during the play phase can resume via resume_active_round.
         {
             let mut st = ctx.state.lock().await;
-            let dm_state = sorted_participants.iter().map(|uid| {
-                (uid.to_string(), ActiveDmParticipant {
-                    dm_room_id:      String::new(),
-                    prompt_event_id: None,
-                    answer_acked:    false,
+            let dm_state = sorted_participants
+                .iter()
+                .map(|uid| {
+                    (
+                        uid.to_string(),
+                        ActiveDmParticipant {
+                            dm_room_id: String::new(),
+                            prompt_event_id: None,
+                            answer_acked: false,
+                        },
+                    )
                 })
-            }).collect();
+                .collect();
             st.active_round = Some(ActiveRoundState {
                 round_id,
                 guess_num,
-                total_guesses:       total as u32,
-                current_image:       img.clone(),
-                remaining_images:    image_queue.clone(),
-                guess_started_at:    chrono::Utc::now(),
+                total_guesses: total as u32,
+                current_image: img.clone(),
+                remaining_images: image_queue.clone(),
+                guess_started_at: chrono::Utc::now(),
                 answer_timeout_secs: pj.answer_timeout_secs,
-                dm_participants:     dm_state,
-                round_scores:        round_scores_free.clone(),
+                dm_participants: dm_state,
+                round_scores: round_scores_free.clone(),
             });
             st.save(&ctx.state_path).await.ok();
         }
@@ -1917,22 +2151,34 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         if !first_guess {
             tokio::time::sleep(tokio::time::Duration::from_secs(
                 ctx.config.schedule.inter_guess_secs,
-            )).await;
+            ))
+            .await;
         }
         first_guess = false;
 
         if let Err(e) = play_free_guess(
-            &ctx, &client, &room,
-            round_id, guess_num, total as u32,
-            &img, &mut round_scores_free, &sorted_participants,
+            &ctx,
+            &client,
+            &room,
+            round_id,
+            guess_num,
+            total as u32,
+            &img,
+            &mut round_scores_free,
+            &sorted_participants,
             pj.answer_timeout_secs,
-        ).await {
+        )
+        .await
+        {
             error!("resume_pending_join: play_free_guess error: {e}");
         }
     }
 
     ctx.db.finish_round(round_id).await.ok();
-    ctx.db.upsert_round_scores_free_guess(round_id, &round_scores_free).await.ok();
+    ctx.db
+        .upsert_round_scores_free_guess(round_id, &round_scores_free)
+        .await
+        .ok();
 
     // Clear active_round (round is complete) and record last-game date in
     // one atomic save so no intermediate state can trigger a spurious resume.
@@ -1940,8 +2186,13 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         let mut st = ctx.state.lock().await;
         st.active_round = None;
         if let Some(slot) = &pj.slot {
-            let tz: Tz = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
-            let today  = chrono::Utc::now().with_timezone(&tz).date_naive();
+            let tz: Tz = ctx
+                .config
+                .schedule
+                .timezone
+                .parse()
+                .unwrap_or(chrono_tz::UTC);
+            let today = chrono::Utc::now().with_timezone(&tz).date_naive();
             st.last_game_dates.insert(slot.clone(), today);
         }
         st.save(&ctx.state_path).await.ok();

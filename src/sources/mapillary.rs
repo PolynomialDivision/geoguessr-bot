@@ -11,26 +11,26 @@
 //! Requires a free Mapillary client access token (register at
 //! https://www.mapillary.com/developer).
 
-use std::{collections::{HashMap, HashSet, VecDeque}, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Mutex,
+};
 
 use anyhow::{bail, Result};
 use rand::seq::SliceRandom;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use super::{
-    diversity::DiversityTracker,
-    get_with_retry, min_dist_to_existing, MIN_DISTANCE_KM,
-};
+use super::{diversity::DiversityTracker, get_with_retry, min_dist_to_existing, MIN_DISTANCE_KM};
 
 use crate::{
     config::MapillaryConfig,
-    countries::{self, Country},
+    countries::{self, LocationSeed},
     sources::GeoImage,
 };
 
 const API: &str = "https://graph.mapillary.com/images";
-const UA:  &str = "geoguessr-bot/0.1 (matrix bot)";
+const UA: &str = "geoguessr-bot/0.1 (matrix bot)";
 
 // ── API response shapes ───────────────────────────────────────────────────────
 
@@ -41,28 +41,28 @@ struct MapillaryResp {
 
 #[derive(Deserialize, Clone)]
 struct MapillaryImage {
-    id:              String,
-    geometry:        Geometry,
-    thumb_1024_url:  Option<String>,
-    creator:         Option<Creator>,
+    id: String,
+    geometry: Geometry,
+    thumb_1024_url: Option<String>,
+    creator: Option<Creator>,
     /// Mapillary v4 sequence UUID — images in the same sequence are from the
     /// same capture run on the same road/trail.
     #[serde(default)]
-    sequence:        Option<String>,
+    sequence: Option<String>,
     /// Capture time as Unix milliseconds (used for freshness scoring).
     #[serde(default)]
-    captured_at:     Option<i64>,
+    captured_at: Option<i64>,
     /// Original image dimensions (used for resolution scoring).
     #[serde(default)]
-    width:           Option<u32>,
+    width: Option<u32>,
     #[serde(default)]
-    height:          Option<u32>,
+    height: Option<u32>,
     /// Camera heading in degrees [0, 360) — used for sequence heading stability.
     #[serde(default)]
-    compass_angle:   Option<f32>,
+    compass_angle: Option<f32>,
     /// Mapillary server-side quality estimate [0.0, 5.0].
     #[serde(default)]
-    quality_score:   Option<f32>,
+    quality_score: Option<f32>,
 }
 
 /// GeoJSON Point geometry — coordinates are [longitude, latitude].
@@ -96,14 +96,18 @@ pub type ImageMetrics = (Option<f32>, Option<f32>);
 /// clearing everything, so recently-computed metrics survive across prefetch
 /// batches even when the cache is busy.
 pub struct BlurCache {
-    map:   HashMap<String, ImageMetrics>,
+    map: HashMap<String, ImageMetrics>,
     order: VecDeque<String>,
-    cap:   usize,
+    cap: usize,
 }
 
 impl BlurCache {
     pub fn new(cap: usize) -> Self {
-        BlurCache { map: HashMap::new(), order: VecDeque::new(), cap }
+        BlurCache {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap,
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<ImageMetrics> {
@@ -111,11 +115,15 @@ impl BlurCache {
     }
 
     pub fn insert(&mut self, key: String, val: ImageMetrics) {
-        if self.map.contains_key(&key) { return; }
+        if self.map.contains_key(&key) {
+            return;
+        }
         if self.map.len() >= self.cap {
             let evict = (self.cap / 5).max(1);
             for _ in 0..evict {
-                if let Some(old) = self.order.pop_front() { self.map.remove(&old); }
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
             }
         }
         self.order.push_back(key.clone());
@@ -124,12 +132,12 @@ impl BlurCache {
 }
 
 pub async fn fetch(
-    cfg:            &MapillaryConfig,
-    n_photos:       usize,
-    existing:       &[(f64, f64)],
-    existing_seqs:  &[Option<String>],
-    filter:         &mut super::quality_filter::FilterState,
-    blur_cache:     &Mutex<BlurCache>,
+    cfg: &MapillaryConfig,
+    n_photos: usize,
+    existing: &[(f64, f64)],
+    existing_seqs: &[Option<String>],
+    filter: &mut super::quality_filter::FilterState,
+    blur_cache: &Mutex<BlurCache>,
     skip_countries: &HashSet<String>,
 ) -> Result<GeoImage> {
     let n_photos = n_photos.max(1);
@@ -137,45 +145,59 @@ pub async fn fetch(
         bail!("Mapillary: access_token is not configured");
     }
 
-    let client = reqwest::Client::builder()
-        .user_agent(UA)
-        .build()?;
+    let client = reqwest::Client::builder().user_agent(UA).build()?;
 
-    let full_pool: Vec<&Country> = if cfg.countries.is_empty() {
-        countries::COUNTRIES.iter().collect()
+    let all_seeds = countries::location_seeds();
+    let full_pool: Vec<&LocationSeed> = if cfg.countries.is_empty() {
+        all_seeds.iter().collect()
     } else {
-        countries::COUNTRIES
+        all_seeds
             .iter()
-            .filter(|c| cfg.countries.iter().any(|iso| iso.eq_ignore_ascii_case(c.iso)))
+            .filter(|s| {
+                cfg.countries
+                    .iter()
+                    .any(|iso| iso.eq_ignore_ascii_case(s.country.iso))
+            })
             .collect()
     };
 
     if full_pool.is_empty() {
-        bail!("Mapillary: country filter matches no known countries");
+        bail!("Mapillary: country filter matches no known location seeds");
     }
 
     // Exclude recently over-represented countries, but keep at least 5 options
     // so the skip list can never starve the pool.
-    let filtered: Vec<&Country> = full_pool.iter().copied()
-        .filter(|c| !skip_countries.contains(c.iso) && !skip_countries.contains(c.name))
+    let filtered: Vec<&LocationSeed> = full_pool
+        .iter()
+        .copied()
+        .filter(|s| {
+            !skip_countries.contains(s.country.iso) && !skip_countries.contains(s.country.name)
+        })
         .collect();
-    let pool = if filtered.len() >= 5 { filtered } else { full_pool };
+    let pool = if filtered.len() >= 5 {
+        filtered
+    } else {
+        full_pool
+    };
 
     // Build a diversity tracker from already-accepted locations to detect
     // geographic collapse and prefer under-sampled regions.
     let diversity = DiversityTracker::from_coords(existing);
     if diversity.is_homogeneous() {
-        warn!("Mapillary: cache is geographically homogeneous — prioritising under-sampled regions");
+        warn!(
+            "Mapillary: cache is geographically homogeneous — prioritising under-sampled regions"
+        );
     }
 
     // Shuffle first (so countries with equal diversity scores are tried in
     // random order), then stable-sort by diversity score descending.
-    let candidates: Vec<&Country> = {
+    let candidates: Vec<&LocationSeed> = {
         let mut rng = rand::thread_rng();
         let mut v = pool.clone();
         v.shuffle(&mut rng);
         v.sort_by(|a, b| {
-            diversity.score(b.lat, b.lon)
+            diversity
+                .score(b.lat, b.lon)
                 .partial_cmp(&diversity.score(a.lat, a.lon))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
@@ -183,20 +205,36 @@ pub async fn fetch(
     };
 
     for seed in candidates.iter().take(10) {
-        match try_seed(&client, seed, cfg, n_photos, existing, existing_seqs, filter, blur_cache).await {
+        match try_seed(
+            &client,
+            seed,
+            cfg,
+            n_photos,
+            existing,
+            existing_seqs,
+            filter,
+            blur_cache,
+        )
+        .await
+        {
             Ok(Some(img)) => {
                 info!(
                     "Mapillary: found {} photo(s) for {} ({}) — nearest existing {:.0} km",
                     1 + img.extra_image_urls.len(),
-                    seed.name, seed.iso,
-                    img.lat.zip(img.lon)
+                    seed.city,
+                    seed.country.iso,
+                    img.lat
+                        .zip(img.lon)
                         .map(|(lat, lon)| min_dist_to_existing(lat, lon, existing))
                         .unwrap_or(f64::INFINITY),
                 );
                 return Ok(img);
             }
-            Ok(None)   => {} // quality filter rejected all candidates for this seed
-            Err(e)     => warn!("Mapillary: seed {} failed: {e}", seed.name),
+            Ok(None) => {} // quality filter rejected all candidates for this seed
+            Err(e) => warn!(
+                "Mapillary: seed {}, {} failed: {e}",
+                seed.city, seed.country.name
+            ),
         }
     }
 
@@ -206,14 +244,14 @@ pub async fn fetch(
 // ── Internals ─────────────────────────────────────────────────────────────────
 
 async fn try_seed(
-    client:        &reqwest::Client,
-    seed:          &Country,
-    cfg:           &MapillaryConfig,
-    n_photos:      usize,
-    existing:      &[(f64, f64)],
+    client: &reqwest::Client,
+    seed: &LocationSeed,
+    cfg: &MapillaryConfig,
+    n_photos: usize,
+    existing: &[(f64, f64)],
     existing_seqs: &[Option<String>],
-    filter:        &mut super::quality_filter::FilterState,
-    blur_cache:    &Mutex<BlurCache>,
+    filter: &mut super::quality_filter::FilterState,
+    blur_cache: &Mutex<BlurCache>,
 ) -> Result<Option<GeoImage>> {
     let radius_km = (cfg.search_radius / 1000).clamp(1, 50);
     let url = format!(
@@ -231,7 +269,12 @@ async fn try_seed(
     let resp: MapillaryResp = get_with_retry(client, &url).await?;
 
     if resp.data.is_empty() {
-        bail!("no images found near {} within {}km", seed.name, radius_km);
+        bail!(
+            "no images found near {}, {} within {}km",
+            seed.city,
+            seed.country.name,
+            radius_km
+        );
     }
 
     // Save for density scoring before resp.data is moved.
@@ -239,16 +282,25 @@ async fn try_seed(
 
     // Shuffle, then retain only images that have a thumbnail URL.
     let mut candidates: Vec<MapillaryImage> = {
-        let mut rng  = rand::thread_rng();
+        let mut rng = rand::thread_rng();
         let mut data = resp.data;
         data.shuffle(&mut rng);
         data.into_iter()
-            .filter(|img| img.thumb_1024_url.as_deref().map(|u| !u.is_empty()).unwrap_or(false))
+            .filter(|img| {
+                img.thumb_1024_url
+                    .as_deref()
+                    .map(|u| !u.is_empty())
+                    .unwrap_or(false)
+            })
             .collect()
     };
 
     if candidates.is_empty() {
-        bail!("no images with thumbnail URL near {}", seed.name);
+        bail!(
+            "no images with thumbnail URL near {}, {}",
+            seed.city,
+            seed.country.name
+        );
     }
 
     // ── Collect all distance/sequence-passing candidate indices ─────────────
@@ -261,7 +313,10 @@ async fn try_seed(
                 return false;
             }
             if let Some(ref seq) = img.sequence {
-                if existing_seqs.iter().any(|es| es.as_deref() == Some(seq.as_str())) {
+                if existing_seqs
+                    .iter()
+                    .any(|es| es.as_deref() == Some(seq.as_str()))
+                {
                     return false;
                 }
             }
@@ -273,7 +328,8 @@ async fn try_seed(
         bail!(
             "all {} candidates near {} are within {MIN_DISTANCE_KM:.0} km of an existing \
              location or share a sequence",
-            candidates.len(), seed.name
+            candidates.len(),
+            seed.city
         );
     }
 
@@ -298,13 +354,17 @@ async fn try_seed(
     // without cloning the whole struct up front.
     for primary_idx in passing {
         // Clone ID and URL before any borrow of `candidates` crosses an await.
-        let img_id    = candidates[primary_idx].id.clone();
-        let thumb_url = candidates[primary_idx].thumb_1024_url.clone().unwrap_or_default();
+        let img_id = candidates[primary_idx].id.clone();
+        let thumb_url = candidates[primary_idx]
+            .thumb_1024_url
+            .clone()
+            .unwrap_or_default();
 
         // Look up cached metrics, or download thumbnail + compute both in one pass.
         // std::sync::Mutex guards are always released before await points.
         let (sharpness, overlay_penalty) = {
-            let cached = blur_cache.lock()
+            let cached = blur_cache
+                .lock()
                 .expect("blur_cache lock poisoned")
                 .get(&img_id);
             match cached {
@@ -312,9 +372,11 @@ async fn try_seed(
                 None => {
                     let metrics = match download_thumbnail(client, &thumb_url).await {
                         Some(ref bytes) => (compute_sharpness(bytes), detect_overlay(bytes)),
-                        None            => (None, None),
+                        None => (None, None),
                     };
-                    blur_cache.lock().expect("blur_cache lock poisoned")
+                    blur_cache
+                        .lock()
+                        .expect("blur_cache lock poisoned")
                         .insert(img_id.clone(), metrics);
                     metrics
                 }
@@ -330,14 +392,14 @@ async fn try_seed(
 
         let seq_score = sequence_score_for(&candidates, primary_idx);
         let qr = filter.evaluate(&super::quality_filter::QualityInput {
-            width:               candidates[primary_idx].width.unwrap_or(0),
-            height:              candidates[primary_idx].height.unwrap_or(0),
-            captured_at_ms:      candidates[primary_idx].captured_at,
+            width: candidates[primary_idx].width.unwrap_or(0),
+            height: candidates[primary_idx].height.unwrap_or(0),
+            captured_at_ms: candidates[primary_idx].captured_at,
             area_image_count,
-            search_radius_km:    radius_km as f64,
-            gps_jitter_m:        None, // not exposed by Mapillary v4 API
+            search_radius_km: radius_km as f64,
+            gps_jitter_m: None, // not exposed by Mapillary v4 API
             sequence_continuity: seq_score,
-            server_quality:      candidates[primary_idx].quality_score,
+            server_quality: candidates[primary_idx].quality_score,
             sharpness,
             overlay,
         });
@@ -345,12 +407,15 @@ async fn try_seed(
         if qr.decision == super::quality_filter::Decision::Reject {
             warn!(
                 "Mapillary: quality filter: {} score={:.2} ({})",
-                seed.name, qr.score, qr.reason,
+                seed.city, qr.score, qr.reason,
             );
             continue; // try next candidate in this seed area
         }
 
-        info!("Mapillary: quality {:.2} ({}) for {}", qr.score, qr.reason, seed.name);
+        info!(
+            "Mapillary: quality {:.2} ({}) for {}",
+            qr.score, qr.reason, seed.city
+        );
 
         let primary = candidates.remove(primary_idx);
         let lon = primary.geometry.coordinates[0];
@@ -370,12 +435,12 @@ async fn try_seed(
             .iter()
             .filter(|img| img.sequence.as_deref() != primary_seq || primary_seq.is_none())
             .filter(|img| {
-                let metrics = blur_cache.lock().ok()
-                    .and_then(|c| c.get(&img.id));
+                let metrics = blur_cache.lock().ok().and_then(|c| c.get(&img.id));
                 match metrics {
-                    Some((sharpness, overlay)) =>
+                    Some((sharpness, overlay)) => {
                         sharpness.map(|s| s >= 0.2).unwrap_or(true)
-                        && overlay.map(|o| o >= 0.3).unwrap_or(true),
+                            && overlay.map(|o| o >= 0.3).unwrap_or(true)
+                    }
                     None => true,
                 }
             })
@@ -384,15 +449,15 @@ async fn try_seed(
             .collect();
 
         return Ok(Some(GeoImage {
-            country:         seed.name.to_owned(),
-            region:          seed.region.to_owned(),
-            city:            None,
-            image_url:       primary.thumb_1024_url.unwrap(), // safe: filtered above
-            source:          "mapillary".to_owned(),
-            attribution:     Some(attribution),
-            lat:             Some(lat),
-            lon:             Some(lon),
-            sequence:        primary.sequence,
+            country: seed.country.name.to_owned(),
+            region: seed.country.region.to_owned(),
+            city: Some(seed.city.to_owned()),
+            image_url: primary.thumb_1024_url.unwrap(), // safe: filtered above
+            source: "mapillary".to_owned(),
+            attribution: Some(attribution),
+            lat: Some(lat),
+            lon: Some(lon),
+            sequence: primary.sequence,
             extra_image_urls,
         }));
     }
@@ -405,9 +470,13 @@ async fn try_seed(
 
 /// Download a thumbnail image; returns `None` on any network or HTTP error.
 async fn download_thumbnail(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
-    if url.is_empty() { return None; }
+    if url.is_empty() {
+        return None;
+    }
     let resp = client.get(url).send().await.ok()?;
-    if !resp.status().is_success() { return None; }
+    if !resp.status().is_success() {
+        return None;
+    }
     resp.bytes().await.ok().map(|b| b.to_vec())
 }
 
@@ -422,18 +491,20 @@ pub(super) fn compute_sharpness(img_bytes: &[u8]) -> Option<f32> {
     let img = image::load_from_memory(img_bytes).ok()?.to_luma8();
     let w = img.width() as usize;
     let h = img.height() as usize;
-    if w < 3 || h < 3 { return None; }
+    if w < 3 || h < 3 {
+        return None;
+    }
 
     let raw = img.as_raw();
     let mut sum_sq = 0.0_f64;
     for y in 1..(h - 1) {
         for x in 1..(w - 1) {
-            let c   = raw[y * w + x] as f64;
+            let c = raw[y * w + x] as f64;
             let lap = raw[(y - 1) * w + x] as f64
-                    + raw[(y + 1) * w + x] as f64
-                    + raw[y * w + (x - 1)] as f64
-                    + raw[y * w + (x + 1)] as f64
-                    - 4.0 * c;
+                + raw[(y + 1) * w + x] as f64
+                + raw[y * w + (x - 1)] as f64
+                + raw[y * w + (x + 1)] as f64
+                - 4.0 * c;
             sum_sq += lap * lap;
         }
     }
@@ -441,7 +512,7 @@ pub(super) fn compute_sharpness(img_bytes: &[u8]) -> Option<f32> {
     let n = ((w - 2) * (h - 2)) as f64;
     let variance = (sum_sq / n) as f32;
 
-    const BLUR:  f32 = 200.0;
+    const BLUR: f32 = 200.0;
     const SHARP: f32 = 2000.0;
     Some(((variance - BLUR) / (SHARP - BLUR)).clamp(0.0, 1.0))
 }
@@ -466,52 +537,78 @@ pub(super) fn compute_sharpness(img_bytes: &[u8]) -> Option<f32> {
 /// Both signals use the bottom 20% of the image.
 pub(super) fn detect_overlay(img_bytes: &[u8]) -> Option<f32> {
     let img = image::load_from_memory(img_bytes).ok()?.to_luma8();
-    let w = img.width()  as usize;
+    let w = img.width() as usize;
     let h = img.height() as usize;
-    if w < 10 || h < 10 { return None; }
+    if w < 10 || h < 10 {
+        return None;
+    }
     let raw = img.as_raw();
 
     // Bottom 20% strip (needs ≥ 3 rows for Sobel).
     let strip_y = (h * 4 / 5).max(1);
-    if h.saturating_sub(strip_y) < 3 { return None; }
+    if h.saturating_sub(strip_y) < 3 {
+        return None;
+    }
 
     // ── Signal 1: variance suppression ───────────────────────────────────────
     let img_sum: f64 = raw.iter().map(|&p| p as f64).sum();
-    let img_mean     = img_sum / (w * h) as f64;
-    let img_var: f64 = raw.iter()
-        .map(|&p| { let d = p as f64 - img_mean; d * d }).sum::<f64>()
+    let img_mean = img_sum / (w * h) as f64;
+    let img_var: f64 = raw
+        .iter()
+        .map(|&p| {
+            let d = p as f64 - img_mean;
+            d * d
+        })
+        .sum::<f64>()
         / (w * h) as f64;
 
     let strip = &raw[strip_y * w..];
     let s_sum: f64 = strip.iter().map(|&p| p as f64).sum();
-    let s_mean      = s_sum / strip.len() as f64;
-    let s_var: f64  = strip.iter()
-        .map(|&p| { let d = p as f64 - s_mean; d * d }).sum::<f64>()
+    let s_mean = s_sum / strip.len() as f64;
+    let s_var: f64 = strip
+        .iter()
+        .map(|&p| {
+            let d = p as f64 - s_mean;
+            d * d
+        })
+        .sum::<f64>()
         / strip.len() as f64;
 
     // 1.0 when strip_var < 35% of full-image variance; 0.0 above that.
-    let var_ratio    = if img_var > 1.0 { (s_var / img_var) as f32 } else { 1.0 };
-    let var_signal   = (1.0 - var_ratio / 0.35).clamp(0.0, 1.0);
+    let var_ratio = if img_var > 1.0 {
+        (s_var / img_var) as f32
+    } else {
+        1.0
+    };
+    let var_signal = (1.0 - var_ratio / 0.35).clamp(0.0, 1.0);
 
     // ── Signal 2: horizontal edge dominance (Sobel Gy vs Gx) ─────────────────
     let mut gy_sum = 0.0f64; // horizontal-edge response (detects horizontal lines)
     let mut gx_sum = 0.0f64; // vertical-edge response
     for y in (strip_y + 1)..(h.saturating_sub(1)) {
         for x in 1..(w.saturating_sub(1)) {
-            macro_rules! px { ($r:expr,$c:expr) => { raw[$r * w + $c] as f64 }; }
-            let gy = -px!(y-1,x-1) - 2.0*px!(y-1,x) - px!(y-1,x+1)
-                     +px!(y+1,x-1) + 2.0*px!(y+1,x) + px!(y+1,x+1);
-            let gx = -px!(y-1,x-1) - 2.0*px!(y,x-1) - px!(y+1,x-1)
-                     +px!(y-1,x+1) + 2.0*px!(y,x+1) + px!(y+1,x+1);
+            macro_rules! px {
+                ($r:expr,$c:expr) => {
+                    raw[$r * w + $c] as f64
+                };
+            }
+            let gy = -px!(y - 1, x - 1) - 2.0 * px!(y - 1, x) - px!(y - 1, x + 1)
+                + px!(y + 1, x - 1)
+                + 2.0 * px!(y + 1, x)
+                + px!(y + 1, x + 1);
+            let gx = -px!(y - 1, x - 1) - 2.0 * px!(y, x - 1) - px!(y + 1, x - 1)
+                + px!(y - 1, x + 1)
+                + 2.0 * px!(y, x + 1)
+                + px!(y + 1, x + 1);
             gy_sum += gy.abs();
             gx_sum += gx.abs();
         }
     }
-    let total_edge  = gy_sum + gx_sum + 1.0;
-    let h_frac      = (gy_sum / total_edge) as f32;
+    let total_edge = gy_sum + gx_sum + 1.0;
+    let h_frac = (gy_sum / total_edge) as f32;
     // 0.0 at h_frac = 0.65 (slightly H-dominant but common outdoors);
     // 1.0 at h_frac = 0.90 (overwhelmingly horizontal — clear bar border).
-    let hv_signal   = ((h_frac - 0.65) / 0.25).clamp(0.0, 1.0);
+    let hv_signal = ((h_frac - 0.65) / 0.25).clamp(0.0, 1.0);
 
     // ── Combine ───────────────────────────────────────────────────────────────
     // Variance suppression alone is sufficient for solid bars.
@@ -525,16 +622,17 @@ pub(super) fn detect_overlay(img_bytes: &[u8]) -> Option<f32> {
 /// * 0.6  — fewer than 25% of cached peers have high overlay → isolated artifact.
 /// * 1.0  — no peer cache data, or overlay is widespread across the sequence.
 fn sequence_overlay_multiplier(
-    candidates:  &[MapillaryImage],
+    candidates: &[MapillaryImage],
     primary_idx: usize,
-    blur_cache:  &Mutex<BlurCache>,
+    blur_cache: &Mutex<BlurCache>,
 ) -> f32 {
     let seq_id = match candidates[primary_idx].sequence.as_deref() {
         Some(s) => s,
-        None    => return 1.0,
+        None => return 1.0,
     };
 
-    let peer_ids: Vec<&str> = candidates.iter()
+    let peer_ids: Vec<&str> = candidates
+        .iter()
         .enumerate()
         .filter(|&(i, img)| i != primary_idx && img.sequence.as_deref() == Some(seq_id))
         .map(|(_, img)| img.id.as_str())
@@ -545,7 +643,8 @@ fn sequence_overlay_multiplier(
     }
 
     let cache = blur_cache.lock().expect("blur_cache lock");
-    let peer_overlays: Vec<f32> = peer_ids.iter()
+    let peer_overlays: Vec<f32> = peer_ids
+        .iter()
         .filter_map(|id| cache.get(id))
         .filter_map(|(_, penalty)| penalty)
         .collect();
@@ -555,10 +654,14 @@ fn sequence_overlay_multiplier(
         return 1.0; // peers exist but uncached — apply full penalty conservatively
     }
 
-    let high_frac = peer_overlays.iter().filter(|&&s| s > 0.5).count() as f32
-        / peer_overlays.len() as f32;
+    let high_frac =
+        peer_overlays.iter().filter(|&&s| s > 0.5).count() as f32 / peer_overlays.len() as f32;
 
-    if high_frac < 0.25 { 0.6 } else { 1.0 }
+    if high_frac < 0.25 {
+        0.6
+    } else {
+        1.0
+    }
 }
 
 /// Build a sequence-continuity score for the candidate at `primary_idx` by
@@ -568,20 +671,17 @@ fn sequence_overlay_multiplier(
 /// Returns `None` when the candidate has no sequence ID (isolated frame
 /// without attribution to a traversal), allowing the quality filter to exclude
 /// the axis and redistribute its weight rather than blindly penalising.
-fn sequence_score_for(
-    candidates: &[MapillaryImage],
-    primary_idx: usize,
-) -> Option<f32> {
+fn sequence_score_for(candidates: &[MapillaryImage], primary_idx: usize) -> Option<f32> {
     let seq_id = candidates[primary_idx].sequence.as_deref()?;
 
     let mut frames: Vec<super::quality_filter::SequenceFrame> = candidates
         .iter()
         .filter(|img| img.sequence.as_deref() == Some(seq_id))
         .map(|img| super::quality_filter::SequenceFrame {
-            lat:            img.geometry.coordinates[1],
-            lon:            img.geometry.coordinates[0],
+            lat: img.geometry.coordinates[1],
+            lon: img.geometry.coordinates[0],
             captured_at_ms: img.captured_at,
-            compass_angle:  img.compass_angle,
+            compass_angle: img.compass_angle,
         })
         .collect();
 
@@ -589,7 +689,8 @@ fn sequence_score_for(
     // original (shuffled) position via a stable sort, which is better than
     // silently placing them at time-0.
     frames.sort_by(|a, b| {
-        a.captured_at_ms.unwrap_or(i64::MAX)
+        a.captured_at_ms
+            .unwrap_or(i64::MAX)
             .cmp(&b.captured_at_ms.unwrap_or(i64::MAX))
     });
 
