@@ -12,7 +12,7 @@ use crate::avatar::{PIN_ANCHOR_X, PIN_ANCHOR_Y};
 
 const GUESS_MAP_W: u32 = 640;
 const GUESS_MAP_H: u32 = 400;
-const GUESS_MAP_MAX_ZOOM: u8 = 15;
+const GUESS_MAP_MAX_ZOOM: u8 = 17;
 const GUESS_MAP_EFFECTIVE_W: f64 = 520.0;
 const GUESS_MAP_EFFECTIVE_H: f64 = 260.0;
 
@@ -273,10 +273,10 @@ fn guess_map_zoom(guess_lat: f64, actual_lat: f64, lon_span: f64, dist_km: f64) 
 
     let fit_zoom = max_zoom_lon.min(max_zoom_lat);
     let distance_cap = match dist_km {
-        d if d <= 0.5 => 15,
-        d if d <= 2.0 => 14,
-        d if d <= 8.0 => 13,
-        d if d <= 20.0 => 12,
+        d if d <= 0.5 => 17,
+        d if d <= 2.0 => 16,
+        d if d <= 8.0 => 15,
+        d if d <= 20.0 => 14,
         d if d <= 80.0 => 10,
         d if d <= 250.0 => 8,
         d if d <= 700.0 => 7,
@@ -286,6 +286,20 @@ fn guess_map_zoom(guess_lat: f64, actual_lat: f64, lon_span: f64, dist_km: f64) 
     };
 
     fit_zoom.min(distance_cap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guess_map_uses_street_level_zoom_for_very_close_guesses() {
+        let actual_lat = 50.8510;
+        let guess_lat  = 50.8518;
+        let (_, lon_span) = minimum_lon_arc(&[4.3517, 4.3517]);
+
+        assert_eq!(guess_map_zoom(guess_lat, actual_lat, lon_span, 0.1), 17);
+    }
 }
 
 /// Draw a line taking the SHORTER arc between two points.

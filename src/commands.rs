@@ -549,12 +549,11 @@ fn format_leaderboard(
 ) -> String {
     const BAR_W: usize = 10;
 
-    let global_mean = score_global_mean(&board);
-    sort_score_leaderboard(&mut board, global_mean);
+    sort_score_leaderboard(&mut board);
 
     let mut lines = vec![
         format!("🏆 **{}** · {} rounds", header, round_count),
-        "⭐ sorted by confidence-adjusted pts/guess".to_owned(),
+        "⭐ rating = avg score minus reliability penalty".to_owned(),
         String::new(),
     ];
     for (i, entry) in board.iter().enumerate() {
@@ -564,67 +563,43 @@ fn format_leaderboard(
             2 => "🥉",
             _ => "▪️",
         };
-        let adj_score = confidence_adjusted_score(entry, global_mean);
-        let raw_avg = if entry.guesses_played > 0 {
-            entry.total_score as f64 / entry.guesses_played as f64
-        } else {
-            0.0
-        };
+        let rating = fair_rating(entry);
+        let raw_avg = raw_score_average(entry);
         let confidence = score_confidence(entry);
-        let filled = (confidence * BAR_W as f64).round() as usize;
-        let bar = format!(
-            "{}{}",
-            "█".repeat(filled.min(BAR_W)),
-            "░".repeat(BAR_W - filled.min(BAR_W))
-        );
-        let avg_dist = if entry.guesses_played > 0 {
-            format_dist(entry.avg_distance_km)
-        } else {
-            "n/a".to_owned()
-        };
         let best_dist = if entry.guesses_played > 0 {
             format_dist(entry.best_distance_km)
         } else {
             "n/a".to_owned()
         };
-        lines.push(format!("{medal} {}. {}", i + 1, entry.user_id));
+        let filled = ((rating / 5000.0) * BAR_W as f64).round() as usize;
+        let bar = format!(
+            "{}{}",
+            "█".repeat(filled.min(BAR_W)),
+            "░".repeat(BAR_W - filled.min(BAR_W))
+        );
         lines.push(format!(
-            "   {bar} 🔒{}% · ⭐{} · 🎯{}/g · 📍{} · 🏅{} · 🎮{}",
-            (confidence * 100.0).round() as i64,
-            adj_score.round() as i64,
+            "{medal} {}. {} · ⭐{} {bar} · 🎯{}/g · 🔒{}% · 🎮{} · 🏅{}",
+            i + 1,
+            entry.user_id,
+            rating.round() as i64,
             raw_avg.round() as i64,
-            avg_dist,
-            best_dist,
+            (confidence * 100.0).round() as i64,
             entry.guesses_played,
+            best_dist,
         ));
     }
     lines.join("\n")
 }
 
-fn score_global_mean(board: &[crate::db::ScoreLeaderboardEntry]) -> f64 {
-    let total_guesses: i64 = board.iter().map(|e| e.guesses_played).sum();
-    let total_pts: i64 = board.iter().map(|e| e.total_score).sum();
-    if total_guesses > 0 {
-        total_pts as f64 / total_guesses as f64
-    } else {
-        2000.0
-    }
-}
+fn fair_rating(entry: &crate::db::ScoreLeaderboardEntry) -> f64 {
+    const MAX_UNCERTAINTY_PENALTY: f64 = 1200.0;
 
-fn confidence_adjusted_score(entry: &crate::db::ScoreLeaderboardEntry, global_mean: f64) -> f64 {
-    const PRIOR_GUESSES: f64 = 30.0;
-
-    let n = entry.guesses_played as f64;
-    let avg = if n > 0.0 {
-        entry.total_score as f64 / n
-    } else {
-        0.0
-    };
-    (PRIOR_GUESSES * global_mean + n * avg) / (PRIOR_GUESSES + n)
+    let penalty = MAX_UNCERTAINTY_PENALTY * (1.0 - score_confidence(entry));
+    (raw_score_average(entry) - penalty).max(0.0)
 }
 
 fn score_confidence(entry: &crate::db::ScoreLeaderboardEntry) -> f64 {
-    const PRIOR_GUESSES: f64 = 30.0;
+    const PRIOR_GUESSES: f64 = 20.0;
 
     if entry.guesses_played > 0 {
         entry.guesses_played as f64 / (entry.guesses_played as f64 + PRIOR_GUESSES)
@@ -633,10 +608,18 @@ fn score_confidence(entry: &crate::db::ScoreLeaderboardEntry) -> f64 {
     }
 }
 
-fn sort_score_leaderboard(board: &mut [crate::db::ScoreLeaderboardEntry], global_mean: f64) {
+fn raw_score_average(entry: &crate::db::ScoreLeaderboardEntry) -> f64 {
+    if entry.guesses_played > 0 {
+        entry.total_score as f64 / entry.guesses_played as f64
+    } else {
+        0.0
+    }
+}
+
+fn sort_score_leaderboard(board: &mut [crate::db::ScoreLeaderboardEntry]) {
     board.sort_by(|a, b| {
-        confidence_adjusted_score(b, global_mean)
-            .partial_cmp(&confidence_adjusted_score(a, global_mean))
+        fair_rating(b)
+            .partial_cmp(&fair_rating(a))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(b.guesses_played.cmp(&a.guesses_played))
             .then(a.user_id.cmp(&b.user_id))
@@ -692,8 +675,7 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
     };
 
     let mut board = ctx.db.score_leaderboard_alltime().await.unwrap_or_default();
-    let global_mean = score_global_mean(&board);
-    sort_score_leaderboard(&mut board, global_mean);
+    sort_score_leaderboard(&mut board);
     let rank = board.iter().position(|e| e.user_id == user).map(|i| i + 1);
     let rank_str = rank
         .map(|r| format!(" · rank #{r} of {}", board.len()))
@@ -938,31 +920,37 @@ mod tests {
     }
 
     #[test]
-    fn score_leaderboard_sorts_by_confidence_adjusted_score() {
+    fn score_leaderboard_sorts_by_fair_rating() {
         let mut board = vec![
             score_entry("@high-total-low-average:example.com", 100_000, 100),
             score_entry("@lower-total-high-average:example.com", 50_000, 10),
         ];
-        let global_mean = score_global_mean(&board);
 
-        sort_score_leaderboard(&mut board, global_mean);
+        sort_score_leaderboard(&mut board);
 
         assert_eq!(board[0].user_id, "@lower-total-high-average:example.com");
-        assert!(
-            confidence_adjusted_score(&board[0], global_mean)
-                > confidence_adjusted_score(&board[1], global_mean)
-        );
+        assert!(fair_rating(&board[0]) > fair_rating(&board[1]));
     }
 
     #[test]
-    fn leaderboard_bar_reflects_confidence_not_adjusted_score() {
+    fn fair_rating_uses_only_a_small_sample_penalty() {
+        let few_guesses = score_entry("@few:example.com", 5_000, 2);
+        let many_guesses = score_entry("@many:example.com", 50_000, 20);
+
+        assert_eq!(fair_rating(&few_guesses).round() as i64, 1_409);
+        assert_eq!(fair_rating(&many_guesses).round() as i64, 1_900);
+    }
+
+    #[test]
+    fn leaderboard_is_compact_and_bar_reflects_rating() {
         let text = format_leaderboard(
             vec![score_entry("@twenty-guesses:example.com", 100_000, 20)],
             "Test Leaderboard",
             1,
         );
 
-        assert!(text.contains("████░░░░░░ 🔒40%"));
-        assert!(text.contains("⭐5000"));
+        assert!(text.contains(
+            "🥇 1. @twenty-guesses:example.com · ⭐4400 █████████░ · 🎯5000/g · 🔒50% · 🎮20 · 🏅100 km"
+        ));
     }
 }
