@@ -350,6 +350,7 @@ html,body{height:100%;background:#1a1a2e;font-family:system-ui,sans-serif}
         map.setLayoutProperty(layer.id, 'text-field', [
           'coalesce',
           ['get', 'name:' + lang],
+          ['get', 'name:en'],
           ['get', 'name'],
         ]);
       }
