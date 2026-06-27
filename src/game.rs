@@ -560,6 +560,24 @@ async fn play_free_guess(
             }
             tmap
         } else {
+            // No web server configured: post a geo-picker browsing link per participant
+            // so they can see the map in their own language and use !guess to submit.
+            let st = ctx.state.lock().await;
+            let line = participants
+                .iter()
+                .map(|uid| {
+                    let lang = st.user_langs.get(uid.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| "en".to_owned());
+                    format!(
+                        "[🗺️ {}](https://polynomialdivision.github.io/geo-picker/?lang={})",
+                        uid.localpart(), lang
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("  ·  ");
+            drop(st);
+            room.send(format::mentionify(&line)).await.ok();
             HashMap::new()
         }
     } else {
