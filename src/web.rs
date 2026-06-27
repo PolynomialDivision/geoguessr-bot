@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
@@ -76,6 +76,7 @@ pub async fn run(bind_addr: String, state: WebState) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/g/:token",        get(serve_map))
         .route("/g/:token/submit", post(submit_guess))
+        .route("/map-test",        get(test_map))
         .with_state(state);
 
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -99,6 +100,11 @@ async fn serve_map(
     };
     let one_shot = ws.max_guesses > 0;
     Html(map_html(&token, tok.user_id.localpart(), one_shot, &tok.lang)).into_response()
+}
+
+async fn test_map(Query(params): Query<HashMap<String, String>>) -> Response {
+    let lang = params.get("lang").cloned().unwrap_or_else(|| "en".to_owned());
+    Html(map_html("test", "test", false, &lang)).into_response()
 }
 
 // ── Guess submission ──────────────────────────────────────────────────────────
