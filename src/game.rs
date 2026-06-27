@@ -538,11 +538,19 @@ async fn play_free_guess(
                     tmap.insert(uid.clone(), token);
                 }
 
+                let once = if ctx.config.schedule.max_guesses_per_player > 0 { "1" } else { "0" };
+                let encoded_base = crate::web::percent_encode(public_url);
                 let links_line = participants
                     .iter()
                     .map(|uid| {
                         let tok = &tmap[uid];
-                        format!("[🗺️ {}]({}/g/{})", uid.localpart(), public_url, tok)
+                        let lang = store.tokens.get(tok.as_str())
+                            .map(|t| t.lang.as_str())
+                            .unwrap_or("en");
+                        format!(
+                            "[🗺️ {}](https://polynomialdivision.github.io/geo-picker/?lang={}&token={}&base={}&once={})",
+                            uid.localpart(), lang, tok, encoded_base, once
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join("  ·  ");

@@ -1161,6 +1161,7 @@ dependencies = [
  "tiny-skia",
  "tokio",
  "toml 0.8.23",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]

@@ -10,10 +10,11 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::{Path, State},
-    http::StatusCode,
-    response::{Html, IntoResponse, Json, Response},
+    http::{HeaderValue, Method, StatusCode, header},
+    response::{Html, IntoResponse, Json, Redirect, Response},
     routing::{get, post},
 };
+use tower_http::cors::CorsLayer;
 use matrix_sdk::{
     Client,
     ruma::{OwnedEventId, OwnedRoomId, OwnedUserId},
@@ -73,9 +74,15 @@ pub struct WebState {
 // ── Server entry point ────────────────────────────────────────────────────────
 
 pub async fn run(bind_addr: String, state: WebState) -> anyhow::Result<()> {
+    let cors = CorsLayer::new()
+        .allow_origin("https://polynomialdivision.github.io".parse::<HeaderValue>().unwrap())
+        .allow_methods([Method::POST, Method::OPTIONS])
+        .allow_headers([header::CONTENT_TYPE]);
+
     let app = Router::new()
         .route("/g/:token",        get(serve_map))
         .route("/g/:token/submit", post(submit_guess))
+        .layer(cors)
         .with_state(state);
 
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -97,8 +104,13 @@ async fn serve_map(
     let Some(tok) = info else {
         return (StatusCode::NOT_FOUND, Html(expired_html())).into_response();
     };
-    let one_shot = ws.max_guesses > 0;
-    Html(map_html(&token, tok.user_id.localpart(), one_shot, &tok.lang)).into_response()
+    let once = if ws.max_guesses > 0 { "1" } else { "0" };
+    let encoded_base = percent_encode(&ws.public_url);
+    let url = format!(
+        "https://polynomialdivision.github.io/geo-picker/?lang={}&token={}&base={}&once={}",
+        tok.lang, token, encoded_base, once
+    );
+    Redirect::to(&url).into_response()
 }
 
 // ── Guess submission ──────────────────────────────────────────────────────────
@@ -185,9 +197,10 @@ pub async fn update_links_message(ws: &WebState, round_id: i64, guess_num: u32) 
             Some(s) => s,
             None    => return,
         };
-        let token_by_user: HashMap<String, String> = store.tokens.iter()
+        // Map user_id → (token, lang) for building geo-picker links.
+        let token_by_user: HashMap<String, (String, String)> = store.tokens.iter()
             .filter(|(_, t)| t.round_id == round_id && t.guess_num == guess_num)
-            .map(|(tok, t)| (t.user_id.to_string(), tok.clone()))
+            .map(|(tok, t)| (t.user_id.to_string(), (tok.clone(), t.lang.clone())))
             .collect();
         (session, token_by_user)
     };
@@ -200,11 +213,16 @@ pub async fn update_links_message(ws: &WebState, round_id: i64, guess_num: u32) 
         })
     };
 
+    let once = if ws.max_guesses > 0 { "1" } else { "0" };
+    let encoded_base = percent_encode(&ws.public_url);
     let line = session.participants.iter().map(|uid| {
         if submitted.contains(uid.as_str()) {
             format!("✅ {}", uid.localpart())
-        } else if let Some(tok) = token_by_user.get(uid.as_str()) {
-            format!("[🗺️ {}]({}/g/{})", uid.localpart(), ws.public_url, tok)
+        } else if let Some((tok, lang)) = token_by_user.get(uid.as_str()) {
+            format!(
+                "[🗺️ {}](https://polynomialdivision.github.io/geo-picker/?lang={}&token={}&base={}&once={})",
+                uid.localpart(), lang, tok, encoded_base, once
+            )
         } else {
             format!("⏳ {}", uid.localpart())
         }
@@ -230,6 +248,23 @@ pub fn generate_token() -> String {
         .collect()
 }
 
+/// Percent-encode a string for use as a URL query parameter value.
+pub fn percent_encode(s: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
+}
+
 // ── Coordinate validation ─────────────────────────────────────────────────────
 
 pub fn is_valid_coords(lat: f64, lon: f64) -> bool {
@@ -237,208 +272,6 @@ pub fn is_valid_coords(lat: f64, lon: f64) -> bool {
 }
 
 // ── HTML ──────────────────────────────────────────────────────────────────────
-
-fn map_html(token: &str, display_name: &str, one_shot: bool, lang: &str) -> String {
-    // Use placeholder replacement so Leaflet's {z}/{x}/{y}/{s} tokens and
-    // JavaScript object literals don't need escaping in a format! string.
-    let token_json    = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_owned());
-    let name_json     = serde_json::to_string(display_name).unwrap_or_else(|_| "\"\"".to_owned());
-    let one_shot_js   = if one_shot { "true" } else { "false" };
-    let lang_json     = serde_json::to_string(lang).unwrap_or_else(|_| "\"en\"".to_owned());
-
-    LEAFLET_MAP_TEMPLATE
-        .replace("__TOKEN__", &token_json)
-        .replace("__NAME__", &name_json)
-        .replace("__ONE_SHOT__", one_shot_js)
-        .replace("__LANG__", &lang_json)
-}
-
-static LEAFLET_MAP_TEMPLATE: &str = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GeoGuessr – Place your guess</title>
-<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css">
-<style>
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;background:#1a1a2e;font-family:system-ui,sans-serif}
-#map{height:calc(100% - 60px)}
-#bar{
-  position:fixed;bottom:0;left:0;right:0;height:60px;
-  display:flex;align-items:center;gap:12px;padding:0 16px;
-  background:#16213e;color:#e0e0f0;border-top:1px solid #2a2a4a;
-  z-index:1000;
-}
-#hint{flex:1;font-size:14px;color:#99aacc}
-#name{font-size:13px;color:#556;white-space:nowrap}
-#btn{
-  padding:10px 22px;border:none;border-radius:8px;font-size:15px;
-  font-weight:600;cursor:pointer;white-space:nowrap;transition:background .15s;
-}
-#btn:disabled{background:#2a2a4a;color:#556;cursor:default}
-#btn.ready{background:#2980b9;color:#fff}
-#btn.ready:hover{background:#3498db}
-#btn.done-update{background:#27ae60;color:#fff}
-#btn.done-update:hover{background:#2ecc71}
-#btn.done-locked{background:#1e3a2a;color:#5a8a6a;cursor:default}
-</style>
-</head>
-<body>
-<div id="map"></div>
-<div id="bar">
-  <span id="hint">Tap the map to place your pin</span>
-  <button id="btn" disabled>Submit guess</button>
-  <span id="name"></span>
-</div>
-<script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
-<script>
-(function(){
-  var TOKEN    = __TOKEN__;
-  var NAME     = __NAME__;
-  var ONE_SHOT = __ONE_SHOT__;
-  var LANG     = __LANG__;
-
-  var T = {
-    en:{tap:'Tap the map to place your pin',submit:'Submit guess',submitting:'Submitting…',locked_in:'✅ Locked in: ',locked_btn:'✅ Guess locked in',update:'✏️ Update guess',recorded:'✅ Guess recorded: ',net_err:'❌ Network error — try again',err:'Error — try again'},
-    de:{tap:'Karte antippen, um Stecknadel zu setzen',submit:'Antwort absenden',submitting:'Wird gesendet…',locked_in:'✅ Festgelegt: ',locked_btn:'✅ Antwort festgelegt',update:'✏️ Antwort ändern',recorded:'✅ Antwort gespeichert: ',net_err:'❌ Netzwerkfehler — erneut versuchen',err:'Fehler — erneut versuchen'},
-    fr:{tap:'Appuyez sur la carte pour placer votre repère',submit:'Soumettre',submitting:'Envoi…',locked_in:'✅ Verrouillé : ',locked_btn:'✅ Réponse verrouillée',update:'✏️ Modifier',recorded:'✅ Réponse enregistrée : ',net_err:'❌ Erreur réseau — réessayez',err:'Erreur — réessayez'},
-    es:{tap:'Toca el mapa para colocar tu pin',submit:'Enviar respuesta',submitting:'Enviando…',locked_in:'✅ Confirmado: ',locked_btn:'✅ Respuesta confirmada',update:'✏️ Actualizar respuesta',recorded:'✅ Respuesta guardada: ',net_err:'❌ Error de red — inténtalo de nuevo',err:'Error — inténtalo de nuevo'},
-    ru:{tap:'Нажмите на карту, чтобы поставить метку',submit:'Отправить ответ',submitting:'Отправка…',locked_in:'✅ Зафиксировано: ',locked_btn:'✅ Ответ зафиксирован',update:'✏️ Изменить ответ',recorded:'✅ Ответ записан: ',net_err:'❌ Ошибка сети — попробуйте снова',err:'Ошибка — попробуйте снова'},
-    it:{tap:'Tocca la mappa per posizionare il pin',submit:'Invia risposta',submitting:'Invio…',locked_in:'✅ Bloccato: ',locked_btn:'✅ Risposta bloccata',update:'✏️ Aggiorna risposta',recorded:'✅ Risposta registrata: ',net_err:'❌ Errore di rete — riprova',err:'Errore — riprova'},
-    pl:{tap:'Dotknij mapę, aby umieścić pinezkę',submit:'Prześlij odpowiedź',submitting:'Wysyłanie…',locked_in:'✅ Zablokowano: ',locked_btn:'✅ Odpowiedź zablokowana',update:'✏️ Zaktualizuj odpowiedź',recorded:'✅ Odpowiedź zapisana: ',net_err:'❌ Błąd sieci — spróbuj ponownie',err:'Błąd — spróbuj ponownie'},
-    nl:{tap:'Tik op de kaart om je pin te plaatsen',submit:'Antwoord verzenden',submitting:'Verzenden…',locked_in:'✅ Vergrendeld: ',locked_btn:'✅ Antwoord vergrendeld',update:'✏️ Antwoord bijwerken',recorded:'✅ Antwoord opgeslagen: ',net_err:'❌ Netwerkfout — probeer opnieuw',err:'Fout — probeer opnieuw'},
-    pt:{tap:'Toque no mapa para colocar seu marcador',submit:'Enviar resposta',submitting:'Enviando…',locked_in:'✅ Confirmado: ',locked_btn:'✅ Resposta confirmada',update:'✏️ Atualizar resposta',recorded:'✅ Resposta registada: ',net_err:'❌ Erro de rede — tente novamente',err:'Erro — tente novamente'},
-    uk:{tap:'Натисніть на карту, щоб поставити мітку',submit:'Надіслати відповідь',submitting:'Надсилання…',locked_in:'✅ Зафіксовано: ',locked_btn:'✅ Відповідь зафіксована',update:'✏️ Оновити відповідь',recorded:'✅ Відповідь збережено: ',net_err:'❌ Помилка мережі — спробуйте ще раз',err:'Помилка — спробуйте ще раз'},
-    ja:{tap:'地図をタップしてピンを置く',submit:'回答を送信',submitting:'送信中…',locked_in:'✅ 確定: ',locked_btn:'✅ 回答を確定',update:'✏️ 回答を更新',recorded:'✅ 回答を記録: ',net_err:'❌ ネットワークエラー — 再試行',err:'エラー — 再試行'},
-    zh:{tap:'点击地图放置图钉',submit:'提交答案',submitting:'提交中…',locked_in:'✅ 已确认: ',locked_btn:'✅ 答案已确认',update:'✏️ 更新答案',recorded:'✅ 答案已记录: ',net_err:'❌ 网络错误 — 请重试',err:'错误 — 请重试'},
-    ar:{tap:'اضغط على الخريطة لوضع الدبوس',submit:'إرسال الإجابة',submitting:'جارٍ الإرسال…',locked_in:'✅ تم التأكيد: ',locked_btn:'✅ تم تأكيد الإجابة',update:'✏️ تحديث الإجابة',recorded:'✅ تم تسجيل الإجابة: ',net_err:'❌ خطأ في الشبكة — حاول مرة أخرى',err:'خطأ — حاول مرة أخرى'},
-    tr:{tap:'Pini yerleştirmek için haritaya dokun',submit:'Tahmin gönder',submitting:'Gönderiliyor…',locked_in:'✅ Kilitlendi: ',locked_btn:'✅ Tahmin kilitlendi',update:'✏️ Tahmini güncelle',recorded:'✅ Tahmin kaydedildi: ',net_err:'❌ Ağ hatası — tekrar dene',err:'Hata — tekrar dene'},
-    sv:{tap:'Tryck på kartan för att placera din nål',submit:'Skicka svar',submitting:'Skickar…',locked_in:'✅ Låst: ',locked_btn:'✅ Svar låst',update:'✏️ Uppdatera svar',recorded:'✅ Svar registrerat: ',net_err:'❌ Nätverksfel — försök igen',err:'Fel — försök igen'},
-    fi:{tap:'Napauta karttaa asettaaksesi nuppineulan',submit:'Lähetä arvaus',submitting:'Lähetetään…',locked_in:'✅ Lukittu: ',locked_btn:'✅ Arvaus lukittu',update:'✏️ Päivitä arvaus',recorded:'✅ Arvaus tallennettu: ',net_err:'❌ Verkkovirhe — yritä uudelleen',err:'Virhe — yritä uudelleen'},
-    da:{tap:'Tryk på kortet for at placere din nål',submit:'Send gæt',submitting:'Sender…',locked_in:'✅ Låst: ',locked_btn:'✅ Gæt låst',update:'✏️ Opdater gæt',recorded:'✅ Gæt registreret: ',net_err:'❌ Netværksfejl — prøv igen',err:'Fejl — prøv igen'},
-    cs:{tap:'Klepněte na mapu a umístěte špendlík',submit:'Odeslat odpověď',submitting:'Odesílám…',locked_in:'✅ Uzamčeno: ',locked_btn:'✅ Odpověď uzamčena',update:'✏️ Aktualizovat odpověď',recorded:'✅ Odpověď zaznamenána: ',net_err:'❌ Chyba sítě — zkuste znovu',err:'Chyba — zkuste znovu'},
-    hu:{tap:'Koppintson a térképre a gombostű elhelyezéséhez',submit:'Tipp elküldése',submitting:'Küldés…',locked_in:'✅ Rögzítve: ',locked_btn:'✅ Tipp rögzítve',update:'✏️ Tipp frissítése',recorded:'✅ Tipp rögzítve: ',net_err:'❌ Hálózati hiba — próbálja újra',err:'Hiba — próbálja újra'},
-    ro:{tap:'Atinge harta pentru a plasa acul',submit:'Trimite răspuns',submitting:'Se trimite…',locked_in:'✅ Blocat: ',locked_btn:'✅ Răspuns blocat',update:'✏️ Actualizează răspuns',recorded:'✅ Răspuns înregistrat: ',net_err:'❌ Eroare de rețea — încearcă din nou',err:'Eroare — încearcă din nou'},
-    el:{tap:'Πατήστε στον χάρτη για να τοποθετήσετε την καρφίτσα',submit:'Αποστολή απάντησης',submitting:'Αποστολή…',locked_in:'✅ Κλειδωμένο: ',locked_btn:'✅ Απάντηση κλειδωμένη',update:'✏️ Ενημέρωση απάντησης',recorded:'✅ Απάντηση καταγράφηκε: ',net_err:'❌ Σφάλμα δικτύου — δοκιμάστε ξανά',err:'Σφάλμα — δοκιμάστε ξανά'},
-    he:{tap:'גע במפה כדי למקם את הסיכה',submit:'שלח תשובה',submitting:'שולח…',locked_in:'✅ נעול: ',locked_btn:'✅ תשובה נעולה',update:'✏️ עדכן תשובה',recorded:'✅ תשובה נרשמה: ',net_err:'❌ שגיאת רשת — נסה שוב',err:'שגיאה — נסה שוב'},
-    ko:{tap:'지도를 눌러 핀을 놓으세요',submit:'답안 제출',submitting:'제출 중…',locked_in:'✅ 확정됨: ',locked_btn:'✅ 답안 확정',update:'✏️ 답안 수정',recorded:'✅ 답안 기록됨: ',net_err:'❌ 네트워크 오류 — 다시 시도',err:'오류 — 다시 시도'},
-    th:{tap:'แตะแผนที่เพื่อวางหมุด',submit:'ส่งคำตอบ',submitting:'กำลังส่ง…',locked_in:'✅ ล็อคแล้ว: ',locked_btn:'✅ ล็อคคำตอบแล้ว',update:'✏️ อัปเดตคำตอบ',recorded:'✅ บันทึกคำตอบแล้ว: ',net_err:'❌ เครือข่ายผิดพลาด — ลองอีกครั้ง',err:'ผิดพลาด — ลองอีกครั้ง'},
-    vi:{tap:'Chạm vào bản đồ để đặt ghim',submit:'Gửi đoán',submitting:'Đang gửi…',locked_in:'✅ Đã xác nhận: ',locked_btn:'✅ Đã khóa đoán',update:'✏️ Cập nhật đoán',recorded:'✅ Đoán đã được ghi: ',net_err:'❌ Lỗi mạng — thử lại',err:'Lỗi — thử lại'},
-    id:{tap:'Ketuk peta untuk meletakkan pin',submit:'Kirim tebakan',submitting:'Mengirim…',locked_in:'✅ Dikunci: ',locked_btn:'✅ Tebakan dikunci',update:'✏️ Perbarui tebakan',recorded:'✅ Tebakan dicatat: ',net_err:'❌ Kesalahan jaringan — coba lagi',err:'Kesalahan — coba lagi'}
-  };
-
-  function t(key) {
-    var base = (LANG || 'en').split('-')[0];
-    var row  = T[base] || T['en'];
-    return row[key] || T['en'][key] || key;
-  }
-
-  if (NAME) document.getElementById('name').textContent = '👤 ' + NAME;
-
-  var map = new maplibregl.Map({
-    container: 'map',
-    style:     'https://tiles.openfreemap.org/styles/liberty',
-    center:    [0, 20],
-    zoom:      2,
-  });
-
-  var lang = (LANG || 'en').split('-')[0];
-  map.once('load', function() {
-    map.getStyle().layers.forEach(function(layer) {
-      if (layer.layout && layer.layout['text-field']) {
-        map.setLayoutProperty(layer.id, 'text-field', [
-          'coalesce',
-          ['get', 'name:' + lang],
-          ['get', 'name'],
-        ]);
-      }
-    });
-  });
-
-  var hint      = document.getElementById('hint');
-  var btn       = document.getElementById('btn');
-  var pin       = null;
-  var pinLat    = null;
-  var pinLon    = null;
-  var submitted = false;
-
-  hint.textContent = t('tap');
-  btn.textContent  = t('submit');
-
-  function handleClick(e) {
-    if (submitted && ONE_SHOT) return;
-    pinLat = e.lngLat.lat;
-    pinLon = e.lngLat.lng;
-    if (pin) {
-      pin.setLngLat([pinLon, pinLat]);
-    } else {
-      pin = new maplibregl.Marker({draggable: true})
-        .setLngLat([pinLon, pinLat])
-        .addTo(map);
-      pin.on('dragend', function() {
-        if (submitted && ONE_SHOT) return;
-        var ll = pin.getLngLat();
-        pinLat = ll.lat;
-        pinLon = ll.lng;
-        hint.textContent = fmt(pinLat, pinLon);
-        if (!submitted) setReady();
-      });
-    }
-    hint.textContent = fmt(pinLat, pinLon);
-    if (!submitted || !ONE_SHOT) setReady();
-  }
-  map.on('click', handleClick);
-
-  function setReady() {
-    btn.disabled = false;
-    btn.className = 'ready';
-    btn.textContent = submitted ? t('update') : t('submit');
-  }
-
-  btn.addEventListener('click', async function() {
-    if (!pinLat || btn.disabled) return;
-    btn.disabled = true;
-    btn.textContent = t('submitting');
-    try {
-      var r = await fetch('/g/' + TOKEN + '/submit', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({lat: pinLat, lon: pinLon}),
-      });
-      if (r.ok) {
-        var j = await r.json();
-        var place = (j && j.geocoded) ? j.geocoded : fmt(pinLat, pinLon);
-        submitted = true;
-        if (ONE_SHOT) {
-          hint.textContent = t('locked_in') + place;
-          btn.textContent = t('locked_btn');
-          btn.className = 'done-locked';
-          btn.disabled = true;
-          map.off('click', handleClick);
-          if (pin) pin.setDraggable(false);
-        } else {
-          hint.textContent = t('recorded') + place;
-          btn.textContent = t('update');
-          btn.className = 'done-update';
-          btn.disabled = false;
-        }
-      } else {
-        var txt = await r.text();
-        hint.textContent = '❌ ' + (txt || t('err'));
-        setReady();
-      }
-    } catch(e) {
-      hint.textContent = t('net_err');
-      setReady();
-    }
-  });
-
-  function fmt(lat, lon) { return lat.toFixed(3) + ', ' + lon.toFixed(3); }
-})();
-</script>
-</body>
-</html>"#;
 
 fn expired_html() -> String {
     r#"<!DOCTYPE html>
