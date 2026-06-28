@@ -288,10 +288,26 @@ html,body{height:100%;background:#1a1a2e;font-family:system-ui,sans-serif}
 #btn.done-update{background:#27ae60;color:#fff}
 #btn.done-update:hover{background:#2ecc71}
 #btn.done-locked{background:#1e3a2a;color:#5a8a6a;cursor:default}
+#search{
+  position:fixed;top:12px;left:50%;transform:translateX(-50%);
+  display:flex;gap:6px;z-index:1000;width:min(400px,calc(100vw - 24px));
+}
+#search input{
+  flex:1;padding:8px 12px;border:none;border-radius:8px;font-size:14px;
+  background:#fff;color:#222;box-shadow:0 2px 8px rgba(0,0,0,0.35);outline:none;
+}
+#search button{
+  padding:8px 14px;border:none;border-radius:8px;font-size:15px;
+  background:#2980b9;color:#fff;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.35);
+}
 </style>
 </head>
 <body>
 <div id="map"></div>
+<div id="search">
+  <input id="search-input" type="text" placeholder="Search or paste lat, lon…" autocomplete="off">
+  <button id="search-btn">🔍</button>
+</div>
 <div id="bar">
   <span id="hint">Tap the map to place your pin</span>
   <button id="btn" disabled>Submit guess</button>
@@ -373,15 +389,14 @@ html,body{height:100%;background:#1a1a2e;font-family:system-ui,sans-serif}
   hint.textContent = t('tap');
   btn.textContent  = t('submit');
 
-  function handleClick(e) {
-    if (submitted && ONE_SHOT) return;
-    pinLat = e.lngLat.lat;
-    pinLon = e.lngLat.lng;
+  function placePin(lat, lon) {
+    pinLat = lat;
+    pinLon = lon;
     if (pin) {
-      pin.setLngLat([pinLon, pinLat]);
+      pin.setLngLat([lon, lat]);
     } else {
       pin = new maplibregl.Marker({draggable: true})
-        .setLngLat([pinLon, pinLat])
+        .setLngLat([lon, lat])
         .addTo(map);
       pin.on('dragend', function() {
         if (submitted && ONE_SHOT) return;
@@ -395,7 +410,39 @@ html,body{height:100%;background:#1a1a2e;font-family:system-ui,sans-serif}
     hint.textContent = fmt(pinLat, pinLon);
     if (!submitted || !ONE_SHOT) setReady();
   }
+
+  function handleClick(e) {
+    if (submitted && ONE_SHOT) return;
+    placePin(e.lngLat.lat, e.lngLat.lng);
+  }
   map.on('click', handleClick);
+
+  var searchInput = document.getElementById('search-input');
+  async function doSearch() {
+    var q = searchInput.value.trim();
+    if (!q) return;
+    var m = q.match(/^(-?\d+\.?\d*)[,\s]+(-?\d+\.?\d*)$/);
+    if (m) {
+      var lat = parseFloat(m[1]), lon = parseFloat(m[2]);
+      if (lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
+        map.flyTo({center: [lon, lat], zoom: 12});
+        placePin(lat, lon);
+        return;
+      }
+    }
+    try {
+      var url = 'https://nominatim.openstreetmap.org/search?q=' + encodeURIComponent(q) +
+                '&format=json&limit=1&accept-language=' + lang;
+      var r = await fetch(url);
+      var d = await r.json();
+      if (d && d[0]) {
+        map.flyTo({center: [parseFloat(d[0].lon), parseFloat(d[0].lat)], zoom: 10});
+        placePin(parseFloat(d[0].lat), parseFloat(d[0].lon));
+      }
+    } catch(_) {}
+  }
+  document.getElementById('search-btn').addEventListener('click', doSearch);
+  searchInput.addEventListener('keydown', function(e) { if (e.key === 'Enter') doSearch(); });
 
   function setReady() {
     btn.disabled = false;
