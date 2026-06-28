@@ -1611,7 +1611,7 @@ fn build_guess_map_url(
     let enc_name = url_encode_component(name);
     let params = format!(
         "lang={lang}&alat={actual_lat:.4}&alon={actual_lon:.4}\
-         &g={enc_name}|{guess_lat:.4}|{guess_lon:.4}|{r:02X}{g:02X}{b:02X}|{mxc}|{score}|{dist_km:.1}"
+         &g={enc_name}|{guess_lat:.4}|{guess_lon:.4}|{r:02X}{g:02X}{b:02X}|{mxc}|{score}|{dist_km:.3}"
     );
     format!(
         "https://polynomialdivision.github.io/geo-picker/reveal.html{}",
@@ -1637,7 +1637,7 @@ fn build_all_guesses_map_url(
     for (uid, lat, lon, r, g, b, score, dist, mxc) in entries {
         let name = url_encode_component(display_name(names, uid));
         params.push_str(&format!(
-            "&g={name}|{lat:.4}|{lon:.4}|{r:02X}{g:02X}{b:02X}|{mxc}|{score}|{dist:.1}"
+            "&g={name}|{lat:.4}|{lon:.4}|{r:02X}{g:02X}{b:02X}|{mxc}|{score}|{dist:.3}"
         ));
     }
     format!(
