@@ -300,6 +300,11 @@ html,body{height:100%;background:#1a1a2e;font-family:system-ui,sans-serif}
   padding:8px 14px;border:none;border-radius:8px;font-size:15px;
   background:#2980b9;color:#fff;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.35);
 }
+#layer-toggle{
+  position:fixed;top:12px;right:12px;z-index:1000;
+  padding:8px 12px;border:none;border-radius:8px;font-size:13px;
+  background:#fff;color:#333;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.35);
+}
 </style>
 </head>
 <body>
@@ -308,6 +313,7 @@ html,body{height:100%;background:#1a1a2e;font-family:system-ui,sans-serif}
   <input id="search-input" type="text" placeholder="Search or paste lat, lon…" autocomplete="off">
   <button id="search-btn">🔍</button>
 </div>
+<button id="layer-toggle">🛰 Satellite</button>
 <div id="bar">
   <span id="hint">Tap the map to place your pin</span>
   <button id="btn" disabled>Submit guess</button>
@@ -358,15 +364,25 @@ html,body{height:100%;background:#1a1a2e;font-family:system-ui,sans-serif}
 
   if (NAME) document.getElementById('name').textContent = '👤 ' + NAME;
 
+  var lang = (LANG || 'en').split('-')[0];
+
+  var LIBERTY    = 'https://tiles.openfreemap.org/styles/liberty';
+  var SATELLITE  = {
+    version: 8,
+    sources: {sat: {type:'raster', tileSize:256, attribution:'© Esri',
+      tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}']}},
+    layers: [{id:'sat', type:'raster', source:'sat'}]
+  };
+  var isSatellite = false;
+
   var map = new maplibregl.Map({
     container: 'map',
-    style:     'https://tiles.openfreemap.org/styles/liberty',
+    style:     LIBERTY,
     center:    [0, 20],
     zoom:      2,
   });
 
-  var lang = (LANG || 'en').split('-')[0];
-  map.once('load', function() {
+  function applyLanguage() {
     map.getStyle().layers.forEach(function(layer) {
       if (layer.layout && layer.layout['text-field']) {
         map.setLayoutProperty(layer.id, 'text-field', [
@@ -377,6 +393,15 @@ html,body{height:100%;background:#1a1a2e;font-family:system-ui,sans-serif}
         ]);
       }
     });
+  }
+
+  map.on('style.load', function() { if (!isSatellite) applyLanguage(); });
+
+  var toggleBtn = document.getElementById('layer-toggle');
+  toggleBtn.addEventListener('click', function() {
+    isSatellite = !isSatellite;
+    map.setStyle(isSatellite ? SATELLITE : LIBERTY);
+    toggleBtn.textContent = isSatellite ? '🗺 Map' : '🛰 Satellite';
   });
 
   var hint      = document.getElementById('hint');
