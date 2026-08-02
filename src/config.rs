@@ -1,5 +1,5 @@
+pub use mxbot_common::config::{EncryptionStrategy, MatrixConfig, VerificationConfig};
 use serde::Deserialize;
-pub use mxbot_common::config::{EncryptionStrategy, MatrixConfig};
 
 #[derive(Deserialize)]
 pub struct Config {
@@ -35,6 +35,8 @@ pub struct SecurityConfig {
     pub admin_users: Vec<String>,
     #[serde(default)]
     pub encryption_strategy: EncryptionStrategy,
+    #[serde(default)]
+    pub verification: VerificationConfig,
 }
 
 #[derive(Deserialize)]
@@ -82,20 +84,40 @@ pub struct ScheduleConfig {
 impl ScheduleConfig {
     pub fn parse_game_time(s: &str) -> Option<(u32, u32)> {
         let (h, m) = s.split_once(':')?;
-        let hour: u32   = h.trim().parse().ok()?;
+        let hour: u32 = h.trim().parse().ok()?;
         let minute: u32 = m.trim().parse().ok()?;
-        if hour < 24 && minute < 60 { Some((hour, minute)) } else { None }
+        if hour < 24 && minute < 60 {
+            Some((hour, minute))
+        } else {
+            None
+        }
     }
 }
 
-fn default_join_emoji()           -> String { "👍".to_owned() }
-fn default_answer_timeout()       -> u64 { 90 }
-fn default_guesses_per_round()    -> u32 { 5 }
-fn default_inter_guess_secs()     -> u64 { 15 }
-fn default_reminder_before_secs() -> u64 { 300 }
-fn default_timezone()             -> String { "UTC".to_owned() }
-fn default_photos_per_location()  -> usize { 1 }
-fn default_score_half_life_km()   -> f64 { 2000.0 }
+fn default_join_emoji() -> String {
+    "👍".to_owned()
+}
+fn default_answer_timeout() -> u64 {
+    90
+}
+fn default_guesses_per_round() -> u32 {
+    5
+}
+fn default_inter_guess_secs() -> u64 {
+    15
+}
+fn default_reminder_before_secs() -> u64 {
+    300
+}
+fn default_timezone() -> String {
+    "UTC".to_owned()
+}
+fn default_photos_per_location() -> usize {
+    1
+}
+fn default_score_half_life_km() -> f64 {
+    2000.0
+}
 
 // ── Sources ───────────────────────────────────────────────────────────────────
 
@@ -132,7 +154,9 @@ pub struct MapillaryConfig {
     pub countries: Vec<String>,
 }
 
-fn default_mapillary_radius() -> u32 { 50_000 }
+fn default_mapillary_radius() -> u32 {
+    50_000
+}
 
 #[derive(Deserialize, Default)]
 pub struct LocalConfig {

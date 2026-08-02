@@ -81,3 +81,12 @@ max_image_bytes = 4194304
 #   ...
 # ]
 # "country" must match one of the names in the built-in countries list.
+
+[security.verification]
+# Users allowed to complete first-time verification. If omitted or empty,
+# an explicit allowed_inviters list is used as the fallback.
+allowed_users = ["@you:matrix.org"]
+# SAS-only verification limits.
+flow_timeout_secs = 300
+grant_ttl_secs = 600
+max_concurrent = 8
