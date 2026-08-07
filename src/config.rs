@@ -145,8 +145,14 @@ pub struct MapillaryConfig {
     /// Get one free at https://www.mapillary.com/developer
     #[serde(default)]
     pub access_token: String,
-    /// Search radius in metres around the seed coordinate (default 50 000 = 50 km, the API max).
-    /// The Mapillary API accepts up to 50 km; the value is divided by 1000 internally.
+    /// Desired search radius in metres around the seed coordinate.
+    /// We search via Mapillary's `bbox` query (not `radius` — that param is
+    /// capped by the API at 50 *metres*, far too small to find enough
+    /// images). `bbox` has its own hard cap of "smaller than 0.01 degrees
+    /// square", which works out to roughly 500 m–1.1 km per side depending
+    /// on latitude. Any value here larger than that ceiling is silently
+    /// clamped down to it — there is no way to search a wider area via this
+    /// endpoint. See `sources::mapillary::seed_bbox`.
     #[serde(default = "default_mapillary_radius")]
     pub search_radius: u32,
     /// Optional ISO 3166-1 alpha-2 country filter (same as wikimedia).

@@ -32,6 +32,17 @@ use crate::{
 const API: &str = "https://graph.mapillary.com/images";
 const UA: &str = "geoguessr-bot/0.1 (matrix bot)";
 
+/// Max candidate images to request per `bbox` query. Mapillary's documented
+/// max (and default) for the `limit` param on /images is 2000; requesting it
+/// up front avoids needing pagination to get a representative sample.
+const MAPILLARY_IMAGES_LIMIT: u32 = 2000;
+
+/// Half-width, in degrees, of the largest bounding box Mapillary's /images
+/// endpoint accepts. The API rejects any bbox that isn't strictly smaller
+/// than 0.01 degrees square, so 0.0049 (a 0.0098° full box) stays safely
+/// under that with margin for floating-point rounding.
+const MAX_BBOX_HALF_DEG: f64 = 0.0049;
+
 // ── API response shapes ───────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -253,27 +264,37 @@ async fn try_seed(
     filter: &mut super::quality_filter::FilterState,
     blur_cache: &Mutex<BlurCache>,
 ) -> Result<Option<GeoImage>> {
-    let radius_km = (cfg.search_radius / 1000).clamp(1, 50);
+    // Mapillary's /images endpoint does NOT support an arbitrarily large
+    // point+radius search: its `radius` query param is capped by the API
+    // itself at 50 (and per Mapillary's docs that unit is *metres*, not
+    // kilometres — confirmed empirically: the API returns HTTP 200 with
+    // `{"error": "Param radius must be a number less than or equal to 50"}`
+    // for anything above 50). A 50 m circle around an arbitrary seed point
+    // yields only a handful of candidate images, which made the
+    // photos-per-location quality/diversity filters starve almost
+    // everywhere. The endpoint's actual wide-area filter is `bbox`, capped
+    // at "smaller than 0.01 degrees square" — empirically this returns
+    // ~1000x more candidates than the old radius search for the same seed
+    // point, so we use that instead and treat `search_radius` purely as an
+    // (optional, smaller-than-max) cap on the box size.
+    let (left, bottom, right, top) = seed_bbox(seed.lat, seed.lon, cfg.search_radius);
+    let effective_radius_km = bbox_effective_radius_km(seed.lat, left, bottom, right, top);
     let url = format!(
         "{API}?access_token={token}\
          &fields=id,geometry,thumb_1024_url,creator,sequence,captured_at,width,height,compass_angle,quality_score\
-         &lat={lat}&lng={lon}\
-         &radius={radius}\
-         &limit=50",
-        token  = cfg.access_token,
-        lat    = seed.lat,
-        lon    = seed.lon,
-        radius = radius_km,
+         &bbox={left},{bottom},{right},{top}\
+         &limit={MAPILLARY_IMAGES_LIMIT}",
+        token = cfg.access_token,
     );
 
     let resp: MapillaryResp = get_with_retry(client, &url).await?;
 
     if resp.data.is_empty() {
         bail!(
-            "no images found near {}, {} within {}km",
+            "no images found near {}, {} within ~{:.2}km effective radius",
             seed.city,
             seed.country.name,
-            radius_km
+            effective_radius_km,
         );
     }
 
@@ -396,7 +417,7 @@ async fn try_seed(
             height: candidates[primary_idx].height.unwrap_or(0),
             captured_at_ms: candidates[primary_idx].captured_at,
             area_image_count,
-            search_radius_km: radius_km as f64,
+            search_radius_km: effective_radius_km,
             gps_jitter_m: None, // not exposed by Mapillary v4 API
             sequence_continuity: seq_score,
             server_quality: candidates[primary_idx].quality_score,
@@ -467,6 +488,36 @@ async fn try_seed(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Build a `(left, bottom, right, top)` bounding box around `(lat, lon)`,
+/// sized from `radius_m` (metres) but clamped to the largest box Mapillary's
+/// /images endpoint will accept (see `MAX_BBOX_HALF_DEG`). Longitude degrees
+/// shrink with latitude, so the longitude half-width is widened by
+/// `1 / cos(lat)` to keep the box roughly square on the ground — still
+/// subject to the same degree clamp, since that's what the API enforces.
+fn seed_bbox(lat: f64, lon: f64, radius_m: u32) -> (f64, f64, f64, f64) {
+    const METRES_PER_DEG: f64 = 111_320.0;
+    let half_lat_deg = (radius_m as f64 / METRES_PER_DEG).min(MAX_BBOX_HALF_DEG);
+    let lon_scale = lat.to_radians().cos().abs().max(0.01); // guard near the poles
+    let half_lon_deg = (radius_m as f64 / (METRES_PER_DEG * lon_scale)).min(MAX_BBOX_HALF_DEG);
+    (
+        lon - half_lon_deg,
+        lat - half_lat_deg,
+        lon + half_lon_deg,
+        lat + half_lat_deg,
+    )
+}
+
+/// Radius (km) of a circle with the same area as the given bbox, for feeding
+/// into `quality_filter::score_density`, which expects a search radius
+/// rather than a box.
+fn bbox_effective_radius_km(lat: f64, left: f64, bottom: f64, right: f64, top: f64) -> f64 {
+    const KM_PER_DEG: f64 = 111.32;
+    let width_km = (right - left) * KM_PER_DEG * lat.to_radians().cos().abs();
+    let height_km = (top - bottom) * KM_PER_DEG;
+    let area_km2 = (width_km * height_km).max(0.0);
+    (area_km2 / std::f64::consts::PI).sqrt()
+}
 
 /// Download a thumbnail image; returns `None` on any network or HTTP error.
 async fn download_thumbnail(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
@@ -695,4 +746,47 @@ fn sequence_score_for(candidates: &[MapillaryImage], primary_idx: usize) -> Opti
     });
 
     Some(super::quality_filter::score_sequence_continuity(&frames))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_bbox_never_exceeds_mapillarys_bbox_size_limit() {
+        // Mapillary rejects any bbox that isn't strictly smaller than 0.01
+        // degrees square. Check both a large requested radius and a
+        // near-polar latitude (where 1/cos(lat) blows up the naive
+        // longitude conversion) stay safely under that in both dimensions.
+        for (lat, lon, radius_m) in [
+            (0.0, 0.0, 50_000),
+            (61.4978, 23.7610, 50_000), // Tampere
+            (65.0, 20.0, 200_000),      // near-polar, huge requested radius
+            (-33.0, 151.0, 5_000),      // small requested radius
+        ] {
+            let (left, bottom, right, top) = seed_bbox(lat, lon, radius_m);
+            assert!(right - left < 0.01, "lon span too large at lat={lat}");
+            assert!(top - bottom < 0.01, "lat span too large at lat={lat}");
+            assert!(left < lon && lon < right);
+            assert!(bottom < lat && lat < top);
+        }
+    }
+
+    #[test]
+    fn seed_bbox_respects_small_requested_radius() {
+        // A radius well under the API ceiling should not be clamped up to it.
+        let (_left, bottom, _right, top) = seed_bbox(0.0, 0.0, 100);
+        let lat_span_deg = top - bottom;
+        assert!(lat_span_deg < MAX_BBOX_HALF_DEG); // much smaller than the max
+        assert!(lat_span_deg > 0.0);
+    }
+
+    #[test]
+    fn bbox_effective_radius_km_is_positive_and_reasonable() {
+        let (left, bottom, right, top) = seed_bbox(48.85, 2.35, 50_000); // Paris
+        let r = bbox_effective_radius_km(48.85, left, bottom, right, top);
+        // Max bbox is roughly ~0.5-0.6 km on a side at this latitude, so the
+        // equivalent-area radius should land well under 1 km.
+        assert!(r > 0.0 && r < 1.0, "effective radius out of range: {r}");
+    }
 }
