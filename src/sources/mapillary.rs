@@ -21,7 +21,10 @@ use rand::seq::SliceRandom;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use super::{diversity::DiversityTracker, get_with_retry, min_dist_to_existing, MIN_DISTANCE_KM};
+use super::{
+    diversity::DiversityTracker, get_with_retry, haversine_km, min_dist_to_existing,
+    MIN_DISTANCE_KM,
+};
 
 use crate::{
     config::MapillaryConfig,
@@ -367,7 +370,26 @@ async fn try_seed(
             candidates[b].geometry.coordinates[1],
             candidates[b].geometry.coordinates[0],
         );
-        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        // Diversity cells are 2° wide (see diversity.rs), so every candidate
+        // in a single seed's sub-1km bbox falls in the same cell and ties
+        // here in practice. Break ties (and rank within them) by distance to
+        // the seed's named point, so we prefer images actually near "Tampere"
+        // over ones merely somewhere inside the search box.
+        let dist_a = haversine_km(
+            seed.lat,
+            seed.lon,
+            candidates[a].geometry.coordinates[1],
+            candidates[a].geometry.coordinates[0],
+        );
+        let dist_b = haversine_km(
+            seed.lat,
+            seed.lon,
+            candidates[b].geometry.coordinates[1],
+            candidates[b].geometry.coordinates[0],
+        );
+        sb.partial_cmp(&sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal))
     });
 
     // ── Try each diversity-passing candidate through the quality filter ────────
