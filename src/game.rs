@@ -328,6 +328,11 @@ pub async fn start_round(
         q
     };
 
+    if image_queue.is_empty() && n > 0 {
+        abort_round_no_images(&ctx, &client, round_id, n).await;
+        return Ok(());
+    }
+
     let mut round_scores_free: HashMap<String, i64> = HashMap::new();
 
     let mut first_guess = true;
@@ -429,6 +434,47 @@ pub async fn start_round(
     Ok(())
 }
 
+/// Abort a round that has zero usable images: every cached candidate was
+/// either too close to a previously-played location or was discarded by the
+/// photos-per-location dedup gate (see the "pop-time dedup" warnings logged
+/// just before this is called). Posts a message distinct from "nobody
+/// played" so it's clear this was a supply-side failure, not a
+/// participation outcome, and finishes/clears round state so it doesn't
+/// linger as active.
+async fn abort_round_no_images(ctx: &BotContext, client: &Client, round_id: i64, requested: usize) {
+    error!(
+        "GeoGuessr round {round_id}: aborting — 0 of {requested} requested image(s) available \
+         after quality/dedup filtering; see preceding 'pop-time dedup' warnings for the reason(s)"
+    );
+    if let Some(r) = client.get_room(&ctx.room_id) {
+        r.send(format::mentionify(
+            "⚠️ Round aborted · no location with enough valid images was available. \
+             An admin may need to run !prefetch or check the image source config.",
+        ))
+        .await
+        .ok();
+    }
+    ctx.db.finish_round(round_id).await.ok();
+    let mut st = ctx.state.lock().await;
+    st.active_round = None;
+    st.save(&ctx.state_path).await.ok();
+}
+
+/// Abort a single guess because its image could not be delivered to Matrix
+/// (fetch, upload, or send failure). Posts a chat message distinct from a
+/// normal timeout/reveal, and closes out the DB guess row so it isn't left
+/// dangling in a "started" state. Called before the countdown timer, active
+/// game registration, or DB event-id linkage happen, so no player-facing
+/// state ever treats this guess as playable.
+async fn abort_guess_no_image(ctx: &BotContext, room: &Room, guess_id: i64, guess_num: u32, n_total: u32) {
+    room.send(format::mentionify(&format!(
+        "⚠️ Guess {guess_num}/{n_total} skipped · failed to deliver the image to Matrix (see logs).",
+    )))
+    .await
+    .ok();
+    ctx.db.finish_guess(guess_id, 0, 0).await.ok();
+}
+
 // ── Single image — free guess ─────────────────────────────────────────────────
 
 async fn play_free_guess(
@@ -474,18 +520,42 @@ async fn play_free_guess(
         }
     };
 
+    info!(
+        "GeoGuessr guess {guess_num}/{n_total}: selected {} ({}, source={}, lat={:?}, lon={:?}) — \
+         fetching/uploading image",
+        img.city.as_deref().unwrap_or(&img.country),
+        img.country,
+        img.source,
+        img.lat,
+        img.lon,
+    );
+
     // Upload all images once; reuse mxc_uris across main room + all DMs.
     let all_images = match upload_all_images(client, img).await {
         Ok(v) => v,
         Err(e) => {
-            error!("GeoGuessr free-guess: failed to upload image: {e}");
+            error!(
+                "GeoGuessr guess {guess_num}/{n_total}: failed to fetch/upload image for {} \
+                 (source={}, url={}): {e}",
+                img.country, img.source, img.image_url,
+            );
+            abort_guess_no_image(ctx, room, guess_id, guess_num, n_total).await;
             return Ok(());
         }
     };
 
+    info!(
+        "GeoGuessr guess {guess_num}/{n_total}: uploaded {} image(s) to Matrix media store for {}",
+        all_images.len(),
+        img.country,
+    );
+
     let n_imgs = all_images.len();
 
-    // Post all images to the main room.
+    // Post all images to the main room. The primary (reference) image must
+    // be sent successfully before the round is allowed to become playable —
+    // if it fails, abort the guess instead of starting a timer nobody can
+    // see an image for. Extra context images are best-effort.
     for (i, media) in all_images.iter().enumerate() {
         let label = if i == 0 {
             if n_imgs == 1 {
@@ -496,15 +566,36 @@ async fn play_free_guess(
         } else {
             format!("📍 Context image ({}/{})", i + 1, n_imgs)
         };
-        room.send(image_content_with_info(
-            label,
-            media.uri.clone(),
-            &media.mime,
-            media.w,
-            media.h,
-            media.size,
-        ))
-        .await?;
+        let send_result = room
+            .send(image_content_with_info(
+                label,
+                media.uri.clone(),
+                &media.mime,
+                media.w,
+                media.h,
+                media.size,
+            ))
+            .await;
+        match send_result {
+            Ok(ev) => info!(
+                "GeoGuessr guess {guess_num}/{n_total}: sent image {}/{n_imgs} to room \
+                 (event_id={})",
+                i + 1,
+                ev.response.event_id,
+            ),
+            Err(e) if i == 0 => {
+                error!(
+                    "GeoGuessr guess {guess_num}/{n_total}: failed to send reference image \
+                     event to room: {e}"
+                );
+                abort_guess_no_image(ctx, room, guess_id, guess_num, n_total).await;
+                return Ok(());
+            }
+            Err(e) => warn!(
+                "GeoGuessr guess {guess_num}/{n_total}: failed to send context image {}/{n_imgs}: {e}",
+                i + 1,
+            ),
+        }
     }
 
     let total_secs = answer_timeout_secs;
@@ -1724,13 +1815,33 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
         }
     }
 
-    let current = ctx.state.lock().await.cached_guesses.len();
+    // Only count cache entries that actually satisfy the *current*
+    // photos-per-location requirement — an entry with too few photos will be
+    // discarded by the pop-time dedup gate in `start_round` and is therefore
+    // not "available" from the caller's point of view.  Counting raw cache
+    // length here previously let the cache silently fill up with images that
+    // could never be used once `photos_per_location` was raised, so prefetch
+    // would think it had enough and stop fetching — permanently starving
+    // every future round of usable images.
+    let n_photos_needed = ctx.effective_photos_per_location().await;
+    let (current, total_cached) = {
+        let st = ctx.state.lock().await;
+        let usable = st
+            .cached_guesses
+            .iter()
+            .filter(|img| img.extra_image_urls.len() + 1 >= n_photos_needed)
+            .count();
+        (usable, st.cached_guesses.len())
+    };
     let needed = target.saturating_sub(current);
     if needed == 0 {
         return;
     }
 
-    info!("GeoGuessr: prefetching {needed} images");
+    info!(
+        "GeoGuessr: prefetching {needed} image(s) (target={target}, usable_cached={current}, \
+         total_cached={total_cached}, photos_per_location={n_photos_needed})"
+    );
 
     let sources = &ctx.config.sources.enabled;
 
@@ -1796,12 +1907,11 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
                 .to_owned()
         };
 
-        let n_photos = ctx.effective_photos_per_location().await;
         let result = match source.as_str() {
             "mapillary" => {
                 crate::sources::mapillary::fetch(
                     &ctx.config.sources.mapillary,
-                    n_photos,
+                    n_photos_needed,
                     &existing_coords,
                     &existing_seqs,
                     &mut filter,
@@ -2127,6 +2237,12 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         st.save(&ctx.state_path).await.ok();
         q
     };
+
+    if image_queue.is_empty() && n > 0 {
+        abort_round_no_images(&ctx, &client, round_id, n).await;
+        *ctx.round_abort.lock().await = None;
+        return;
+    }
 
     let total = image_queue.len();
     let mut round_scores_free: HashMap<String, i64> = HashMap::new();
