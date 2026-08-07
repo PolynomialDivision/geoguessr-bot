@@ -50,6 +50,10 @@ CREATE TABLE IF NOT EXISTS answers (
     guess_lon     REAL,
     distance_km   REAL,
     score         INTEGER,
+    -- 1 = this row is a synthesized "no guess submitted" record (score 0)
+    -- for a player who was part of the round's roster but didn't answer.
+    -- 0 = a real, player-submitted guess. See Db::record_missed_guesses.
+    missed        INTEGER NOT NULL DEFAULT 0,
     UNIQUE(guess_id, user_id)
 );
 

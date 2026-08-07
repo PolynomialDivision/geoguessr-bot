@@ -48,6 +48,26 @@ reminder_before_secs = 300
 # IANA timezone for scheduling.
 timezone = "Europe/Berlin"
 
+[schedule.rating]
+# Leaderboard rating = a Bayesian-shrinkage estimate of skill:
+#   rating = (n / (n + k)) * player_average + (k / (n + k)) * baseline
+# `n` is guesses played, counting missed/no-guess rounds as 0 (so skipping a
+# hard guess can't inflate your average). `baseline` is derived automatically
+# from the community's own average score per guess — not set here.
+#
+# How many "prior" guesses worth of pull toward the baseline a rating gets.
+# Higher = trusts a small sample less; lower = trusts it sooner. At n = k a
+# player's rating is exactly halfway between their own average and baseline.
+# k = 15
+
+# Guesses played below which a leaderboard entry is flagged "provisional"
+# (🔰) — a display hint only, doesn't change the rating math.
+# provisional_threshold = 10
+
+# Rating baseline used only when there's no community data yet (e.g. right
+# after !resetstats). Ignored once any guesses exist.
+# baseline_fallback = 1500.0
+
 [sources]
 # Sources to draw images from. Supported: "wikimedia", "mapillary", "local".
 # The bot picks randomly from this list for each image.

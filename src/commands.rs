@@ -542,18 +542,112 @@ async fn cmd_scores_rolling(ctx: &BotContext) -> Result<Option<String>> {
     }
 }
 
+// ── Scoring / rating ─────────────────────────────────────────────────────────
+//
+// The leaderboard rating is a Bayesian-shrinkage estimate of a player's true
+// skill:
+//
+//   rating = (n / (n + k)) * player_average + (k / (n + k)) * baseline
+//
+// `n` is `guesses_played` — every guess a player was on the hook for, real
+// submissions AND missed/no-guess rounds (recorded as 0, see
+// `Db::record_missed_guesses`). Counting misses as 0 rather than excluding
+// them is what makes "every round you join counts": skipping a hard guess
+// drags your average down instead of just not counting, so there's no
+// strategic benefit to only answering the easy ones.
+//
+// `baseline` is the community's own average score per guess — derived from
+// the leaderboard data itself (see `community_baseline`), not a fixed
+// constant, so it tracks the actual difficulty/skill level of this room's
+// games over time.
+//
+// `k` (config: `schedule.rating.k`) controls how fast a player's rating
+// trusts their own average over the baseline: at n = k they're weighted
+// equally; at n >> k the rating is essentially their raw average; at n = 0
+// the rating is exactly the baseline. This is what keeps a single lucky
+// perfect round from outranking someone with a long, consistently good
+// track record, while a player who plays a lot but badly still converges to
+// their own (low) rating rather than being propped up by participation
+// alone — shrinkage only pulls toward the baseline, it never adds points
+// for volume.
+
+fn raw_score_average(entry: &crate::db::ScoreLeaderboardEntry) -> f64 {
+    if entry.guesses_played > 0 {
+        entry.total_score as f64 / entry.guesses_played as f64
+    } else {
+        0.0
+    }
+}
+
+/// Community baseline: average score per guess across the whole board
+/// (real + missed guesses). Falls back to `fallback` only when there's no
+/// data yet to derive one from (e.g. right after `!resetstats`).
+fn community_baseline(board: &[crate::db::ScoreLeaderboardEntry], fallback: f64) -> f64 {
+    let total_score: i64 = board.iter().map(|e| e.total_score).sum();
+    let total_guesses: i64 = board.iter().map(|e| e.guesses_played).sum();
+    if total_guesses > 0 {
+        total_score as f64 / total_guesses as f64
+    } else {
+        fallback
+    }
+}
+
+/// Bayesian-shrinkage rating — see the module-level comment above.
+fn shrunk_rating(entry: &crate::db::ScoreLeaderboardEntry, k: f64, baseline: f64) -> f64 {
+    let n = entry.guesses_played as f64;
+    if n <= 0.0 {
+        return baseline;
+    }
+    let weight = n / (n + k.max(0.0));
+    weight * raw_score_average(entry) + (1.0 - weight) * baseline
+}
+
+/// Percentage of `guesses_played` that were real submissions (not missed).
+fn completion_pct(entry: &crate::db::ScoreLeaderboardEntry) -> f64 {
+    if entry.guesses_played > 0 {
+        entry.guesses_answered as f64 / entry.guesses_played as f64 * 100.0
+    } else {
+        0.0
+    }
+}
+
+/// A rating is "provisional" — not yet enough data to trust — below the
+/// configured `provisional_threshold` of guesses played. Display-only; the
+/// rating math already accounts for sample size via shrinkage regardless.
+fn is_provisional(entry: &crate::db::ScoreLeaderboardEntry, threshold: i64) -> bool {
+    entry.guesses_played < threshold
+}
+
+fn sort_score_leaderboard(board: &mut [crate::db::ScoreLeaderboardEntry], k: f64, baseline: f64) {
+    board.sort_by(|a, b| {
+        shrunk_rating(b, k, baseline)
+            .partial_cmp(&shrunk_rating(a, k, baseline))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.guesses_played.cmp(&a.guesses_played))
+            .then(a.user_id.cmp(&b.user_id))
+    });
+}
+
 fn format_leaderboard(
     mut board: Vec<crate::db::ScoreLeaderboardEntry>,
     header: &str,
     round_count: i64,
+    rating_cfg: &crate::config::RatingConfig,
 ) -> String {
     const BAR_W: usize = 10;
 
-    sort_score_leaderboard(&mut board);
+    let baseline = community_baseline(&board, rating_cfg.baseline_fallback);
+    let k = rating_cfg.k;
+    sort_score_leaderboard(&mut board, k, baseline);
 
     let mut lines = vec![
         format!("🏆 **{}** · {} rounds", header, round_count),
-        "⭐ rating = avg score minus reliability penalty".to_owned(),
+        format!(
+            "⭐ rating blends your average with the community baseline (⭐{}) until you've played \
+             enough to trust it · 🔰 = provisional (<{} guesses)",
+            baseline.round() as i64,
+            rating_cfg.provisional_threshold,
+        ),
         String::new(),
     ];
     for (i, entry) in board.iter().enumerate() {
@@ -563,10 +657,10 @@ fn format_leaderboard(
             2 => "🥉",
             _ => "▪️",
         };
-        let rating = fair_rating(entry);
+        let rating = shrunk_rating(entry, k, baseline);
         let raw_avg = raw_score_average(entry);
-        let confidence = score_confidence(entry);
-        let best_dist = if entry.guesses_played > 0 {
+        let pct = completion_pct(entry);
+        let best_dist = if entry.guesses_answered > 0 {
             format_dist(entry.best_distance_km)
         } else {
             "n/a".to_owned()
@@ -577,53 +671,23 @@ fn format_leaderboard(
             "█".repeat(filled.min(BAR_W)),
             "░".repeat(BAR_W - filled.min(BAR_W))
         );
+        let provisional = if is_provisional(entry, rating_cfg.provisional_threshold) {
+            " 🔰"
+        } else {
+            ""
+        };
         lines.push(format!(
-            "{medal} {}. {} · ⭐{} {bar} · 🎯{}/g · 🔒{}% · 🎮{} · 🏅{}",
+            "{medal} {}. {}{provisional} · ⭐{} {bar} · 🎯{}/g · ✅{}% · 🎮{} · 🏅{}",
             i + 1,
             entry.user_id,
             rating.round() as i64,
             raw_avg.round() as i64,
-            (confidence * 100.0).round() as i64,
+            pct.round() as i64,
             entry.guesses_played,
             best_dist,
         ));
     }
     lines.join("\n")
-}
-
-fn fair_rating(entry: &crate::db::ScoreLeaderboardEntry) -> f64 {
-    const MAX_UNCERTAINTY_PENALTY: f64 = 1200.0;
-
-    let penalty = MAX_UNCERTAINTY_PENALTY * (1.0 - score_confidence(entry));
-    (raw_score_average(entry) - penalty).max(0.0)
-}
-
-fn score_confidence(entry: &crate::db::ScoreLeaderboardEntry) -> f64 {
-    const PRIOR_GUESSES: f64 = 20.0;
-
-    if entry.guesses_played > 0 {
-        entry.guesses_played as f64 / (entry.guesses_played as f64 + PRIOR_GUESSES)
-    } else {
-        0.0
-    }
-}
-
-fn raw_score_average(entry: &crate::db::ScoreLeaderboardEntry) -> f64 {
-    if entry.guesses_played > 0 {
-        entry.total_score as f64 / entry.guesses_played as f64
-    } else {
-        0.0
-    }
-}
-
-fn sort_score_leaderboard(board: &mut [crate::db::ScoreLeaderboardEntry]) {
-    board.sort_by(|a, b| {
-        fair_rating(b)
-            .partial_cmp(&fair_rating(a))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(b.guesses_played.cmp(&a.guesses_played))
-            .then(a.user_id.cmp(&b.user_id))
-    });
 }
 
 /// All-time leaderboard (every round ever played). Used by `!leaderboard`.
@@ -637,6 +701,7 @@ pub async fn build_alltime_leaderboard(ctx: &BotContext) -> Option<String> {
         board,
         "All-time Leaderboard",
         round_count,
+        &ctx.config.schedule.rating,
     ))
 }
 
@@ -651,6 +716,7 @@ pub async fn build_rolling_leaderboard(ctx: &BotContext) -> Option<String> {
         board,
         "Leaderboard (last 90 days)",
         round_count,
+        &ctx.config.schedule.rating,
     ))
 }
 
@@ -674,8 +740,10 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
         0
     };
 
+    let rating_cfg = &ctx.config.schedule.rating;
     let mut board = ctx.db.score_leaderboard_alltime().await.unwrap_or_default();
-    sort_score_leaderboard(&mut board);
+    let baseline = community_baseline(&board, rating_cfg.baseline_fallback);
+    sort_score_leaderboard(&mut board, rating_cfg.k, baseline);
     let rank = board.iter().position(|e| e.user_id == user).map(|i| i + 1);
     let rank_str = rank
         .map(|r| format!(" · rank #{r} of {}", board.len()))
@@ -685,6 +753,25 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
         "🌍 **Your stats** · {}/{} correct ({}%) · {} round(s){rank_str}",
         stats.total_correct, stats.total_questions, pct, stats.rounds_played,
     )];
+
+    if let Some(entry) = board.iter().find(|e| e.user_id == user) {
+        let rating = shrunk_rating(entry, rating_cfg.k, baseline);
+        let raw_avg = raw_score_average(entry);
+        let pct = completion_pct(entry);
+        let provisional = if is_provisional(entry, rating_cfg.provisional_threshold) {
+            " (provisional)"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "⭐ Rating {}{provisional} · avg {} pts/guess · {}% completion ({} guesses, {} missed)",
+            rating.round() as i64,
+            raw_avg.round() as i64,
+            pct.round() as i64,
+            entry.guesses_played,
+            entry.guesses_played - entry.guesses_answered,
+        ));
+    }
 
     let country_stats = ctx.db.user_country_stats(user).await.unwrap_or_default();
     if country_stats.len() >= 2 {
@@ -903,54 +990,213 @@ fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RatingConfig;
+    use crate::db::ScoreLeaderboardEntry;
 
-    fn score_entry(
+    /// A player with no missed guesses: `guesses_answered == guesses_played`,
+    /// matching every pre-existing (pre-`missed`-column) row.
+    fn score_entry(user_id: &str, total_score: i64, guesses_played: i64) -> ScoreLeaderboardEntry {
+        score_entry_with_misses(user_id, total_score, guesses_played, guesses_played)
+    }
+
+    /// A player with `guesses_played - guesses_answered` missed guesses
+    /// (each contributing 0 to `total_score`, matching how
+    /// `Db::record_missed_guesses` stores them).
+    fn score_entry_with_misses(
         user_id: &str,
         total_score: i64,
         guesses_played: i64,
-    ) -> crate::db::ScoreLeaderboardEntry {
-        crate::db::ScoreLeaderboardEntry {
+        guesses_answered: i64,
+    ) -> ScoreLeaderboardEntry {
+        ScoreLeaderboardEntry {
             user_id: user_id.to_owned(),
             total_score,
             rounds_played: guesses_played,
             guesses_played,
+            guesses_answered,
             avg_distance_km: 1000.0,
             best_distance_km: 100.0,
         }
     }
 
+    const TEST_RATING: RatingConfig = RatingConfig {
+        k: 15.0,
+        provisional_threshold: 10,
+        baseline_fallback: 1500.0,
+    };
+
+    // ── Missed guesses count as zero ────────────────────────────────────────
+
     #[test]
-    fn score_leaderboard_sorts_by_fair_rating() {
+    fn missed_guess_drags_average_down_instead_of_being_ignored() {
+        // One perfect 5000-pt guess, then one missed guess (0 pts). If the
+        // miss were simply excluded (the old bug), this would still average
+        // 5000/1 = 5000. Counted as a zero, it should average 5000/2 = 2500.
+        let entry = score_entry_with_misses("@skipper:example.com", 5_000, 2, 1);
+
+        assert_eq!(raw_score_average(&entry), 2500.0);
+        assert_eq!(completion_pct(&entry), 50.0);
+    }
+
+    #[test]
+    fn fully_missed_player_has_zero_average_not_no_average() {
+        let entry = score_entry_with_misses("@ghost:example.com", 0, 3, 0);
+
+        assert_eq!(raw_score_average(&entry), 0.0);
+        assert_eq!(completion_pct(&entry), 0.0);
+    }
+
+    // ── One lucky round shouldn't dominate ──────────────────────────────────
+
+    #[test]
+    fn one_perfect_round_does_not_outrank_sustained_consistent_play() {
+        // A single perfect round (raw average 5000, n=1) vs. 50 rounds of
+        // solid (not perfect) play averaging 2200.
+        let lucky = score_entry("@lucky-one-shot:example.com", 5_000, 1);
+        let consistent = score_entry("@consistent-grinder:example.com", 2_200 * 50, 50);
+
+        let baseline = 1800.0;
+        let rating_lucky = shrunk_rating(&lucky, TEST_RATING.k, baseline);
+        let rating_consistent = shrunk_rating(&consistent, TEST_RATING.k, baseline);
+
+        assert!(
+            rating_consistent > rating_lucky,
+            "consistent play ({rating_consistent}) should outrank a single lucky round ({rating_lucky})"
+        );
+
+        let mut board = vec![lucky, consistent];
+        sort_score_leaderboard(&mut board, TEST_RATING.k, baseline);
+        assert_eq!(board[0].user_id, "@consistent-grinder:example.com");
+    }
+
+    // ── Many consistently good rounds → rating trusts the player's own average ──
+
+    #[test]
+    fn many_good_rounds_converge_close_to_raw_average() {
+        let veteran = score_entry("@veteran:example.com", 2_500 * 200, 200);
+        let baseline = 1800.0;
+
+        let rating = shrunk_rating(&veteran, TEST_RATING.k, baseline);
+        let raw_avg = raw_score_average(&veteran);
+
+        // n=200 vastly outweighs k=15, so the baseline's pull should be minor.
+        assert!(
+            (rating - raw_avg).abs() < 100.0,
+            "rating {rating} should be close to raw average {raw_avg} at large n"
+        );
+    }
+
+    // ── Grinding badly isn't rewarded merely for participation ─────────────
+
+    #[test]
+    fn repeated_bad_play_is_not_propped_up_by_participation() {
+        // Plays constantly but badly: raw average 200, far below baseline.
+        let bad_grinder = score_entry("@bad-grinder:example.com", 200 * 100, 100);
+        // Barely plays, but happens to land right at the baseline average.
+        let mediocre_newcomer = score_entry("@mediocre-newcomer:example.com", 1_800 * 2, 2);
+
+        let baseline = 1800.0;
+        let rating_bad = shrunk_rating(&bad_grinder, TEST_RATING.k, baseline);
+        let rating_newcomer = shrunk_rating(&mediocre_newcomer, TEST_RATING.k, baseline);
+
+        // Volume alone must not lift the bad grinder above someone who merely
+        // played a couple of average rounds — the rating should track their
+        // own poor average, not their participation count.
+        assert!(
+            rating_bad < rating_newcomer,
+            "grinding badly ({rating_bad}) must not outrank a mediocre newcomer ({rating_newcomer})"
+        );
+        // And it should sit close to their own (bad) average, not be pulled
+        // meaningfully toward the baseline just because n is large.
+        assert!(
+            rating_bad < baseline - 1000.0,
+            "rating {rating_bad} should stay well below the baseline {baseline}"
+        );
+    }
+
+    // ── Baseline is a genuine (weighted) community average ─────────────────
+
+    #[test]
+    fn community_baseline_is_guess_weighted_not_a_naive_average_of_averages() {
+        let a = score_entry("@a:example.com", 1_000, 10); // avg 100
+        let b = score_entry("@b:example.com", 100_000, 100); // avg 1000
+
+        // Weighted: (1000 + 100000) / (10 + 100) = 918.18...
+        // A naive mean of the two per-player averages would give 550 instead
+        // — wrong, because it would let a low-volume player skew the
+        // baseline as much as a high-volume one.
+        let baseline = community_baseline(&[a, b], 1500.0);
+        assert!((baseline - 918.18).abs() < 0.1, "baseline was {baseline}");
+    }
+
+    #[test]
+    fn community_baseline_falls_back_when_no_data() {
+        assert_eq!(community_baseline(&[], 1500.0), 1500.0);
+    }
+
+    // ── Existing (pre-`missed`-column) data keeps working ───────────────────
+
+    #[test]
+    fn legacy_style_entries_with_no_misses_behave_sanely() {
+        // Every historical row defaults to missed=0, so guesses_answered ==
+        // guesses_played for all pre-existing data — completion should read
+        // 100% and the rating/average math should behave exactly as before.
+        let legacy = score_entry("@veteran-since-day-one:example.com", 4_000 * 30, 30);
+
+        assert_eq!(completion_pct(&legacy), 100.0);
+        assert_eq!(raw_score_average(&legacy), 4_000.0);
+        assert!(!is_provisional(&legacy, TEST_RATING.provisional_threshold));
+    }
+
+    // ── Sorting + formatting ─────────────────────────────────────────────────
+
+    #[test]
+    fn sort_score_leaderboard_orders_by_rating_then_volume_then_name() {
         let mut board = vec![
             score_entry("@high-total-low-average:example.com", 100_000, 100),
             score_entry("@lower-total-high-average:example.com", 50_000, 10),
         ];
 
-        sort_score_leaderboard(&mut board);
+        sort_score_leaderboard(&mut board, TEST_RATING.k, 1800.0);
 
         assert_eq!(board[0].user_id, "@lower-total-high-average:example.com");
-        assert!(fair_rating(&board[0]) > fair_rating(&board[1]));
     }
 
     #[test]
-    fn fair_rating_uses_only_a_small_sample_penalty() {
-        let few_guesses = score_entry("@few:example.com", 5_000, 2);
-        let many_guesses = score_entry("@many:example.com", 50_000, 20);
+    fn provisional_flag_reflects_threshold() {
+        let new_player = score_entry("@new:example.com", 5_000, 3);
+        let established = score_entry("@established:example.com", 100_000, 30);
 
-        assert_eq!(fair_rating(&few_guesses).round() as i64, 1_409);
-        assert_eq!(fair_rating(&many_guesses).round() as i64, 1_900);
+        assert!(is_provisional(&new_player, TEST_RATING.provisional_threshold));
+        assert!(!is_provisional(&established, TEST_RATING.provisional_threshold));
     }
 
     #[test]
-    fn leaderboard_is_compact_and_bar_reflects_rating() {
+    fn leaderboard_formatting_shows_rating_average_completion_and_volume() {
+        // Single entry → the community baseline equals its own average, so
+        // shrinkage is a no-op and the rating is exactly the raw average —
+        // keeps the expected string deterministic.
         let text = format_leaderboard(
             vec![score_entry("@twenty-guesses:example.com", 100_000, 20)],
             "Test Leaderboard",
             1,
+            &TEST_RATING,
         );
 
         assert!(text.contains(
-            "🥇 1. @twenty-guesses:example.com · ⭐4400 █████████░ · 🎯5000/g · 🔒50% · 🎮20 · 🏅100 km"
+            "🥇 1. @twenty-guesses:example.com · ⭐5000 ██████████ · 🎯5000/g · ✅100% · 🎮20 · 🏅100 km"
         ));
+    }
+
+    #[test]
+    fn leaderboard_formatting_marks_provisional_entries() {
+        let text = format_leaderboard(
+            vec![score_entry("@fresh:example.com", 5_000, 2)],
+            "Test Leaderboard",
+            1,
+            &TEST_RATING,
+        );
+
+        assert!(text.contains("@fresh:example.com 🔰"));
     }
 }

@@ -79,6 +79,9 @@ pub struct ScheduleConfig {
     ///   500  = 50 km scores ~4512 pts.
     #[serde(default = "default_score_half_life_km")]
     pub score_half_life_km: f64,
+    /// Leaderboard rating tuning — see `RatingConfig`.
+    #[serde(default)]
+    pub rating: RatingConfig,
 }
 
 impl ScheduleConfig {
@@ -117,6 +120,56 @@ fn default_photos_per_location() -> usize {
 }
 fn default_score_half_life_km() -> f64 {
     2000.0
+}
+
+/// Tuning for the leaderboard's Bayesian-shrinkage rating:
+///
+///   rating = (n / (n + k)) * player_average + (k / (n + k)) * baseline
+///
+/// where `n` is a player's guesses played (real submissions plus missed
+/// guesses, which count as 0 — see `Db::record_missed_guesses`), and
+/// `baseline` is the community's own average score per guess (derived from
+/// the leaderboard data itself, not configured here — see
+/// `commands::community_baseline`).
+#[derive(Deserialize, Clone, Copy)]
+pub struct RatingConfig {
+    /// How many "prior" guesses worth of pull toward the baseline a
+    /// player's rating gets. Higher = trusts a small sample less (rating
+    /// stays closer to baseline for longer); lower = trusts it sooner.
+    /// At n = k, a player's rating is exactly halfway between their own
+    /// average and the baseline.
+    #[serde(default = "default_rating_k")]
+    pub k: f64,
+    /// Guesses played below which a leaderboard entry is flagged
+    /// "provisional" — not yet enough data to be a confident read on skill.
+    /// Purely a display hint; does not change the rating math itself.
+    #[serde(default = "default_provisional_threshold")]
+    pub provisional_threshold: i64,
+    /// Rating baseline used only when there is no community data yet to
+    /// derive one from (e.g. right after `!resetstats`). Once any guesses
+    /// exist, the real community average is used instead.
+    #[serde(default = "default_baseline_fallback")]
+    pub baseline_fallback: f64,
+}
+
+impl Default for RatingConfig {
+    fn default() -> Self {
+        Self {
+            k: default_rating_k(),
+            provisional_threshold: default_provisional_threshold(),
+            baseline_fallback: default_baseline_fallback(),
+        }
+    }
+}
+
+fn default_rating_k() -> f64 {
+    15.0
+}
+fn default_provisional_threshold() -> i64 {
+    10
+}
+fn default_baseline_fallback() -> f64 {
+    1500.0
 }
 
 // ── Sources ───────────────────────────────────────────────────────────────────

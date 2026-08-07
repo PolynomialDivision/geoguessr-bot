@@ -31,9 +31,15 @@ pub struct ScoreLeaderboardEntry {
     pub user_id:          String,
     pub total_score:      i64,
     pub rounds_played:    i64,
-    /// Number of individual guesses submitted (one per puzzle in a round).
+    /// Total guesses counted toward this player: real submissions PLUS
+    /// missed/no-guess rounds recorded as 0 (see `Db::record_missed_guesses`).
+    /// This is the denominator for both the raw average and the leaderboard
+    /// rating, so a player can't inflate either by skipping hard guesses.
     pub guesses_played:   i64,
-    /// Average Haversine distance across all guesses (km).
+    /// Of `guesses_played`, how many were real player submissions (i.e.
+    /// `guesses_played - guesses_answered` is the missed count).
+    pub guesses_answered: i64,
+    /// Average Haversine distance across real (non-missed) guesses (km).
     pub avg_distance_km:  f64,
     /// Best (closest) single guess ever (km).
     pub best_distance_km: f64,
@@ -134,6 +140,29 @@ impl Db {
         self.run(move |conn| {
             conn.execute_batch(schema).context("Applying schema")?;
             info!("Database schema OK");
+            Ok(())
+        })
+        .await?;
+
+        // Step 3: add `answers.missed` for databases created before it existed.
+        // `CREATE TABLE IF NOT EXISTS` in step 2 doesn't retroactively add
+        // columns to an already-existing table, so existing installs need an
+        // explicit ALTER. Checked via PRAGMA table_info rather than catching
+        // the "duplicate column" error, so this doesn't depend on how a given
+        // SQLite/rusqlite version reports that error.
+        self.run(|conn| {
+            let has_missed_col = conn
+                .prepare("PRAGMA table_info(answers)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .any(|name| name == "missed");
+            if !has_missed_col {
+                info!("DB migration: adding answers.missed column");
+                conn.execute(
+                    "ALTER TABLE answers ADD COLUMN missed INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
+            }
             Ok(())
         })
         .await
@@ -385,8 +414,52 @@ impl Db {
                        guess_lat    = excluded.guess_lat,
                        guess_lon    = excluded.guess_lon,
                        distance_km  = excluded.distance_km,
-                       score        = excluded.score",
+                       score        = excluded.score,
+                       missed       = 0",
                     params![guess_id, round_id, user_id, guess_text, guess_lat, guess_lon, distance_km, score],
+                )?;
+                tx.execute(
+                    "INSERT INTO players (user_id) VALUES (?1)
+                     ON CONFLICT(user_id) DO UPDATE SET
+                       last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+                    params![user_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Record that `user_ids` were part of this guess's roster (join-phase
+    /// participants, or players who already answered earlier in the round)
+    /// but did not submit anything. Inserted as `score = 0, missed = 1` rows
+    /// so every joined round counts toward a player's average and stats —
+    /// skipping a guess can no longer simply leave no trace.
+    ///
+    /// Uses `DO NOTHING` on conflict: a real answer (from
+    /// `record_free_guess_answers`) always takes precedence and is never
+    /// clobbered by a missed-guess record for the same (guess, user).
+    pub async fn record_missed_guesses(
+        &self,
+        guess_id: i64,
+        round_id: i64,
+        user_ids: &[String],
+    ) -> Result<()> {
+        if user_ids.is_empty() {
+            return Ok(());
+        }
+        let user_ids = user_ids.to_vec();
+        self.run(move |conn| {
+            let tx = conn.transaction()?;
+            for user_id in &user_ids {
+                tx.execute(
+                    "INSERT INTO answers
+                       (guess_id, round_id, user_id, choice_index, is_correct,
+                        source, score, missed)
+                     VALUES (?1, ?2, ?3, 0, 0, 'missed', 0, 1)
+                     ON CONFLICT(guess_id, user_id) DO NOTHING",
+                    params![guess_id, round_id, user_id],
                 )?;
                 tx.execute(
                     "INSERT INTO players (user_id) VALUES (?1)
@@ -458,6 +531,12 @@ impl Db {
     }
 
     /// All-time leaderboard — includes every round ever played.
+    ///
+    /// `guesses_played` counts every answer row (real + missed) so a player's
+    /// average and rating reflect every guess they were on the hook for, not
+    /// just the ones they chose to submit. `guesses_answered` (real
+    /// submissions only) is kept separately for completion-rate display, and
+    /// distance stats are computed only from real (non-missed) rows.
     pub async fn score_leaderboard_alltime(&self) -> Result<Vec<ScoreLeaderboardEntry>> {
         self.run(|conn| {
             let mut stmt = conn.prepare(
@@ -465,16 +544,17 @@ impl Db {
                         SUM(rs.total_score)                AS total_score,
                         COUNT(DISTINCT rs.round_id)        AS rounds_played,
                         COALESCE(a.guesses_played, 0)      AS guesses_played,
+                        COALESCE(a.guesses_answered, 0)    AS guesses_answered,
                         COALESCE(a.avg_distance_km, 0.0)   AS avg_distance_km,
                         COALESCE(a.best_distance_km, 0.0)  AS best_distance_km
                    FROM round_scores rs
                    LEFT JOIN (
                        SELECT user_id,
-                              COUNT(*)          AS guesses_played,
-                              AVG(distance_km)  AS avg_distance_km,
-                              MIN(distance_km)  AS best_distance_km
+                              COUNT(*) AS guesses_played,
+                              SUM(CASE WHEN missed = 0 THEN 1 ELSE 0 END) AS guesses_answered,
+                              AVG(CASE WHEN missed = 0 THEN distance_km END) AS avg_distance_km,
+                              MIN(CASE WHEN missed = 0 THEN distance_km END) AS best_distance_km
                          FROM answers
-                        WHERE distance_km IS NOT NULL
                         GROUP BY user_id
                    ) a ON a.user_id = rs.user_id
                   GROUP BY rs.user_id",
@@ -484,8 +564,9 @@ impl Db {
                 total_score:      r.get(1)?,
                 rounds_played:    r.get(2)?,
                 guesses_played:   r.get(3)?,
-                avg_distance_km:  r.get(4)?,
-                best_distance_km: r.get(5)?,
+                guesses_answered: r.get(4)?,
+                avg_distance_km:  r.get(5)?,
+                best_distance_km: r.get(6)?,
             }))?;
             rows.map(|r| r.context("reading score leaderboard row")).collect()
         })
@@ -493,6 +574,7 @@ impl Db {
     }
 
     /// Rolling leaderboard — only rounds from the last 90 days.
+    /// Same real-vs-missed split as `score_leaderboard_alltime`; see there.
     pub async fn score_leaderboard(&self) -> Result<Vec<ScoreLeaderboardEntry>> {
         self.run(|conn| {
             let mut stmt = conn.prepare(
@@ -500,6 +582,7 @@ impl Db {
                         SUM(rs.total_score)                AS total_score,
                         COUNT(DISTINCT rs.round_id)        AS rounds_played,
                         COALESCE(a.guesses_played, 0)      AS guesses_played,
+                        COALESCE(a.guesses_answered, 0)    AS guesses_answered,
                         COALESCE(a.avg_distance_km, 0.0)   AS avg_distance_km,
                         COALESCE(a.best_distance_km, 0.0)  AS best_distance_km
                    FROM round_scores rs
@@ -507,14 +590,14 @@ impl Db {
                     AND ro.started_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-90 days')
                    LEFT JOIN (
                        SELECT ans.user_id,
-                              COUNT(*)             AS guesses_played,
-                              AVG(ans.distance_km) AS avg_distance_km,
-                              MIN(ans.distance_km) AS best_distance_km
+                              COUNT(*) AS guesses_played,
+                              SUM(CASE WHEN ans.missed = 0 THEN 1 ELSE 0 END) AS guesses_answered,
+                              AVG(CASE WHEN ans.missed = 0 THEN ans.distance_km END) AS avg_distance_km,
+                              MIN(CASE WHEN ans.missed = 0 THEN ans.distance_km END) AS best_distance_km
                          FROM answers ans
                          JOIN guesses g  ON g.id  = ans.guess_id
                          JOIN rounds  ri ON ri.id = g.round_id
-                        WHERE ans.distance_km IS NOT NULL
-                          AND ri.started_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-90 days')
+                        WHERE ri.started_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-90 days')
                         GROUP BY ans.user_id
                    ) a ON a.user_id = rs.user_id
                   GROUP BY rs.user_id",
@@ -524,8 +607,9 @@ impl Db {
                 total_score:      r.get(1)?,
                 rounds_played:    r.get(2)?,
                 guesses_played:   r.get(3)?,
-                avg_distance_km:  r.get(4)?,
-                best_distance_km: r.get(5)?,
+                guesses_answered: r.get(4)?,
+                avg_distance_km:  r.get(5)?,
+                best_distance_km: r.get(6)?,
             }))?;
             rows.map(|r| r.context("reading score leaderboard row")).collect()
         })
@@ -790,5 +874,190 @@ mod tests {
         // Verify via round_stats (indirect).
         let stats = db.round_stats(round_id).await.unwrap();
         assert!(stats.is_empty()); // no answer rows → no stats rows
+    }
+
+    // ── Missed guesses ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn record_missed_guesses_counts_as_zero_in_leaderboard() {
+        let db = mem_db().await;
+        let round_id = db.start_round("!r:example.com", 1, "test").await.unwrap();
+        let guess_id = db
+            .start_guess(round_id, 1, "France", "Europe", None, "test", None, &[], 0, 90, Some(48.85), Some(2.35))
+            .await
+            .unwrap();
+
+        // @alice answers for real; @bob is on the roster but never guesses.
+        db.record_free_guess_answers(
+            guess_id,
+            round_id,
+            vec![("@alice:example.com".to_owned(), "Paris".to_owned(), 48.85, 2.35, 0.0, 5000)],
+        )
+        .await
+        .unwrap();
+        db.record_missed_guesses(guess_id, round_id, &["@bob:example.com".to_owned()])
+            .await
+            .unwrap();
+
+        let mut scores = HashMap::new();
+        scores.insert("@alice:example.com".to_owned(), 5000i64);
+        scores.insert("@bob:example.com".to_owned(), 0i64);
+        db.upsert_round_scores_free_guess(round_id, &scores).await.unwrap();
+
+        let board = db.score_leaderboard_alltime().await.unwrap();
+        let alice = board.iter().find(|e| e.user_id == "@alice:example.com").unwrap();
+        let bob = board.iter().find(|e| e.user_id == "@bob:example.com").unwrap();
+
+        assert_eq!(alice.guesses_played, 1);
+        assert_eq!(alice.guesses_answered, 1);
+        assert_eq!(alice.total_score, 5000);
+
+        // The missed guess still counts: it shows up as a played (but not
+        // answered) guess with 0 score, and the round still counts for @bob.
+        assert_eq!(bob.guesses_played, 1);
+        assert_eq!(bob.guesses_answered, 0);
+        assert_eq!(bob.total_score, 0);
+        assert_eq!(bob.rounds_played, 1);
+    }
+
+    #[tokio::test]
+    async fn record_missed_guesses_does_not_clobber_a_real_answer() {
+        let db = mem_db().await;
+        let round_id = db.start_round("!r:example.com", 1, "test").await.unwrap();
+        let guess_id = db
+            .start_guess(round_id, 1, "Japan", "Asia", None, "test", None, &[], 0, 90, None, None)
+            .await
+            .unwrap();
+
+        db.record_free_guess_answers(
+            guess_id,
+            round_id,
+            vec![("@late:example.com".to_owned(), "Tokyo".to_owned(), 35.6, 139.7, 12.3, 4800)],
+        )
+        .await
+        .unwrap();
+        // Defensive: a real answer must win even if a miss is also recorded
+        // for the same (guess, user) — DO NOTHING on conflict.
+        db.record_missed_guesses(guess_id, round_id, &["@late:example.com".to_owned()])
+            .await
+            .unwrap();
+
+        let mut scores = HashMap::new();
+        scores.insert("@late:example.com".to_owned(), 4800i64);
+        db.upsert_round_scores_free_guess(round_id, &scores).await.unwrap();
+
+        let board = db.score_leaderboard_alltime().await.unwrap();
+        let late = board.iter().find(|e| e.user_id == "@late:example.com").unwrap();
+        assert_eq!(late.guesses_answered, 1);
+        assert_eq!(late.total_score, 4800);
+    }
+
+    #[tokio::test]
+    async fn record_missed_guesses_no_op_on_empty_input() {
+        let db = mem_db().await;
+        let round_id = db.start_round("!r:example.com", 1, "test").await.unwrap();
+        let guess_id = db
+            .start_guess(round_id, 1, "Peru", "S. America", None, "test", None, &[], 0, 90, None, None)
+            .await
+            .unwrap();
+        db.record_missed_guesses(guess_id, round_id, &[]).await.unwrap();
+    }
+
+    // ── Migration: existing data keeps working ──────────────────────────────
+
+    /// Simulates a database created before the `answers.missed` column
+    /// existed, then runs the real `migrate()` and checks old data survives
+    /// and the leaderboard query (which now depends on `missed`) still works.
+    #[tokio::test]
+    async fn migration_adds_missed_column_to_pre_existing_database() {
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE players (
+                user_id      TEXT PRIMARY KEY,
+                first_seen_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                last_seen_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
+            CREATE TABLE rounds (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                room_id      TEXT NOT NULL,
+                n_guesses    INTEGER NOT NULL,
+                triggered_by TEXT NOT NULL,
+                started_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                ended_at     TEXT
+            );
+            CREATE TABLE guesses (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                round_id            INTEGER NOT NULL REFERENCES rounds(id),
+                guess_num           INTEGER NOT NULL,
+                country             TEXT NOT NULL,
+                region              TEXT NOT NULL,
+                city                TEXT,
+                source              TEXT NOT NULL,
+                attribution         TEXT,
+                choices             TEXT NOT NULL DEFAULT '[]',
+                correct_index       INTEGER NOT NULL DEFAULT 0,
+                answer_timeout_secs INTEGER NOT NULL DEFAULT 90,
+                actual_lat          REAL,
+                actual_lon          REAL,
+                matrix_event_id     TEXT,
+                asked_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                n_answers_received  INTEGER,
+                n_correct           INTEGER
+            );
+            CREATE TABLE answers (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                guess_id      INTEGER NOT NULL REFERENCES guesses(id),
+                round_id      INTEGER NOT NULL REFERENCES rounds(id),
+                user_id       TEXT NOT NULL,
+                choice_index  INTEGER NOT NULL DEFAULT 0,
+                is_correct    INTEGER NOT NULL DEFAULT 0,
+                source        TEXT NOT NULL DEFAULT 'reaction',
+                submitted_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                changed_answer INTEGER NOT NULL DEFAULT 0,
+                guess_text    TEXT,
+                guess_lat     REAL,
+                guess_lon     REAL,
+                distance_km   REAL,
+                score         INTEGER,
+                UNIQUE(guess_id, user_id)
+            );
+            CREATE TABLE round_scores (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                round_id      INTEGER NOT NULL REFERENCES rounds(id),
+                user_id       TEXT NOT NULL,
+                correct_count INTEGER NOT NULL DEFAULT 0,
+                total_count   INTEGER NOT NULL DEFAULT 0,
+                total_score   INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(round_id, user_id)
+            );
+            INSERT INTO rounds (id, room_id, n_guesses, triggered_by)
+                VALUES (1, '!legacy:example.com', 1, 'test');
+            INSERT INTO guesses (id, round_id, guess_num, country, region, source)
+                VALUES (1, 1, 1, 'Spain', 'Europe', 'test');
+            INSERT INTO answers (guess_id, round_id, user_id, guess_text, guess_lat, guess_lon, distance_km, score)
+                VALUES (1, 1, '@old-timer:example.com', 'Madrid', 40.4, -3.7, 5.0, 4900);
+            INSERT INTO round_scores (round_id, user_id, total_count, total_score)
+                VALUES (1, '@old-timer:example.com', 1, 4900);
+            ",
+        )
+        .unwrap();
+        let db = Db { conn: Arc::new(Mutex::new(conn)) };
+
+        db.migrate().await.unwrap();
+
+        // Old data survives, defaults to missed=0, and is fully queryable
+        // through the leaderboard query that now depends on that column.
+        let board = db.score_leaderboard_alltime().await.unwrap();
+        let entry = board.iter().find(|e| e.user_id == "@old-timer:example.com").unwrap();
+        assert_eq!(entry.total_score, 4900);
+        assert_eq!(entry.guesses_played, 1);
+        assert_eq!(entry.guesses_answered, 1);
+        assert_eq!(entry.rounds_played, 1);
+
+        // And the new missed-guess write path works on the migrated table.
+        let guess_id = db.find_guess_id(1, 1).await.unwrap();
+        db.record_missed_guesses(guess_id, 1, &["@newcomer:example.com".to_owned()])
+            .await
+            .unwrap();
     }
 }

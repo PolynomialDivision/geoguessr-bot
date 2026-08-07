@@ -819,6 +819,40 @@ async fn play_free_guess(
         *round_scores.entry(uid.clone()).or_insert(0) += score;
     }
 
+    // ── Missed guesses: count every joined round, not just answered ones ───────
+    // Roster = join-phase participants ∪ anyone who has already scored (real
+    // or missed) earlier this round — i.e. everyone known to be "in" this
+    // round. Roster members who did not submit this guess are recorded as an
+    // explicit 0-point "missed" answer instead of simply having no row, so a
+    // player can't inflate their average by skipping the guesses they expect
+    // to do badly on. `round_scores` already carries the roster forward guess
+    // to guess (each miss is inserted with `.or_insert(0)`), so a walk-in who
+    // joins mid-round is only ever expected for guesses from that point on —
+    // never penalised retroactively for guesses before they showed up.
+    let answered_uids: HashSet<&str> = scored.iter().map(|(uid, ..)| uid.as_str()).collect();
+    let missed_uids: Vec<String> = participants
+        .iter()
+        .map(|u| u.as_str().to_owned())
+        .chain(round_scores.keys().cloned())
+        .collect::<HashSet<String>>()
+        .into_iter()
+        .filter(|uid| !answered_uids.contains(uid.as_str()))
+        .collect();
+
+    if !missed_uids.is_empty() {
+        ctx.db
+            .record_missed_guesses(guess_id, round_id, &missed_uids)
+            .await?;
+        info!(
+            "GeoGuessr guess {guess_num}/{n_total}: {} player(s) missed (recorded as 0 pts): {:?}",
+            missed_uids.len(),
+            missed_uids,
+        );
+        for uid in &missed_uids {
+            round_scores.entry(uid.clone()).or_insert(0);
+        }
+    }
+
     let user_ids: Vec<&str> = scored.iter().map(|(uid, _, _, _)| uid.as_str()).collect();
     let names = fetch_names(room, &user_ids).await;
     let raw_avatars = crate::avatar::fetch_player_avatars(room, &user_ids).await;
@@ -837,6 +871,7 @@ async fn play_free_guess(
         actual_lat,
         actual_lon,
         &scored,
+        missed_uids.len(),
         &names,
         &raw_avatars,
         &avatar_mxcs,
@@ -846,6 +881,7 @@ async fn play_free_guess(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn post_reveal_free_guess(
     ctx: &BotContext,
     client: &Client,
@@ -853,6 +889,7 @@ async fn post_reveal_free_guess(
     actual_lat: f64,
     actual_lon: f64,
     scored: &[(String, FreeGuess, f64, i64)],
+    missed_count: usize,
     names: &HashMap<String, String>,
     raw_avatars: &HashMap<String, Vec<u8>>,
     avatar_mxcs: &HashMap<String, String>,
@@ -945,6 +982,12 @@ async fn post_reveal_free_guess(
                 uid, dist_str, score,
             ));
         }
+    }
+    if missed_count > 0 {
+        lines.push(format!(
+            "😴 {missed_count} player{} missed this one (0 pts, counts toward their average)",
+            if missed_count == 1 { "" } else { "s" },
+        ));
     }
     let text = lines.join("\n");
 
