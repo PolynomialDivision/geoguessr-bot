@@ -1,6 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
-use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use matrix_sdk::ruma::{
+    events::{room::message::RoomMessageEventContent, Mentions},
+    OwnedUserId,
+};
 
 /// Scan `text` for Matrix user IDs and return a `RoomMessageEventContent`
 /// with HTML mention pills showing the localpart as the pill label.
@@ -44,6 +47,10 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
     let mut pos      = 0;
     let mut found    = false;   // true when HTML output differs from plain
     let mut in_bold  = false;
+    // Every MXID pill rendered below must also land in `m.mentions` on this
+    // same event — that field, not the HTML pill, is what current Matrix
+    // clients/servers use to decide push notifications and highlights.
+    let mut mentioned: BTreeSet<OwnedUserId> = BTreeSet::new();
 
     while pos < text.len() {
         // ── **bold** markers ──────────────────────────────────────────────────
@@ -97,6 +104,9 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
                     r#"<a href="https://matrix.to/#/{token}">{label}</a>"#
                 ));
                 found = true;
+                if let Ok(uid) = OwnedUserId::try_from(token) {
+                    mentioned.insert(uid);
+                }
                 pos += token_len;
                 continue;
             }
@@ -121,10 +131,16 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
         html.push_str("</strong>");
     }
 
-    if found {
+    let content = if found {
         RoomMessageEventContent::text_html(plain, html)
     } else {
         RoomMessageEventContent::text_plain(text)
+    };
+
+    if mentioned.is_empty() {
+        content
+    } else {
+        content.add_mentions(Mentions::with_user_ids(mentioned))
     }
 }
 
@@ -304,5 +320,36 @@ mod tests {
         let html = html.expect("should have HTML body");
         assert!(html.contains(">Alice Smith<"));
         assert!(html.contains(r#"href="https://matrix.to/#/@alice:example.org""#));
+    }
+
+    fn uid(s: &str) -> OwnedUserId {
+        <&matrix_sdk::ruma::UserId>::try_from(s).unwrap().to_owned()
+    }
+
+    #[test]
+    fn mentionify_sets_m_mentions_on_the_same_event() {
+        // The HTML pill alone does not notify anyone — current Matrix
+        // clients/servers key push/highlight behaviour off `m.mentions`.
+        let c = mentionify("Hello @alice:example.org!");
+        let mentions = c.mentions.expect("m.mentions must be set");
+        assert_eq!(mentions.user_ids, [uid("@alice:example.org")].into_iter().collect());
+        assert!(!mentions.room);
+    }
+
+    #[test]
+    fn mentionify_with_names_sets_m_mentions_for_every_pill() {
+        let mut names = HashMap::new();
+        names.insert("@alice:example.org".to_owned(), "Alice".to_owned());
+        let c = mentionify_with_names("@alice:example.org and @bob:example.org", &names);
+        let mentions = c.mentions.expect("m.mentions must be set");
+        assert_eq!(mentions.user_ids.len(), 2);
+        assert!(mentions.user_ids.contains(&uid("@alice:example.org")));
+        assert!(mentions.user_ids.contains(&uid("@bob:example.org")));
+    }
+
+    #[test]
+    fn no_mxid_means_no_mentions_field() {
+        let c = mentionify("no mentions here");
+        assert!(c.mentions.is_none());
     }
 }
