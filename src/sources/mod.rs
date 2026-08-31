@@ -9,48 +9,6 @@ pub mod mapillary;
 pub mod quality_filter;
 
 use serde::{Deserialize, Serialize};
-use tracing::warn;
-
-// ── Resilient HTTP helper ─────────────────────────────────────────────────────
-
-/// GET `url`, deserialize the JSON body as `T`, retrying on network/parse
-/// errors with exponential backoff.  HTTP error status codes are returned
-/// as-is (via `error_for_status`) for the caller to handle.
-///
-/// Delays: 1 s, 2 s, 4 s, 8 s (up to 5 attempts total).
-pub(super) async fn get_with_retry<T>(client: &reqwest::Client, url: &str) -> anyhow::Result<T>
-where
-    T: serde::de::DeserializeOwned,
-{
-    const MAX_RETRIES: u32 = 5;
-    let mut last_err = anyhow::anyhow!("no attempts made");
-
-    for attempt in 0..MAX_RETRIES {
-        if attempt > 0 {
-            let delay = 2u64.pow(attempt - 1).min(16);
-            warn!("HTTP retry {attempt}/{MAX_RETRIES} for {url} in {delay}s");
-            tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
-        }
-        match client.get(url).send().await {
-            Err(e) => {
-                warn!("HTTP request error: {e}");
-                last_err = e.into();
-            }
-            Ok(resp) => match resp.error_for_status() {
-                Err(e) => return Err(e.into()), // HTTP 4xx/5xx — don't retry
-                Ok(resp) => match resp.json::<T>().await {
-                    Ok(val) => return Ok(val),
-                    Err(e)  => {
-                        warn!("HTTP response parse error: {e}");
-                        last_err = e.into();
-                    }
-                },
-            },
-        }
-    }
-
-    Err(last_err.context(format!("unreachable after {MAX_RETRIES} attempts: {url}")))
-}
 
 // ── Diversity helpers ─────────────────────────────────────────────────────────
 

@@ -21,10 +21,7 @@ use rand::seq::SliceRandom;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use super::{
-    diversity::DiversityTracker, get_with_retry, haversine_km, min_dist_to_existing,
-    MIN_DISTANCE_KM,
-};
+use super::{diversity::DiversityTracker, haversine_km, min_dist_to_existing, MIN_DISTANCE_KM};
 
 use crate::{
     config::MapillaryConfig,
@@ -45,6 +42,19 @@ const MAPILLARY_IMAGES_LIMIT: u32 = 2000;
 /// than 0.01 degrees square, so 0.0049 (a 0.0098° full box) stays safely
 /// under that with margin for floating-point rounding.
 const MAX_BBOX_HALF_DEG: f64 = 0.0049;
+
+/// Number of times a bbox is halved (in both dimensions) after Mapillary
+/// rejects it as "too much data" (see `ImagesFetchError::TooMuchData`)
+/// before giving up on that seed. This is a *separate* cap from
+/// `MAX_BBOX_HALF_DEG`: that one bounds the box the API will accept at all;
+/// this one works around an undocumented cap on the total number of matching
+/// images per response, which depends on local imagery density and can be
+/// tripped well inside the documented size limit in densely-covered cities.
+/// 4 halvings take the area down to 1/256th — comfortably below the density
+/// that trips the cap even in the world's most densely-mapped city centres —
+/// while staying bounded so a pathological case can't spin forever or
+/// hammer the API.
+const MAX_BBOX_SHRINKS: u32 = 4;
 
 // ── API response shapes ───────────────────────────────────────────────────────
 
@@ -218,7 +228,18 @@ pub async fn fetch(
         v
     };
 
+    // Tallied purely for the diagnostic summary below — every attempt still
+    // logs its own WARN as before, so this adds one line on total failure,
+    // not per-request spam.
+    let mut n_tried = 0u32;
+    let mut n_quality_rejected = 0u32;
+    let mut n_too_dense = 0u32;
+    let mut n_no_images = 0u32;
+    let mut n_deduped = 0u32;
+    let mut n_other_failures = 0u32;
+
     for seed in candidates.iter().take(10) {
+        n_tried += 1;
         match try_seed(
             &client,
             seed,
@@ -244,18 +265,64 @@ pub async fn fetch(
                 );
                 return Ok(img);
             }
-            Ok(None) => {} // quality filter rejected all candidates for this seed
-            Err(e) => warn!(
-                "Mapillary: seed {}, {} failed: {e}",
-                seed.city, seed.country.name
-            ),
+            Ok(None) => n_quality_rejected += 1, // quality filter rejected all candidates
+            Err(e) => {
+                match classify_seed_failure(&e.to_string()) {
+                    SeedFailureCategory::TooDense => n_too_dense += 1,
+                    SeedFailureCategory::NoImages => n_no_images += 1,
+                    SeedFailureCategory::Deduped => n_deduped += 1,
+                    SeedFailureCategory::Other => n_other_failures += 1,
+                }
+                warn!(
+                    "Mapillary: seed {}, {} failed: {e}",
+                    seed.city, seed.country.name
+                );
+            }
         }
     }
 
-    bail!("Mapillary: could not find a suitable image after trying multiple seeds")
+    bail!(
+        "Mapillary: could not find a suitable image after trying {n_tried} seed(s) \
+         ({n_quality_rejected} quality-rejected, {n_too_dense} too dense for any bbox, \
+         {n_no_images} with no images, {n_deduped} fully deduped against history/cache, \
+         {n_other_failures} other failures — see preceding WARNs for detail)"
+    )
 }
 
 // ── Internals ─────────────────────────────────────────────────────────────────
+
+/// Coarse reason bucket for a single seed's failure, used only to build the
+/// aggregate diagnostic summary `fetch()` logs when it exhausts all seeds —
+/// e.g. "3 too dense, 2 with no images, ..." instead of just "could not find
+/// a suitable image", so an admin can tell a density problem from a genuine
+/// coverage gap or an over-eager dedup gate without combing through WARNs.
+enum SeedFailureCategory {
+    /// Every bbox down to the smallest shrink step still had too many
+    /// matching images (see `MAX_BBOX_SHRINKS`) — see `try_seed`'s bail!.
+    TooDense,
+    /// Mapillary has no (or no thumbnail-bearing) images near this seed.
+    NoImages,
+    /// Every candidate was within `MIN_DISTANCE_KM` of an already-known
+    /// location or shared a sequence with one.
+    Deduped,
+    /// Network error, persistent HTTP error, or anything else.
+    Other,
+}
+
+/// Classify a `try_seed` failure message (see its `bail!`s) into a
+/// `SeedFailureCategory`. Matches on the same literal text `try_seed`
+/// bails with, so it only needs updating if those messages change wording.
+fn classify_seed_failure(msg: &str) -> SeedFailureCategory {
+    if msg.contains("too densely covered") {
+        SeedFailureCategory::TooDense
+    } else if msg.contains("no images") {
+        SeedFailureCategory::NoImages
+    } else if msg.contains("of an existing location or share a sequence") {
+        SeedFailureCategory::Deduped
+    } else {
+        SeedFailureCategory::Other
+    }
+}
 
 async fn try_seed(
     client: &reqwest::Client,
@@ -280,17 +347,52 @@ async fn try_seed(
     // ~1000x more candidates than the old radius search for the same seed
     // point, so we use that instead and treat `search_radius` purely as an
     // (optional, smaller-than-max) cap on the box size.
-    let (left, bottom, right, top) = seed_bbox(seed.lat, seed.lon, cfg.search_radius);
-    let effective_radius_km = bbox_effective_radius_km(seed.lat, left, bottom, right, top);
-    let url = format!(
-        "{API}?access_token={token}\
-         &fields=id,geometry,thumb_1024_url,creator,sequence,captured_at,width,height,compass_angle,quality_score\
-         &bbox={left},{bottom},{right},{top}\
-         &limit={MAPILLARY_IMAGES_LIMIT}",
-        token = cfg.access_token,
-    );
+    // Mapillary enforces an undocumented cap on the total number of images
+    // matching a bbox (independent of the documented max bbox *size* and of
+    // the `limit` query param — confirmed empirically). A box sized at the
+    // documented maximum, which is what we start with, routinely exceeds
+    // that cap in imagery-dense cities. Rather than lose the whole seed,
+    // shrink the box and retry — bounded by MAX_BBOX_SHRINKS so this can
+    // never loop forever or burst the API.
+    let (mut half_lat_deg, mut half_lon_deg) = seed_half_degs(seed.lat, cfg.search_radius);
+    let mut shrinks = 0u32;
+    let (resp, left, bottom, right, top) = loop {
+        let (left, bottom, right, top) =
+            bbox_from_half_degs(seed.lat, seed.lon, half_lat_deg, half_lon_deg);
+        let url = format!(
+            "{API}?access_token={token}\
+             &fields=id,geometry,thumb_1024_url,creator,sequence,captured_at,width,height,compass_angle,quality_score\
+             &bbox={left},{bottom},{right},{top}\
+             &limit={MAPILLARY_IMAGES_LIMIT}",
+            token = cfg.access_token,
+        );
 
-    let resp: MapillaryResp = get_with_retry(client, &url).await?;
+        match get_images(client, &url).await {
+            Ok(resp) => break (resp, left, bottom, right, top),
+            Err(ImagesFetchError::TooMuchData) if shrinks < MAX_BBOX_SHRINKS => {
+                shrinks += 1;
+                half_lat_deg /= 2.0;
+                half_lon_deg /= 2.0;
+                warn!(
+                    "Mapillary: {} bbox too dense (shrink {shrinks}/{MAX_BBOX_SHRINKS}) — \
+                     retrying at {:.4}°×{:.4}°",
+                    seed.city,
+                    half_lon_deg * 2.0,
+                    half_lat_deg * 2.0,
+                );
+            }
+            Err(ImagesFetchError::TooMuchData) => {
+                bail!(
+                    "too densely covered even at the smallest bbox ({:.5}°×{:.5}°, {} shrink(s))",
+                    half_lon_deg * 2.0,
+                    half_lat_deg * 2.0,
+                    MAX_BBOX_SHRINKS,
+                );
+            }
+            Err(ImagesFetchError::Other(e)) => return Err(e),
+        }
+    };
+    let effective_radius_km = bbox_effective_radius_km(seed.lat, left, bottom, right, top);
 
     if resp.data.is_empty() {
         bail!(
@@ -509,6 +611,82 @@ async fn try_seed(
     Ok(None)
 }
 
+/// Outcome of a failed `/images` request, distinguishing the one failure
+/// mode `try_seed`'s shrink loop can actually fix from everything else.
+enum ImagesFetchError {
+    /// HTTP 500 with body `{"error":{"code":1,"message":"Please reduce the
+    /// amount of data you're asking for..."}}` — Mapillary's undocumented
+    /// cap on the number of images matching a bbox, independent of the
+    /// `limit` query param (confirmed empirically: identical failure at
+    /// limit=50 and limit=2000 for the same over-dense bbox). Retrying the
+    /// identical request never helps; a smaller bbox does.
+    TooMuchData,
+    /// Anything else (network error, persistent HTTP error, exhausted
+    /// transient-error retries, ...) — shrinking the bbox wouldn't help.
+    Other(anyhow::Error),
+}
+
+/// GET the `/images` endpoint at `url`, retrying network errors, response
+/// parse errors, HTTP 429, and other 5xx statuses with the same exponential
+/// backoff as the rest of the codebase (1 s, 2 s, 4 s, 8 s; 5 attempts
+/// total) — but returning immediately on a persistent 4xx (401/403/404/...,
+/// where retrying is pointless) or on the "too much data" 500 (where
+/// retrying the *same* request is pointless — see `ImagesFetchError`).
+async fn get_images(client: &reqwest::Client, url: &str) -> Result<MapillaryResp, ImagesFetchError> {
+    const MAX_RETRIES: u32 = 5;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for attempt in 0..MAX_RETRIES {
+        if attempt > 0 {
+            let delay = 2u64.pow(attempt - 1).min(16);
+            warn!("Mapillary: HTTP retry {attempt}/{MAX_RETRIES} in {delay}s");
+            tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+        }
+
+        let resp = match client.get(url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("Mapillary: HTTP request error: {e}");
+                last_err = Some(e.into());
+                continue;
+            }
+        };
+
+        if resp.status().is_success() {
+            match resp.json::<MapillaryResp>().await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    warn!("Mapillary: HTTP response parse error: {e}");
+                    last_err = Some(e.into());
+                    continue;
+                }
+            }
+        }
+
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+
+        if status.as_u16() == 500 && body.contains("\"code\":1") {
+            return Err(ImagesFetchError::TooMuchData);
+        }
+        if status.as_u16() == 429 || status.is_server_error() {
+            warn!("Mapillary: HTTP {status} (transient) — {body}");
+            last_err = Some(anyhow::anyhow!("HTTP {status}: {body}"));
+            continue;
+        }
+        // Persistent client error — retrying the same request won't help.
+        return Err(ImagesFetchError::Other(anyhow::anyhow!(
+            "HTTP {status}: {body}"
+        )));
+    }
+
+    Err(ImagesFetchError::Other(
+        last_err
+            .unwrap_or_else(|| anyhow::anyhow!("no attempts made"))
+            .context(format!("unreachable after {MAX_RETRIES} attempts: {url}")),
+    ))
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Build a `(left, bottom, right, top)` bounding box around `(lat, lon)`,
@@ -517,11 +695,29 @@ async fn try_seed(
 /// shrink with latitude, so the longitude half-width is widened by
 /// `1 / cos(lat)` to keep the box roughly square on the ground — still
 /// subject to the same degree clamp, since that's what the API enforces.
+///
+/// Only `seed_half_degs` + `bbox_from_half_degs` are used at runtime now
+/// (`try_seed` needs the halves separately to shrink them); this combined
+/// form is kept for the tests below, which predate the shrink loop.
+#[cfg(test)]
 fn seed_bbox(lat: f64, lon: f64, radius_m: u32) -> (f64, f64, f64, f64) {
+    let (half_lat_deg, half_lon_deg) = seed_half_degs(lat, radius_m);
+    bbox_from_half_degs(lat, lon, half_lat_deg, half_lon_deg)
+}
+
+/// Compute the (half_lat_deg, half_lon_deg) box size for `radius_m` around
+/// `lat`, clamped to `MAX_BBOX_HALF_DEG` per side (see its docs). Split out
+/// from `seed_bbox` so `try_seed`'s density-driven shrink loop can start
+/// from this and shrink both dimensions in place.
+fn seed_half_degs(lat: f64, radius_m: u32) -> (f64, f64) {
     const METRES_PER_DEG: f64 = 111_320.0;
     let half_lat_deg = (radius_m as f64 / METRES_PER_DEG).min(MAX_BBOX_HALF_DEG);
     let lon_scale = lat.to_radians().cos().abs().max(0.01); // guard near the poles
     let half_lon_deg = (radius_m as f64 / (METRES_PER_DEG * lon_scale)).min(MAX_BBOX_HALF_DEG);
+    (half_lat_deg, half_lon_deg)
+}
+
+fn bbox_from_half_degs(lat: f64, lon: f64, half_lat_deg: f64, half_lon_deg: f64) -> (f64, f64, f64, f64) {
     (
         lon - half_lon_deg,
         lat - half_lat_deg,
@@ -810,5 +1006,182 @@ mod tests {
         // Max bbox is roughly ~0.5-0.6 km on a side at this latitude, so the
         // equivalent-area radius should land well under 1 km.
         assert!(r > 0.0 && r < 1.0, "effective radius out of range: {r}");
+    }
+
+    // ── Bbox-density shrink (root-cause regression) ─────────────────────────
+
+    #[test]
+    fn bbox_shrink_halves_both_dimensions_and_stays_positive_through_max_shrinks() {
+        // Regression for the "too much data" bug: a bbox sized at the
+        // documented max routinely exceeded Mapillary's undocumented
+        // per-response density cap in imagery-dense cities (see try_seed).
+        // Each shrink step must genuinely shrink the box and never reach
+        // zero/negative, across the full bound.
+        let (start_lat, start_lon) = seed_half_degs(45.07, 50_000); // dense-city-like start
+        let (mut half_lat, mut half_lon) = (start_lat, start_lon);
+        for step in 1..=MAX_BBOX_SHRINKS {
+            let (prev_lat, prev_lon) = (half_lat, half_lon);
+            half_lat /= 2.0;
+            half_lon /= 2.0;
+            assert!(
+                half_lat > 0.0 && half_lon > 0.0,
+                "shrink {step} produced a non-positive half-degree"
+            );
+            assert!(half_lat < prev_lat && half_lon < prev_lon, "shrink {step} did not shrink");
+        }
+        // 4 halvings should take the area down to 1/256th.
+        assert!((half_lat - start_lat / 16.0).abs() < 1e-12);
+        assert!((half_lon - start_lon / 16.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn classify_seed_failure_buckets_each_try_seed_bail_message() {
+        assert!(matches!(
+            classify_seed_failure(
+                "too densely covered even at the smallest bbox (0.00031°×0.00031°, 4 shrink(s))"
+            ),
+            SeedFailureCategory::TooDense
+        ));
+        assert!(matches!(
+            classify_seed_failure("no images found near Mombasa, Kenya within ~0.56km effective radius"),
+            SeedFailureCategory::NoImages
+        ));
+        assert!(matches!(
+            classify_seed_failure(
+                "all 360 candidates near Iran are within 75 km of an existing location or share a sequence"
+            ),
+            SeedFailureCategory::Deduped
+        ));
+        assert!(matches!(
+            classify_seed_failure("HTTP 403: forbidden"),
+            SeedFailureCategory::Other
+        ));
+    }
+
+    // ── get_images: transient vs. persistent vs. too-much-data (root cause) ─
+
+    /// Spawns a local HTTP server that serves canned `(status, body)`
+    /// responses for successive requests to `/images` (repeating the last
+    /// entry once exhausted), for exercising `get_images`'s retry/
+    /// classification logic against real HTTP semantics without touching
+    /// the real Mapillary API. Returns the request URL, a request counter,
+    /// and the server's task handle (keep it alive for the test's duration).
+    async fn spawn_canned_server(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let responses = Arc::new(responses);
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let app = {
+            let responses = responses.clone();
+            let counter = counter.clone();
+            axum::Router::new().route(
+                "/images",
+                axum::routing::get(move || {
+                    let responses = responses.clone();
+                    let counter = counter.clone();
+                    async move {
+                        let i = counter.fetch_add(1, Ordering::SeqCst);
+                        let (status, body) = responses[i.min(responses.len() - 1)];
+                        (axum::http::StatusCode::from_u16(status).unwrap(), body.to_owned())
+                    }
+                }),
+            )
+        };
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+
+        (format!("http://{addr}/images"), counter, handle)
+    }
+
+    #[tokio::test]
+    async fn get_images_classifies_the_real_mapillary_too_much_data_response() {
+        // Exact body captured from the live API for a bbox in a dense city
+        // (this is the actual root cause of the "no location with enough
+        // valid images" abort). Must be recognised without retrying — the
+        // identical request would just fail identically again.
+        let (url, counter, _server) = spawn_canned_server(vec![(
+            500,
+            r#"{"error":{"code":1,"message":"Please reduce the amount of data you're asking for, then retry your request"}}"#,
+        )])
+        .await;
+        let client = reqwest::Client::new();
+
+        let result = get_images(&client, &url).await;
+
+        assert!(matches!(result, Err(ImagesFetchError::TooMuchData)));
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "must not retry the identical too-much-data request"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_images_retries_a_transient_error_then_succeeds() {
+        let (url, counter, _server) = spawn_canned_server(vec![
+            (503, "temporarily unavailable"),
+            (200, r#"{"data":[]}"#),
+        ])
+        .await;
+        let client = reqwest::Client::new();
+
+        let result = get_images(&client, &url).await;
+
+        assert!(result.is_ok(), "expected recovery after one transient error");
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn get_images_does_not_retry_a_persistent_client_error() {
+        // 403/404/etc. won't be fixed by retrying — retrying anyway would be
+        // exactly the API-hammering behaviour this fix must avoid.
+        let (url, counter, _server) =
+            spawn_canned_server(vec![(403, r#"{"error":{"message":"forbidden"}}"#)]).await;
+        let client = reqwest::Client::new();
+
+        let result = get_images(&client, &url).await;
+
+        assert!(matches!(result, Err(ImagesFetchError::Other(_))));
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "must not retry a persistent 4xx"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_images_gives_up_cleanly_after_bounded_retries_on_full_outage() {
+        // A source that is down for every request must still terminate with
+        // a clean error in bounded time and a bounded number of requests —
+        // never hang or retry forever.
+        let (url, counter, _server) =
+            spawn_canned_server(vec![(500, "internal server error")]).await; // not the too-much-data body
+        let client = reqwest::Client::new();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), get_images(&client, &url))
+            .await
+            .expect("get_images must terminate on its own, not hang forever");
+
+        assert!(matches!(result, Err(ImagesFetchError::Other(_))));
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "must attempt exactly MAX_RETRIES times, not loop forever"
+        );
     }
 }

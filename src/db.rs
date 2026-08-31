@@ -207,6 +207,20 @@ impl Db {
         })
         .await
     }
+
+    /// Number of rounds started at/after `since` (a UTC instant). Used for
+    /// the monthly leaderboard's round count — see `score_leaderboard_month`.
+    pub async fn round_count_since(&self, since: DateTime<Utc>) -> Result<i64> {
+        let since_str = since.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        self.run(move |conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM rounds WHERE started_at >= ?1",
+                params![since_str],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+    }
 }
 
 // ── Guess lifecycle ───────────────────────────────────────────────────────────
@@ -603,6 +617,58 @@ impl Db {
                   GROUP BY rs.user_id",
             )?;
             let rows = stmt.query_map([], |r| Ok(ScoreLeaderboardEntry {
+                user_id:          r.get(0)?,
+                total_score:      r.get(1)?,
+                rounds_played:    r.get(2)?,
+                guesses_played:   r.get(3)?,
+                guesses_answered: r.get(4)?,
+                avg_distance_km:  r.get(5)?,
+                best_distance_km: r.get(6)?,
+            }))?;
+            rows.map(|r| r.context("reading score leaderboard row")).collect()
+        })
+        .await
+    }
+
+    /// Calendar-month leaderboard — only rounds started at/after `since`, a
+    /// UTC instant marking the start of the target month in the bot's
+    /// configured timezone (see `commands::current_month_start_utc`). Same
+    /// real-vs-missed split as `score_leaderboard_alltime`; see there. This
+    /// is purely a filtered view of the same persisted `rounds`/`answers`
+    /// data — no separate monthly score state to keep in sync, so a bot
+    /// restart or a month rolling over can never duplicate or drift scores.
+    pub async fn score_leaderboard_month(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<Vec<ScoreLeaderboardEntry>> {
+        let since_str = since.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT rs.user_id,
+                        SUM(rs.total_score)                AS total_score,
+                        COUNT(DISTINCT rs.round_id)        AS rounds_played,
+                        COALESCE(a.guesses_played, 0)      AS guesses_played,
+                        COALESCE(a.guesses_answered, 0)    AS guesses_answered,
+                        COALESCE(a.avg_distance_km, 0.0)   AS avg_distance_km,
+                        COALESCE(a.best_distance_km, 0.0)  AS best_distance_km
+                   FROM round_scores rs
+                   JOIN rounds ro ON ro.id = rs.round_id
+                    AND ro.started_at >= ?1
+                   LEFT JOIN (
+                       SELECT ans.user_id,
+                              COUNT(*) AS guesses_played,
+                              SUM(CASE WHEN ans.missed = 0 THEN 1 ELSE 0 END) AS guesses_answered,
+                              AVG(CASE WHEN ans.missed = 0 THEN ans.distance_km END) AS avg_distance_km,
+                              MIN(CASE WHEN ans.missed = 0 THEN ans.distance_km END) AS best_distance_km
+                         FROM answers ans
+                         JOIN guesses g  ON g.id  = ans.guess_id
+                         JOIN rounds  ri ON ri.id = g.round_id
+                        WHERE ri.started_at >= ?1
+                        GROUP BY ans.user_id
+                   ) a ON a.user_id = rs.user_id
+                  GROUP BY rs.user_id",
+            )?;
+            let rows = stmt.query_map(params![since_str], |r| Ok(ScoreLeaderboardEntry {
                 user_id:          r.get(0)?,
                 total_score:      r.get(1)?,
                 rounds_played:    r.get(2)?,
@@ -1059,5 +1125,129 @@ mod tests {
         db.record_missed_guesses(guess_id, 1, &["@newcomer:example.com".to_owned()])
             .await
             .unwrap();
+
+        // And the monthly leaderboard query (added after this migration
+        // existed) also works against the migrated table.
+        let since = "2000-01-01T00:00:00.000Z"
+            .parse::<DateTime<Utc>>()
+            .unwrap();
+        let monthly = db.score_leaderboard_month(since).await.unwrap();
+        assert!(monthly.iter().any(|e| e.user_id == "@old-timer:example.com"));
+    }
+
+    // ── Monthly leaderboard ───────────────────────────────────────────────────
+
+    /// Test-only: back-date a round's `started_at` so month-boundary
+    /// filtering can be exercised deterministically instead of racing the
+    /// real clock.
+    async fn set_round_started_at(db: &Db, round_id: i64, ts: &str) {
+        let ts = ts.to_owned();
+        db.run(move |conn| {
+            conn.execute(
+                "UPDATE rounds SET started_at = ?1 WHERE id = ?2",
+                params![ts, round_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn monthly_leaderboard_excludes_previous_month_but_alltime_includes_it() {
+        let db = mem_db().await;
+
+        let july_round = db.start_round("!r:example.com", 1, "test").await.unwrap();
+        set_round_started_at(&db, july_round, "2026-07-15T12:00:00.000Z").await;
+        let mut july_scores = HashMap::new();
+        july_scores.insert("@alice:example.com".to_owned(), 5000i64);
+        db.upsert_round_scores_free_guess(july_round, &july_scores).await.unwrap();
+
+        let august_round = db.start_round("!r:example.com", 1, "test").await.unwrap();
+        set_round_started_at(&db, august_round, "2026-08-15T12:00:00.000Z").await;
+        let mut august_scores = HashMap::new();
+        august_scores.insert("@alice:example.com".to_owned(), 3000i64);
+        db.upsert_round_scores_free_guess(august_round, &august_scores).await.unwrap();
+
+        let august_start = "2026-08-01T00:00:00.000Z".parse::<DateTime<Utc>>().unwrap();
+
+        // All-time still includes both months' rounds.
+        let alltime = db.score_leaderboard_alltime().await.unwrap();
+        let alice_all = alltime.iter().find(|e| e.user_id == "@alice:example.com").unwrap();
+        assert_eq!(alice_all.total_score, 8000);
+        assert_eq!(alice_all.rounds_played, 2);
+
+        // Monthly only includes the August round.
+        let monthly = db.score_leaderboard_month(august_start).await.unwrap();
+        let alice_month = monthly.iter().find(|e| e.user_id == "@alice:example.com").unwrap();
+        assert_eq!(alice_month.total_score, 3000);
+        assert_eq!(alice_month.rounds_played, 1);
+
+        assert_eq!(db.round_count_since(august_start).await.unwrap(), 1);
+        assert_eq!(db.round_count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn monthly_leaderboard_handles_december_to_january_rollover() {
+        let db = mem_db().await;
+
+        let december_round = db.start_round("!r:example.com", 1, "test").await.unwrap();
+        set_round_started_at(&db, december_round, "2025-12-20T09:00:00.000Z").await;
+        let mut december_scores = HashMap::new();
+        december_scores.insert("@alice:example.com".to_owned(), 4000i64);
+        db.upsert_round_scores_free_guess(december_round, &december_scores).await.unwrap();
+
+        let january_round = db.start_round("!r:example.com", 1, "test").await.unwrap();
+        set_round_started_at(&db, january_round, "2026-01-05T09:00:00.000Z").await;
+        let mut january_scores = HashMap::new();
+        january_scores.insert("@alice:example.com".to_owned(), 2500i64);
+        db.upsert_round_scores_free_guess(january_round, &january_scores).await.unwrap();
+
+        let january_start = "2026-01-01T00:00:00.000Z".parse::<DateTime<Utc>>().unwrap();
+
+        let monthly = db.score_leaderboard_month(january_start).await.unwrap();
+        let alice = monthly.iter().find(|e| e.user_id == "@alice:example.com").unwrap();
+        assert_eq!(alice.total_score, 2500);
+        assert_eq!(alice.rounds_played, 1);
+        assert_eq!(db.round_count_since(january_start).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn monthly_leaderboard_counts_missed_guesses_as_zero_same_as_alltime() {
+        let db = mem_db().await;
+        let round_id = db.start_round("!r:example.com", 1, "test").await.unwrap();
+        set_round_started_at(&db, round_id, "2026-08-10T00:00:00.000Z").await;
+        let guess_id = db
+            .start_guess(round_id, 1, "France", "Europe", None, "test", None, &[], 0, 90, Some(48.85), Some(2.35))
+            .await
+            .unwrap();
+
+        db.record_free_guess_answers(
+            guess_id,
+            round_id,
+            vec![("@alice:example.com".to_owned(), "Paris".to_owned(), 48.85, 2.35, 0.0, 5000)],
+        )
+        .await
+        .unwrap();
+        db.record_missed_guesses(guess_id, round_id, &["@bob:example.com".to_owned()])
+            .await
+            .unwrap();
+
+        let mut scores = HashMap::new();
+        scores.insert("@alice:example.com".to_owned(), 5000i64);
+        scores.insert("@bob:example.com".to_owned(), 0i64);
+        db.upsert_round_scores_free_guess(round_id, &scores).await.unwrap();
+
+        let august_start = "2026-08-01T00:00:00.000Z".parse::<DateTime<Utc>>().unwrap();
+        let monthly = db.score_leaderboard_month(august_start).await.unwrap();
+        let alltime = db.score_leaderboard_alltime().await.unwrap();
+
+        for board in [&monthly, &alltime] {
+            let bob = board.iter().find(|e| e.user_id == "@bob:example.com").unwrap();
+            assert_eq!(bob.guesses_played, 1);
+            assert_eq!(bob.guesses_answered, 0);
+            assert_eq!(bob.total_score, 0);
+            assert_eq!(bob.rounds_played, 1);
+        }
     }
 }

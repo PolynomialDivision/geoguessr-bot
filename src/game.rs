@@ -1276,8 +1276,10 @@ async fn post_round_summary_free_guess(
     }
 
     // ── Leaderboards ──────────────────────────────────────────────────────────
+    // Monthly (not all-time) so recent activity stays prominent; the
+    // all-time board is still available via `!scores`.
     if let Some(r) = client.get_room(&ctx.room_id) {
-        if let Some(lb_text) = crate::commands::build_alltime_leaderboard(ctx).await {
+        if let Some(lb_text) = crate::commands::build_monthly_leaderboard(ctx).await {
             r.send(format::mentionify(&lb_text)).await.ok();
         }
     }

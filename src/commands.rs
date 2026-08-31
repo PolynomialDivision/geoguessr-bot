@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use chrono::Timelike as _;
+use chrono::{Datelike as _, TimeZone as _, Timelike as _};
 use chrono_tz::Tz;
 use matrix_sdk::ruma::OwnedUserId;
 use tracing::error;
@@ -23,6 +23,7 @@ pub async fn handle(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Resul
         "!resetstats" => cmd_resetstats(ctx, sender, body).await,
         "!scores" | "!leaderboard" => cmd_scores(ctx).await,
         "!scores90" | "!leaderboard90" => cmd_scores_rolling(ctx).await,
+        "!scoresmonth" | "!leaderboardmonth" | "!monthlyscores" => cmd_scores_month(ctx).await,
         "!mystats" => cmd_mystats(ctx, sender).await,
         "!countries" => cmd_countries(ctx).await,
         "!gameinfo" => cmd_gameinfo(ctx).await,
@@ -542,6 +543,13 @@ async fn cmd_scores_rolling(ctx: &BotContext) -> Result<Option<String>> {
     }
 }
 
+async fn cmd_scores_month(ctx: &BotContext) -> Result<Option<String>> {
+    match build_monthly_leaderboard(ctx).await {
+        Some(text) => Ok(Some(text)),
+        None => Ok(Some("No scores yet this month.".to_owned())),
+    }
+}
+
 // ── Scoring / rating ─────────────────────────────────────────────────────────
 //
 // The leaderboard rating is a Bayesian-shrinkage estimate of a player's true
@@ -705,7 +713,7 @@ pub async fn build_alltime_leaderboard(ctx: &BotContext) -> Option<String> {
     ))
 }
 
-/// 90-day rolling leaderboard. Posted after each round.
+/// 90-day rolling leaderboard.
 pub async fn build_rolling_leaderboard(ctx: &BotContext) -> Option<String> {
     let board = ctx.db.score_leaderboard().await.ok()?;
     if board.is_empty() {
@@ -715,6 +723,54 @@ pub async fn build_rolling_leaderboard(ctx: &BotContext) -> Option<String> {
     Some(format_leaderboard(
         board,
         "Leaderboard (last 90 days)",
+        round_count,
+        &ctx.config.schedule.rating,
+    ))
+}
+
+/// Start of the current calendar month, in `tz`, as a UTC instant — the SQL
+/// lower bound for "this month's" rounds. Uses the bot's configured
+/// timezone (`schedule.timezone`, UTC if unset/invalid) so the monthly
+/// leaderboard rolls over at local, not UTC, midnight on the 1st. On the
+/// rare local-midnight DST gap, falls back to the current wall-clock
+/// instant, which is still safely within the target month.
+fn current_month_start_utc(tz: Tz) -> chrono::DateTime<chrono::Utc> {
+    month_start_utc(tz, chrono::Utc::now().with_timezone(&tz))
+}
+
+/// Start of the calendar month containing `local_now` (already expressed in
+/// `tz`), as a UTC instant. Split out from `current_month_start_utc` so the
+/// month/year-rollover math can be unit-tested without depending on the
+/// real wall clock.
+fn month_start_utc(tz: Tz, local_now: chrono::DateTime<Tz>) -> chrono::DateTime<chrono::Utc> {
+    tz.with_ymd_and_hms(local_now.year(), local_now.month(), 1, 0, 0, 0)
+        .earliest()
+        .unwrap_or(local_now)
+        .with_timezone(&chrono::Utc)
+}
+
+/// Calendar-month leaderboard — only rounds from the current month (in the
+/// bot's configured timezone). Posted after each round instead of the
+/// all-time leaderboard so recent activity stays prominent; `!scores` /
+/// `!leaderboard` remain the all-time view, and `!scoresmonth` /
+/// `!leaderboardmonth` request this one explicitly. Uses the exact same
+/// rating math as the all-time leaderboard (`format_leaderboard`) — only
+/// which rounds are included differs, computed straight from persisted
+/// round timestamps, so there's no separate monthly state to keep in sync
+/// and a restart or month rollover can't duplicate or drift scores.
+pub async fn build_monthly_leaderboard(ctx: &BotContext) -> Option<String> {
+    let tz: Tz = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
+    let month_start = current_month_start_utc(tz);
+
+    let board = ctx.db.score_leaderboard_month(month_start).await.ok()?;
+    if board.is_empty() {
+        return None;
+    }
+    let round_count = ctx.db.round_count_since(month_start).await.unwrap_or(0);
+    let header = format!("{} Leaderboard", chrono::Utc::now().with_timezone(&tz).format("%B %Y"));
+    Some(format_leaderboard(
+        board,
+        &header,
         round_count,
         &ctx.config.schedule.rating,
     ))
@@ -967,6 +1023,7 @@ fn help_text() -> String {
 
   !gameinfo          · schedule & how to play
   !scores            · all-time leaderboard
+  !scoresmonth       · this month's leaderboard
   !scores90          · last 90 days leaderboard
   !mystats           · your rank and stats
   !countries         · country accuracy chart
@@ -1198,5 +1255,73 @@ mod tests {
         );
 
         assert!(text.contains("@fresh:example.com 🔰"));
+    }
+
+    // ── Monthly leaderboard ──────────────────────────────────────────────────
+
+    #[test]
+    fn month_start_utc_handles_december_to_january_rollover() {
+        let tz = chrono_tz::UTC;
+        let local_now = tz.with_ymd_and_hms(2026, 1, 5, 10, 0, 0).unwrap();
+
+        let start = month_start_utc(tz, local_now);
+
+        assert_eq!(start.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+    }
+
+    #[test]
+    fn month_start_utc_uses_configured_timezone_not_bare_utc() {
+        let tz: Tz = "Europe/Berlin".parse().unwrap();
+        // Jan 1st 00:30 in Berlin (UTC+1 in winter) is still Dec 31st in UTC —
+        // the month boundary must follow the *local* midnight, not UTC's.
+        let local_now = tz.with_ymd_and_hms(2026, 1, 1, 0, 30, 0).unwrap();
+
+        let start = month_start_utc(tz, local_now);
+
+        assert_eq!(start.to_rfc3339(), "2025-12-31T23:00:00+00:00");
+    }
+
+    /// Monthly and all-time leaderboards share the exact same sort/format
+    /// pipeline (`format_leaderboard` → `sort_score_leaderboard`) — the only
+    /// difference between them is which rounds the DB query includes before
+    /// handing the board over. So tied entries (equal rating, equal volume)
+    /// must break the tie identically in both: alphabetically by user_id.
+    #[test]
+    fn ties_break_identically_regardless_of_leaderboard_type() {
+        let build_tied_board = || {
+            vec![
+                score_entry("@zed:example.com", 50_000, 10),
+                score_entry("@amy:example.com", 50_000, 10),
+            ]
+        };
+
+        let mut alltime_shaped = build_tied_board();
+        let mut month_shaped = build_tied_board();
+        sort_score_leaderboard(&mut alltime_shaped, TEST_RATING.k, 1800.0);
+        sort_score_leaderboard(&mut month_shaped, TEST_RATING.k, 1800.0);
+
+        assert_eq!(alltime_shaped[0].user_id, "@amy:example.com");
+        assert_eq!(
+            alltime_shaped.iter().map(|e| &e.user_id).collect::<Vec<_>>(),
+            month_shaped.iter().map(|e| &e.user_id).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn monthly_leaderboard_uses_a_month_year_header_and_mention_ready_ids() {
+        let text = format_leaderboard(
+            vec![score_entry("@alice:example.com", 100_000, 20)],
+            "August 2026 Leaderboard",
+            5,
+            &TEST_RATING,
+        );
+
+        assert!(text.starts_with("🏆 **August 2026 Leaderboard** · 5 rounds"));
+        // Raw "@user:server" mxid, unmodified — `format::mentionify` (applied
+        // uniformly wherever command output and round summaries are sent,
+        // see main.rs/game.rs) turns this into a proper mention pill. The
+        // formatter itself must never pre-render a display name or it would
+        // bypass that pipeline.
+        assert!(text.contains("@alice:example.com"));
     }
 }
