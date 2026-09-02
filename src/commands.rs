@@ -632,6 +632,16 @@ fn sort_score_leaderboard(board: &mut [crate::db::ScoreLeaderboardEntry], k: f64
             .partial_cmp(&shrunk_rating(a, k, baseline))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(b.guesses_played.cmp(&a.guesses_played))
+            // Same rating and volume (e.g. everyone's 1-for-1 this month):
+            // break the tie the same way a round itself does — closer best
+            // guess wins, see the `scored.sort_by` in game.rs — instead of
+            // falling straight through to an alphabetical user_id order that
+            // has nothing to do with who actually played better.
+            .then(
+                a.best_distance_km
+                    .partial_cmp(&b.best_distance_km)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
             .then(a.user_id.cmp(&b.user_id))
     });
 }
@@ -1284,8 +1294,9 @@ mod tests {
     /// Monthly and all-time leaderboards share the exact same sort/format
     /// pipeline (`format_leaderboard` → `sort_score_leaderboard`) — the only
     /// difference between them is which rounds the DB query includes before
-    /// handing the board over. So tied entries (equal rating, equal volume)
-    /// must break the tie identically in both: alphabetically by user_id.
+    /// handing the board over. So tied entries (equal rating, equal volume,
+    /// *and* equal best distance — nothing left to distinguish them) must
+    /// break the tie identically in both: alphabetically by user_id.
     #[test]
     fn ties_break_identically_regardless_of_leaderboard_type() {
         let build_tied_board = || {
@@ -1304,6 +1315,33 @@ mod tests {
         assert_eq!(
             alltime_shaped.iter().map(|e| &e.user_id).collect::<Vec<_>>(),
             month_shaped.iter().map(|e| &e.user_id).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Regression test for the very first round of a month: everyone's 1-for-1
+    /// with the same score (so rating and volume both tie exactly), but one
+    /// player's guess landed closer. That player just beat the other in the
+    /// round itself (see the `scored.sort_by` tie-break in game.rs, which
+    /// also breaks equal scores by closer distance) and must not end up
+    /// ranked below them on the leaderboard merely because their user_id
+    /// sorts later alphabetically.
+    #[test]
+    fn equal_score_ties_break_by_best_distance_not_user_id() {
+        let mut closer_but_alphabetically_later = score_entry("@queen:example.com", 4_999, 1);
+        closer_but_alphabetically_later.best_distance_km = 0.123;
+        closer_but_alphabetically_later.avg_distance_km = 0.123;
+
+        let mut farther_but_alphabetically_first = score_entry("@gg:example.com", 4_999, 1);
+        farther_but_alphabetically_first.best_distance_km = 0.205;
+        farther_but_alphabetically_first.avg_distance_km = 0.205;
+
+        let mut board = vec![farther_but_alphabetically_first, closer_but_alphabetically_later];
+        sort_score_leaderboard(&mut board, TEST_RATING.k, 1800.0);
+
+        assert_eq!(
+            board[0].user_id, "@queen:example.com",
+            "the player who actually landed closer should rank first, despite \
+             an identical displayed rating and an alphabetically earlier rival"
         );
     }
 
