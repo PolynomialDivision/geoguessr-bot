@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn sanitize_emoji_only() {
-        assert_eq!(sanitize_filename("🔥🔥🔥.png").starts_with("file_"), true);
+        assert!(sanitize_filename("🔥🔥🔥.png").starts_with("file_"));
         assert!(sanitize_filename("🔥🔥🔥.png").ends_with(".png"));
     }
 

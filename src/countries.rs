@@ -315,7 +315,7 @@ pub const COUNTRIES: &[Country] = &[
     Country {
         name: "Malaysia",
         region: "Asia",
-        lat: 3.14,
+        lat: 3.139,
         lon: 101.69,
         iso: "MY",
     },

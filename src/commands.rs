@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use chrono::{Datelike as _, TimeZone as _, Timelike as _};
 use chrono_tz::Tz;
 use matrix_sdk::ruma::OwnedUserId;
@@ -36,11 +36,10 @@ pub async fn handle(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Resul
 }
 
 fn require_admin(ctx: &BotContext, sender: &OwnedUserId) -> Result<()> {
-    if ctx.admin_users.contains(sender) {
-        Ok(())
-    } else {
-        Err(anyhow!("__not_admin__"))
-    }
+    Ok(mxbot_common::admin::require_admin(
+        &ctx.admin_users,
+        sender,
+    )?)
 }
 
 // ── !startgeo ─────────────────────────────────────────────────────────────────
@@ -81,8 +80,8 @@ async fn cmd_cancelgeo(
     require_admin(ctx, sender)?;
 
     let time_arg = body
-        .splitn(2, char::is_whitespace)
-        .nth(1)
+        .split_once(char::is_whitespace)
+        .map(|x| x.1)
         .unwrap_or("")
         .trim()
         .trim_matches(|c| c == '"' || c == '\'');
@@ -407,7 +406,7 @@ async fn cmd_setschedule(
             .unwrap_or_else(|| format!("{} (config)", ctx.config.schedule.photos_per_location));
         let timeout = ov
             .answer_timeout_secs
-            .map(|s| crate::game::format_duration(s))
+            .map(crate::game::format_duration)
             .unwrap_or_else(|| {
                 format!(
                     "{} (config)",

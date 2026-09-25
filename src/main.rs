@@ -1,3 +1,6 @@
+// Tests build fixtures by tweaking `Default` values field by field.
+#![cfg_attr(test, allow(clippy::field_reassign_with_default))]
+
 use std::{
     collections::HashSet,
     path::PathBuf,
@@ -131,7 +134,7 @@ impl BotContext {
 async fn command_reply(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Option<String> {
     match commands::handle(ctx, sender, body).await {
         Ok(reply) => reply,
-        Err(e) if e.to_string() == "__not_admin__" => {
+        Err(e) if e.is::<mxbot_common::admin::NotAdmin>() => {
             Some("❌ This command requires admin privileges.".to_owned())
         }
         Err(e) => {
@@ -268,7 +271,7 @@ async fn main() -> Result<()> {
                                 Some((lat, lon)) => {
                                     let accepted = {
                                         let mut ag = ctx2.active_game.lock().await;
-                                        ag.as_mut().map_or(false, |g| {
+                                        ag.as_mut().is_some_and(|g| {
                                             g.record_free_guess(user, game::FreeGuess {
                                                 text:         query.clone(),
                                                 lat,
@@ -354,7 +357,6 @@ async fn main() -> Result<()> {
                             let mut js = ctx.join_state.lock().await;
                             js.participants.insert(ev.sender.clone());
                         }
-                        return;
                     }
                 }
             }
@@ -428,5 +430,5 @@ async fn main() -> Result<()> {
 
     tokio::spawn(scheduler::run(ctx, client.clone()));
 
-    bot.sync_forever().await
+    bot.run().await
 }

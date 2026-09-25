@@ -404,7 +404,6 @@ impl Db {
         round_id: i64,
         answers_by_user: &HashMap<String, Vec<bool>>,
     ) -> Result<()> {
-        let round_id = round_id;
         let data: Vec<(String, i64, i64)> = answers_by_user
             .iter()
             .map(|(uid, results)| {

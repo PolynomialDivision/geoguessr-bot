@@ -324,6 +324,7 @@ fn classify_seed_failure(msg: &str) -> SeedFailureCategory {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_seed(
     client: &reqwest::Client,
     seed: &LocationSeed,

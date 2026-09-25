@@ -97,7 +97,10 @@ fn score_seq_steps(frames: &[SequenceFrame]) -> f32 {
     }
 
     // Outlier fraction: GPS jumps or duplicate positions.
-    let n_outliers = steps.iter().filter(|&&d| d < 0.1 || d > 200.0).count();
+    let n_outliers = steps
+        .iter()
+        .filter(|&&d| !(0.1..=200.0).contains(&d))
+        .count();
     let outlier_penalty = 1.0 - n_outliers as f32 / steps.len() as f32;
 
     let mean: f64 = steps.iter().sum::<f64>() / steps.len() as f64;
@@ -111,7 +114,7 @@ fn score_seq_steps(frames: &[SequenceFrame]) -> f32 {
     let regularity = (1.0 - (cv / 2.0).min(1.0)) as f32; // CV ≥ 2 → 0.0
 
     // Scale score: ideal range 1–30 m; taper outside.
-    let scale: f32 = if mean >= 1.0 && mean <= 30.0 {
+    let scale: f32 = if (1.0..=30.0).contains(&mean) {
         1.0
     } else if mean < 1.0 {
         (mean as f32).clamp(0.0, 1.0)

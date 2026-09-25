@@ -140,6 +140,7 @@ pub fn render_avatar_pin(avatar_bytes: Option<&[u8]>, r: u8, g: u8, b: u8) -> Op
 
 // ── Internals ─────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn fill_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, radius: f32, r: u8, g: u8, b: u8, a: u8) {
     let Some(path) = PathBuilder::from_circle(cx, cy, radius) else {
         return;

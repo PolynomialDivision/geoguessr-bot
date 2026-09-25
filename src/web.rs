@@ -146,7 +146,7 @@ async fn submit_guess(
 
     let already_submitted = {
         let ag = ws.active_game.lock().await;
-        ag.as_ref().map_or(false, |g| {
+        ag.as_ref().is_some_and(|g| {
             let ActiveGameMode::FreeGuess { ref guesses, .. } = g.mode;
             guesses.contains_key(tok.user_id.as_str())
         })
@@ -160,7 +160,7 @@ async fn submit_guess(
 
     let accepted = {
         let mut ag = ws.active_game.lock().await;
-        ag.as_mut().map_or(false, |g| {
+        ag.as_mut().is_some_and(|g| {
             g.record_free_guess(
                 tok.user_id.as_str().to_owned(),
                 FreeGuess {
@@ -605,7 +605,7 @@ mod tests {
         let found = store.tokens.get("tok1");
         assert!(found.is_some());
         assert_eq!(found.unwrap().user_id, uid);
-        assert!(store.tokens.get("wrong_token").is_none());
+        assert!(!store.tokens.contains_key("wrong_token"));
     }
 
     #[test]
@@ -793,7 +793,7 @@ mod tests {
     fn authorization_wrong_token_not_found() {
         let store = TokenStore::default();
         assert!(
-            store.tokens.get("nonexistent").is_none(),
+            !store.tokens.contains_key("nonexistent"),
             "unknown token must not be found"
         );
     }

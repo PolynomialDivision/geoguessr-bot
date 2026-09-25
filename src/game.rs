@@ -484,6 +484,7 @@ async fn abort_guess_no_image(
 
 // ── Single image — free guess ─────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn play_free_guess(
     ctx: &BotContext,
     client: &Client,
@@ -646,7 +647,7 @@ async fn play_free_guess(
                     .join("  ·  ");
 
                 if let Ok(ev) = room.send(format::mentionify(&links_line)).await {
-                    set_pinned(&room, &ev.response.event_id).await;
+                    set_pinned(room, &ev.response.event_id).await;
                     store.sessions.insert(
                         (round_id, guess_num),
                         crate::web::GuessSession {
@@ -917,8 +918,7 @@ async fn post_reveal_free_guess(
     // ── Reverse-geocode each guess for human-readable labels ─────────────────
     // overview_entries: (uid, lat, lon, r, g, b, score, dist_km, mxc_url)
     let mut guess_labels: Vec<String> = Vec::with_capacity(scored.len());
-    let mut overview_entries: Vec<(&str, f64, f64, u8, u8, u8, i64, f64, String)> =
-        Vec::with_capacity(scored.len());
+    let mut overview_entries: Vec<OverviewEntry<'_>> = Vec::with_capacity(scored.len());
     for (i, (uid, guess, dist, score)) in scored.iter().enumerate() {
         let (r, g, b, _) = crate::mapimage::PLAYER_COLORS[i % crate::mapimage::PLAYER_COLORS.len()];
         let mxc = avatar_mxcs.get(uid.as_str()).cloned().unwrap_or_default();
@@ -1034,13 +1034,12 @@ async fn post_reveal_free_guess(
             let summary = make_summary(&overview_url);
             let summary = if summary.len() > MATRIX_SPLIT_THRESHOLD {
                 // Last resort: rebuild overview URL without avatars.
-                let stripped: Vec<(&str, f64, f64, u8, u8, u8, i64, f64, String)> =
-                    overview_entries
-                        .iter()
-                        .map(|(uid, lat, lon, r, g, b, score, dist, _)| {
-                            (*uid, *lat, *lon, *r, *g, *b, *score, *dist, String::new())
-                        })
-                        .collect();
+                let stripped: Vec<OverviewEntry<'_>> = overview_entries
+                    .iter()
+                    .map(|(uid, lat, lon, r, g, b, score, dist, _)| {
+                        (*uid, *lat, *lon, *r, *g, *b, *score, *dist, String::new())
+                    })
+                    .collect();
                 let slim_url = build_all_guesses_map_url(&stripped, actual_lat, actual_lon, names);
                 make_summary(&slim_url)
             } else {
@@ -1231,7 +1230,7 @@ async fn post_round_summary_free_guess(
                     .unwrap_or(f64::MAX);
                 da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
             })
-            .then(a.0.cmp(&b.0))
+            .then(a.0.cmp(b.0))
     });
 
     for (i, (uid, score)) in ranking.iter().enumerate() {
@@ -1615,11 +1614,14 @@ async fn upload_image(client: &Client, img: &GeoImage) -> anyhow::Result<Uploade
     }
 }
 
+/// One guess on the round overview map:
+/// (user_id, lat, lon, r, g, b, score, distance_km, avatar_mxc_url).
+type OverviewEntry<'a> = (&'a str, f64, f64, u8, u8, u8, i64, f64, String);
+
 fn detect_mime(data: &[u8]) -> mime::Mime {
+    // Everything that isn't PNG (JPEG magic `ff d8 ff` or unknown) is sent as JPEG.
     if data.starts_with(b"\x89PNG") {
         mime::IMAGE_PNG
-    } else if data.starts_with(b"\xff\xd8\xff") {
-        mime::IMAGE_JPEG
     } else {
         mime::IMAGE_JPEG
     }
@@ -1740,6 +1742,7 @@ fn compress_to_hash(params: &str) -> String {
 /// browser parses it with the same code path as the overview map — no separate
 /// `glat`/`glon` handling needed.  The `mxc` data: URL is included raw (no
 /// percent-encoding) because it never contains `|` or `&`.
+#[allow(clippy::too_many_arguments)]
 fn build_guess_map_url(
     name: &str,
     guess_lat: f64,
@@ -1774,7 +1777,7 @@ fn build_guess_map_url(
 /// JPEG q=55 ≈ 0.5–1 KB each).
 /// Entry tuple: (uid, lat, lon, r, g, b, score, dist_km, mxc_data_url)
 fn build_all_guesses_map_url(
-    entries: &[(&str, f64, f64, u8, u8, u8, i64, f64, String)],
+    entries: &[OverviewEntry<'_>],
     actual_lat: f64,
     actual_lon: f64,
     names: &HashMap<String, String>,

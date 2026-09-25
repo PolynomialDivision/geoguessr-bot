@@ -40,6 +40,7 @@ pub const PLAYER_COLORS: &[(u8, u8, u8, &str)] = &[
 ///
 /// Zoom is chosen automatically based on `dist_km`.
 /// Returns `None` if tile fetching or encoding fails.
+#[allow(clippy::too_many_arguments)]
 pub fn render_guess_map(
     guess_lat: f64,
     guess_lon: f64,
@@ -96,6 +97,9 @@ pub fn render_guess_map(
 
 // ── Round summary map (all guesses) ──────────────────────────────────────────
 
+/// Map legend entries: (display_name, pin emoji).
+type Legend = Vec<(String, &'static str)>;
+
 /// Render a 700×500 PNG showing every player's guess and the actual location.
 ///
 /// `guesses` is `(display_name, lat, lon, avatar_pin_png)`.
@@ -111,7 +115,7 @@ pub fn render_round_map(
     guesses: &[(String, f64, f64, Option<Vec<u8>>)], // (name, lat, lon, pin_png)
     actual_lat: f64,
     actual_lon: f64,
-) -> Option<(Vec<u8>, Vec<(String, &'static str)>)> {
+) -> Option<(Vec<u8>, Legend)> {
     // ── Compute explicit center + zoom from minimum-width arc ─────────────────
     let all_lons: Vec<f64> = std::iter::once(actual_lon)
         .chain(guesses.iter().map(|(_, _, lon, _)| *lon))
@@ -308,23 +312,10 @@ fn guess_map_zoom(guess_lat: f64, actual_lat: f64, lon_span: f64, dist_km: f64) 
     fit_zoom.min(distance_cap)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn guess_map_uses_street_level_zoom_for_very_close_guesses() {
-        let actual_lat = 50.8510;
-        let guess_lat = 50.8518;
-        let (_, lon_span) = minimum_lon_arc(&[4.3517, 4.3517]);
-
-        assert_eq!(guess_map_zoom(guess_lat, actual_lat, lon_span, 0.1), 17);
-    }
-}
-
 /// Draw a line taking the SHORTER arc between two points.
 /// When the shorter arc crosses the antimeridian the line is split into two
 /// segments at ±180° so the staticmap crate renders it correctly.
+#[allow(clippy::too_many_arguments)]
 fn add_line_shorter_arc(
     map: &mut staticmap::StaticMap,
     lat1: f64,
@@ -354,6 +345,7 @@ fn add_line_shorter_arc(
 }
 
 /// Draw a white-underlined coloured line between two points.
+#[allow(clippy::too_many_arguments)]
 fn add_line(
     map: &mut staticmap::StaticMap,
     lat1: f64,
@@ -428,5 +420,19 @@ fn add_actual_marker(map: &mut staticmap::StaticMap, lat: f64, lon: f64) {
         .build()
     {
         map.add_tool(fill);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guess_map_uses_street_level_zoom_for_very_close_guesses() {
+        let actual_lat = 50.8510;
+        let guess_lat = 50.8518;
+        let (_, lon_span) = minimum_lon_arc(&[4.3517, 4.3517]);
+
+        assert_eq!(guess_map_zoom(guess_lat, actual_lat, lon_span, 0.1), 17);
     }
 }
