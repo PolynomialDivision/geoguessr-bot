@@ -4,6 +4,7 @@
 //! Opening the URL shows a Leaflet world map.  Clicking places a draggable
 //! pin; pressing Submit records the guess.  Tokens expire at round end.
 
+use mxbot_common::matrix_sdk;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

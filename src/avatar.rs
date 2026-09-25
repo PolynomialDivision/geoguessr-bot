@@ -10,6 +10,7 @@
 //! `IconBuilder` is configured with `x_offset = PIN_ANCHOR_X` and
 //! `y_offset = PIN_ANCHOR_Y` so the tail tip lands exactly on the coord.
 
+use mxbot_common::matrix_sdk;
 use std::collections::HashMap;
 
 use matrix_sdk::ruma::UInt;

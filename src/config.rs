@@ -1,4 +1,4 @@
-pub use mxbot_common::config::{EncryptionStrategy, MatrixConfig, VerificationConfig};
+pub use mxbot_common::config::{MatrixConfig, SecurityConfig};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -25,18 +25,6 @@ pub struct WebConfig {
     pub bind_addr: String,
     /// Public base URL players open in their browser (no trailing slash).
     pub public_url: String,
-}
-
-#[derive(Deserialize, Default)]
-pub struct SecurityConfig {
-    #[serde(default)]
-    pub allowed_inviters: Vec<String>,
-    #[serde(default)]
-    pub admin_users: Vec<String>,
-    #[serde(default)]
-    pub encryption_strategy: EncryptionStrategy,
-    #[serde(default)]
-    pub verification: VerificationConfig,
 }
 
 #[derive(Deserialize)]

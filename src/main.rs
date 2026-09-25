@@ -4,24 +4,25 @@ use std::{
     sync::{atomic::AtomicU32, Arc},
 };
 
-use anyhow::{Context, Result};
-use matrix_sdk::{
-    config::SyncSettings,
-    ruma::{
-        api::client::filter::FilterDefinition,
-        events::{
-            reaction::OriginalSyncReactionEvent,
-            room::{
-                member::StrippedRoomMemberEvent,
-                message::{MessageType, OriginalSyncRoomMessageEvent, Relation},
+use anyhow::Result;
+use mxbot_common::{
+    admin::Dispatch,
+    matrix_sdk::{
+        deserialized_responses::EncryptionInfo,
+        ruma::{
+            events::{
+                reaction::OriginalSyncReactionEvent,
+                room::message::{MessageType, OriginalSyncRoomMessageEvent},
             },
+            OwnedEventId, OwnedRoomId, OwnedUserId,
         },
-        OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomOrAliasId,
+        Client, Room, RoomState,
     },
-    Client, Room, RoomState,
+    send::{in_thread, thread_root},
+    Bot,
 };
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 mod avatar;
 mod commands;
@@ -39,7 +40,6 @@ mod web;
 
 use config::Config;
 use game::ActiveGame;
-use mxbot_common::verify::VerificationService;
 use state::State;
 
 // ── Join-phase state ──────────────────────────────────────────────────────────
@@ -127,38 +127,29 @@ impl BotContext {
     }
 }
 
-fn thread_reply(
-    text: &str,
-    root: matrix_sdk::ruma::OwnedEventId,
-    reply_to: matrix_sdk::ruma::OwnedEventId,
-) -> matrix_sdk::ruma::events::room::message::RoomMessageEventContent {
-    use matrix_sdk::ruma::events::{relation::Thread, room::message::Relation};
-    let mut content = format::mentionify(text);
-    content.relates_to = Some(Relation::Thread(Thread::reply(root, reply_to)));
-    content
+/// Run one `!command`; `None` when there is nothing to say.
+async fn command_reply(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Option<String> {
+    match commands::handle(ctx, sender, body).await {
+        Ok(reply) => reply,
+        Err(e) if e.to_string() == "__not_admin__" => {
+            Some("❌ This command requires admin privileges.".to_owned())
+        }
+        Err(e) => {
+            error!("Command error: {e}");
+            None
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "geoguessr_bot=info,matrix_sdk=warn".parse().unwrap()),
-        )
-        .init();
+    mxbot_common::logging::init("geoguessr_bot");
 
-    let config_path = std::env::args()
-        .find(|a| a.ends_with(".toml"))
-        .unwrap_or_else(|| "config.toml".to_owned());
-    let config: Config = toml::from_str(
-        &std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Reading config {config_path}"))?,
-    )
-    .context("Parsing config")?;
+    let config: Config =
+        mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
     let config = Arc::new(config);
 
-    let store_path =
-        PathBuf::from(std::env::var("STORE_PATH").unwrap_or_else(|_| "store".to_owned()));
+    let store_path = mxbot_common::config::store_path_from_env();
     tokio::fs::create_dir_all(&store_path).await?;
 
     let db = db::Db::open(&store_path.join("geo.db")).await?;
@@ -173,35 +164,17 @@ async fn main() -> Result<()> {
     }
     let state = Arc::new(Mutex::new(st));
 
-    let admin_users: HashSet<OwnedUserId> = config
-        .security
-        .admin_users
-        .iter()
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let room_id =
+        mxbot_common::rooms::parse_room_id("[schedule] room_id", &config.schedule.room_id)?;
 
-    let allowed_inviters: HashSet<String> =
-        config.security.allowed_inviters.iter().cloned().collect();
-
-    let room_id: OwnedRoomId = config
-        .schedule
-        .room_id
-        .parse()
-        .context("Invalid room_id in [schedule]")?;
-
-    let (client, bot_user_id) = mxbot_common::session::build_and_restore(
-        &config.matrix,
-        &store_path,
-        config.security.encryption_strategy.clone().into(),
-    )
-    .await?;
-
-    let verification = VerificationService::allowlisted_tofu_from_config(
-        client.clone(),
-        &config.security.verification,
-        &config.security.allowed_inviters,
-    );
-    verification.install_handlers();
+    let bot = Bot::builder("geoguessr-bot", env!("CARGO_PKG_VERSION"))
+        .store_path(&store_path)
+        .admin_help(
+            "!startgeo · !schedulegeo · !cancelgeo · !setschedule · !prefetch · !resetstats",
+        )
+        .start(&config.matrix, &config.security)
+        .await?;
+    let client = bot.client.clone();
 
     let join_state = Arc::new(Mutex::new(JoinState {
         join_emoji: config.schedule.join_emoji.clone(),
@@ -215,7 +188,7 @@ async fn main() -> Result<()> {
         state,
         state_path,
         config: Arc::clone(&config),
-        admin_users,
+        admin_users: bot.admins().clone(),
         room_id: room_id.clone(),
         active_game: Arc::new(Mutex::new(None)),
         client: client.clone(),
@@ -248,64 +221,38 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── Invite handler ────────────────────────────────────────────────────────
-    client.add_event_handler({
-        let allowed_inviters = allowed_inviters.clone();
-        let bot_user_id = bot_user_id.clone();
-        move |ev: StrippedRoomMemberEvent, room: Room, client: Client| {
-            let allowed_inviters = allowed_inviters.clone();
-            let bot_user_id = bot_user_id.clone();
-            async move {
-                if ev.state_key != bot_user_id {
-                    return;
-                }
-                if !allowed_inviters.is_empty() && !allowed_inviters.contains(ev.sender.as_str()) {
-                    warn!("Rejecting invite from {}", ev.sender);
-                    room.leave().await.ok();
-                    return;
-                }
-                let room_id = room.room_id().to_owned();
-                let mut via: Vec<OwnedServerName> = vec![ev.sender.server_name().to_owned()];
-                if let Some(s) = room_id.server_name() {
-                    let s = s.to_owned();
-                    if !via.contains(&s) {
-                        via.push(s);
-                    }
-                }
-                if let Ok(roa) = RoomOrAliasId::parse(room_id.as_str()) {
-                    if let Err(e) = client.join_room_by_id_or_alias(&roa, &via).await {
-                        warn!("Join failed: {e}");
-                    }
-                }
-            }
-        }
-    });
-
     // ── Message / command handler (main game room) ────────────────────────────
     client.add_event_handler({
-        let ctx         = ctx.clone();
-        let bot_user_id = bot_user_id.clone();
-        let verification = verification.clone();
-        move |ev: OriginalSyncRoomMessageEvent, room: Room, client: Client| {
-            let ctx         = ctx.clone();
-            let bot_user_id = bot_user_id.clone();
-            let verification = verification.clone();
+        let ctx = ctx.clone();
+        let bot = bot.clone();
+        move |ev: OriginalSyncRoomMessageEvent,
+              room: Room,
+              client: Client,
+              encryption: Option<EncryptionInfo>| {
+            let ctx = ctx.clone();
+            let bot = bot.clone();
             async move {
-                if ev.sender == bot_user_id          { return; }
+                if ev.sender == bot.user_id          { return; }
                 if room.state() != RoomState::Joined { return; }
+                match bot.admin.handle(&room, &ev, encryption.as_ref()).await {
+                    Dispatch::Handled => return,
+                    Dispatch::AdminDm => {
+                        // Admin commands sent privately are answered privately.
+                        let MessageType::Text(text) = &ev.content.msgtype else { return; };
+                        if let Some(reply) = command_reply(&ctx, &ev.sender, text.body.trim()).await {
+                            room.send(format::mentionify(&reply)).await.ok();
+                        }
+                        return;
+                    }
+                    Dispatch::Continue => {}
+                }
                 if room.room_id() != ctx.room_id     { return; }
 
                 let MessageType::Text(ref text) = ev.content.msgtype else { return; };
                 let body = text.body.trim();
-                if verification.handle_admin_command(&ev.sender, &ctx.admin_users, body).await {
-                    return;
-                }
                 if !body.starts_with('!') { return; }
 
-                let thread_root = match &ev.content.relates_to {
-                    Some(Relation::Thread(t)) => t.event_id.clone(),
-                    _                         => ev.event_id.clone(),
-                };
+                let thread_root = thread_root(&ev);
 
                 // Free-guess answer: !guess <location>  (fallback for main room)
                 if body.to_lowercase().starts_with("!guess ") {
@@ -354,25 +301,11 @@ async fn main() -> Result<()> {
                     return;
                 }
 
-                match commands::handle(&ctx, &ev.sender, body).await {
-                    Ok(Some(reply)) => {
-                        if let Some(r) = client.get_room(&ctx.room_id) {
-                            r.send(thread_reply(&reply, thread_root, ev.event_id.clone())).await.ok();
-                        }
+                if let Some(reply) = command_reply(&ctx, &ev.sender, body).await {
+                    if let Some(r) = client.get_room(&ctx.room_id) {
+                        let content = in_thread(format::mentionify(&reply), thread_root, ev.event_id.clone());
+                        r.send(content).await.ok();
                     }
-                    Err(e) if e.to_string() == "__not_admin__" => {
-                        if let Some(r) = client.get_room(&ctx.room_id) {
-                            r.send(thread_reply(
-                                "❌ This command requires admin privileges.",
-                                thread_root,
-                                ev.event_id.clone(),
-                            ))
-                            .await
-                            .ok();
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e)   => error!("Command error: {e}"),
                 }
             }
         }
@@ -381,7 +314,7 @@ async fn main() -> Result<()> {
     // ── Reaction handler — game answers + join opt-in ─────────────────────────
     client.add_event_handler({
         let ctx = ctx.clone();
-        let bot_user_id = bot_user_id.clone();
+        let bot_user_id = bot.user_id.clone();
         move |ev: OriginalSyncReactionEvent, room: Room, _client: Client| {
             let ctx = ctx.clone();
             let bot_user_id = bot_user_id.clone();
@@ -429,11 +362,7 @@ async fn main() -> Result<()> {
     });
 
     // ── Initial sync ──────────────────────────────────────────────────────────
-    let filter = FilterDefinition::with_lazy_loading();
-    client
-        .sync_once(SyncSettings::default().filter(filter.into()))
-        .await
-        .context("Initial sync failed")?;
+    bot.initial_sync().await;
     info!("Initial sync complete");
 
     // Pre-warm the image cache.
@@ -499,13 +428,5 @@ async fn main() -> Result<()> {
 
     tokio::spawn(scheduler::run(ctx, client.clone()));
 
-    loop {
-        match client.sync(SyncSettings::default()).await {
-            Ok(()) => warn!("Sync loop exited — reconnecting"),
-            Err(e) => {
-                warn!("Sync error: {e} — reconnecting in 5s");
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            }
-        }
-    }
+    bot.sync_forever().await
 }
