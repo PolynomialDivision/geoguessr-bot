@@ -12,11 +12,12 @@
 
 use std::collections::HashMap;
 
-use matrix_sdk::{Room, media::{MediaFormat, MediaThumbnailSettings}};
 use matrix_sdk::ruma::UInt;
-use tiny_skia::{
-    FillRule, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, Transform,
+use matrix_sdk::{
+    media::{MediaFormat, MediaThumbnailSettings},
+    Room,
 };
+use tiny_skia::{FillRule, Mask, Paint, PathBuilder, Pixmap, PixmapPaint, Transform};
 
 // ── Pin geometry constants ────────────────────────────────────────────────────
 
@@ -30,25 +31,26 @@ pub const PIN_ANCHOR_X: f64 = (PIN_W / 2) as f64;
 /// `y_offset` for `IconBuilder`: places the tail tip at the lat pixel.
 pub const PIN_ANCHOR_Y: f64 = PIN_H as f64;
 
-const BORDER: f32    = 3.0;
-const TAIL_HALF: f32 = 8.0;   // half-width of triangle base
+const BORDER: f32 = 3.0;
+const TAIL_HALF: f32 = 8.0; // half-width of triangle base
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Download thumbnail bytes for each user.  Missing/failed avatars are simply
 /// absent from the returned map; callers fall back to solid-colour circles.
-pub async fn fetch_player_avatars(
-    room:     &Room,
-    user_ids: &[&str],
-) -> HashMap<String, Vec<u8>> {
+pub async fn fetch_player_avatars(room: &Room, user_ids: &[&str]) -> HashMap<String, Vec<u8>> {
     let mut map = HashMap::new();
     let thumb = MediaFormat::Thumbnail(MediaThumbnailSettings::new(
         UInt::from(64u32),
         UInt::from(64u32),
     ));
     for &uid_str in user_ids {
-        let Ok(uid) = matrix_sdk::ruma::OwnedUserId::try_from(uid_str) else { continue };
-        let Ok(Some(member)) = room.get_member(&uid).await else { continue };
+        let Ok(uid) = matrix_sdk::ruma::OwnedUserId::try_from(uid_str) else {
+            continue;
+        };
+        let Ok(Some(member)) = room.get_member(&uid).await else {
+            continue;
+        };
         if let Ok(Some(bytes)) = member.avatar(thumb.clone()).await {
             map.insert(uid_str.to_owned(), bytes);
         }
@@ -98,8 +100,8 @@ pub fn avatar_bytes_to_data_url(bytes: &[u8]) -> Option<String> {
 /// Returns `None` only if `Pixmap` allocation fails (effectively never).
 pub fn render_avatar_pin(avatar_bytes: Option<&[u8]>, r: u8, g: u8, b: u8) -> Option<Vec<u8>> {
     let mut pixmap = Pixmap::new(PIN_W, PIN_H)?;
-    let cx = PIN_W as f32 / 2.0;   // horizontal centre
-    let cy = cx;                    // vertical centre of the circle part
+    let cx = PIN_W as f32 / 2.0; // horizontal centre
+    let cy = cx; // vertical centre of the circle part
 
     // ── 1. White outer ring (1 px shadow) ────────────────────────────────────
     fill_circle(&mut pixmap, cx, cy, cx - 0.5, 255, 255, 255, 255);
@@ -108,14 +110,15 @@ pub fn render_avatar_pin(avatar_bytes: Option<&[u8]>, r: u8, g: u8, b: u8) -> Op
     fill_circle(&mut pixmap, cx, cy, cx - 2.0, r, g, b, 255);
 
     // ── 3. Avatar image or solid-colour fallback ──────────────────────────────
-    let inner_r      = cx - BORDER - 1.5;
-    let inner_size   = (inner_r * 2.0).round() as u32;
+    let inner_r = cx - BORDER - 1.5;
+    let inner_size = (inner_r * 2.0).round() as u32;
     let inner_offset = (cx - inner_r).round() as i32;
 
     match avatar_bytes.and_then(|b| clip_avatar(b, inner_size)) {
         Some(clipped) => {
             pixmap.draw_pixmap(
-                inner_offset, inner_offset,
+                inner_offset,
+                inner_offset,
                 clipped.as_ref(),
                 &PixmapPaint::default(),
                 Transform::default(),
@@ -137,18 +140,26 @@ pub fn render_avatar_pin(avatar_bytes: Option<&[u8]>, r: u8, g: u8, b: u8) -> Op
 // ── Internals ─────────────────────────────────────────────────────────────────
 
 fn fill_circle(pixmap: &mut Pixmap, cx: f32, cy: f32, radius: f32, r: u8, g: u8, b: u8, a: u8) {
-    let Some(path) = PathBuilder::from_circle(cx, cy, radius) else { return };
+    let Some(path) = PathBuilder::from_circle(cx, cy, radius) else {
+        return;
+    };
     let mut paint = Paint::default();
     paint.set_color_rgba8(r, g, b, a);
     paint.anti_alias = true;
-    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 }
 
 /// Draw the pointy tail below the circle.
 /// The triangle base sits at `y = PIN_W - 1` and the tip at `y = PIN_H`.
 fn draw_tail(pixmap: &mut Pixmap, cx: f32, r: u8, g: u8, b: u8) {
     let base_y = (PIN_W as f32) - 1.0;
-    let tip_y  = PIN_H as f32;
+    let tip_y = PIN_H as f32;
 
     let mut pb = PathBuilder::new();
     pb.move_to(cx - TAIL_HALF, base_y);
@@ -160,7 +171,13 @@ fn draw_tail(pixmap: &mut Pixmap, cx: f32, r: u8, g: u8, b: u8) {
     let mut paint = Paint::default();
     paint.set_color_rgba8(r, g, b, 255);
     paint.anti_alias = true;
-    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 }
 
 /// Decode `bytes`, centre-crop to square, resize to `size × size`, and apply
@@ -195,7 +212,8 @@ fn clip_avatar(bytes: &[u8], size: u32) -> Option<Pixmap> {
     // ── Apply mask ────────────────────────────────────────────────────────────
     let mut clipped = Pixmap::new(size, size)?;
     clipped.draw_pixmap(
-        0, 0,
+        0,
+        0,
         full.as_ref(),
         &PixmapPaint::default(),
         Transform::default(),

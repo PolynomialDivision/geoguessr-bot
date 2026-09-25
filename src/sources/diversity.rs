@@ -10,7 +10,10 @@ use std::collections::HashMap;
 const CELL_DEG: f64 = 2.0;
 
 fn cell_key(lat: f64, lon: f64) -> (i32, i32) {
-    ((lat / CELL_DEG).floor() as i32, (lon / CELL_DEG).floor() as i32)
+    (
+        (lat / CELL_DEG).floor() as i32,
+        (lon / CELL_DEG).floor() as i32,
+    )
 }
 
 /// Lightweight grid-based geographic diversity tracker.
@@ -24,12 +27,16 @@ pub struct DiversityTracker {
 }
 
 impl DiversityTracker {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Build from an existing slice of (lat, lon) pairs.
     pub fn from_coords(coords: &[(f64, f64)]) -> Self {
         let mut t = Self::new();
-        for &(lat, lon) in coords { t.accept(lat, lon); }
+        for &(lat, lon) in coords {
+            t.accept(lat, lon);
+        }
         t
     }
 
@@ -42,7 +49,11 @@ impl DiversityTracker {
     ///
     /// Returns 1.0 for an empty cell and 1/(count+1) for occupied cells.
     pub fn score(&self, lat: f64, lon: f64) -> f32 {
-        let count = self.cell_counts.get(&cell_key(lat, lon)).copied().unwrap_or(0);
+        let count = self
+            .cell_counts
+            .get(&cell_key(lat, lon))
+            .copied()
+            .unwrap_or(0);
         1.0 / (count as f32 + 1.0)
     }
 
@@ -50,7 +61,9 @@ impl DiversityTracker {
     /// all recorded locations — the cache has collapsed into a small cluster.
     pub fn is_homogeneous(&self) -> bool {
         let total: u32 = self.cell_counts.values().sum();
-        if total < 6 { return false; }
+        if total < 6 {
+            return false;
+        }
         let mut counts: Vec<u32> = self.cell_counts.values().copied().collect();
         counts.sort_unstable_by(|a, b| b.cmp(a));
         let top3: u32 = counts.iter().take(3).sum();
@@ -80,7 +93,10 @@ mod tests {
     fn different_cells_independent() {
         let mut t = DiversityTracker::new();
         t.accept(48.0, 11.0);
-        assert!((t.score(0.0, 0.0) - 1.0).abs() < f32::EPSILON, "unrelated cell should score 1.0");
+        assert!(
+            (t.score(0.0, 0.0) - 1.0).abs() < f32::EPSILON,
+            "unrelated cell should score 1.0"
+        );
     }
 
     #[test]
@@ -97,7 +113,9 @@ mod tests {
     #[test]
     fn homogeneous_when_clustered() {
         let mut t = DiversityTracker::new();
-        for _ in 0..8 { t.accept(48.0, 11.0); }
+        for _ in 0..8 {
+            t.accept(48.0, 11.0);
+        }
         t.accept(0.0, 0.0);
         assert!(t.is_homogeneous());
     }
@@ -105,14 +123,18 @@ mod tests {
     #[test]
     fn not_homogeneous_when_spread() {
         let mut t = DiversityTracker::new();
-        for i in 0..10 { t.accept(i as f64 * 10.0, 0.0); }
+        for i in 0..10 {
+            t.accept(i as f64 * 10.0, 0.0);
+        }
         assert!(!t.is_homogeneous());
     }
 
     #[test]
     fn not_homogeneous_with_few_samples() {
         let mut t = DiversityTracker::new();
-        for _ in 0..5 { t.accept(48.0, 11.0); }
+        for _ in 0..5 {
+            t.accept(48.0, 11.0);
+        }
         // below the 6-sample minimum — should not trigger
         assert!(!t.is_homogeneous());
     }

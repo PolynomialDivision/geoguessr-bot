@@ -2,8 +2,12 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
-use std::{collections::HashMap, path::Path, sync::{Arc, Mutex}};
+use rusqlite::{params, Connection};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 use tracing::info;
 
 pub struct Db {
@@ -13,69 +17,69 @@ pub struct Db {
 // ── Result types ──────────────────────────────────────────────────────────────
 
 pub struct LeaderboardEntry {
-    pub user_id:         String,
-    pub total_correct:   i64,
+    pub user_id: String,
+    pub total_correct: i64,
     pub total_questions: i64,
-    pub rounds_played:   i64,
+    pub rounds_played: i64,
 }
 
 pub struct RoundStatsEntry {
-    pub user_id:          String,
-    pub total_score:      i64,
-    pub guesses_played:   i64,
-    pub avg_distance_km:  f64,
+    pub user_id: String,
+    pub total_score: i64,
+    pub guesses_played: i64,
+    pub avg_distance_km: f64,
     pub best_distance_km: f64,
 }
 
 pub struct ScoreLeaderboardEntry {
-    pub user_id:          String,
-    pub total_score:      i64,
-    pub rounds_played:    i64,
+    pub user_id: String,
+    pub total_score: i64,
+    pub rounds_played: i64,
     /// Total guesses counted toward this player: real submissions PLUS
     /// missed/no-guess rounds recorded as 0 (see `Db::record_missed_guesses`).
     /// This is the denominator for both the raw average and the leaderboard
     /// rating, so a player can't inflate either by skipping hard guesses.
-    pub guesses_played:   i64,
+    pub guesses_played: i64,
     /// Of `guesses_played`, how many were real player submissions (i.e.
     /// `guesses_played - guesses_answered` is the missed count).
     pub guesses_answered: i64,
     /// Average Haversine distance across real (non-missed) guesses (km).
-    pub avg_distance_km:  f64,
+    pub avg_distance_km: f64,
     /// Best (closest) single guess ever (km).
     pub best_distance_km: f64,
 }
 
 pub struct UserStatsRow {
-    pub total_correct:   i64,
+    pub total_correct: i64,
     pub total_questions: i64,
-    pub rounds_played:   i64,
+    pub rounds_played: i64,
 }
 
 pub struct CountryStat {
-    pub country:    String,
-    pub region:     String,
+    pub country: String,
+    pub region: String,
     pub times_asked: i64,
     pub total_answers: i64,
     pub correct_answers: i64,
 }
 
 pub struct UserCountryStat {
-    pub country:  String,
+    pub country: String,
     pub answered: i64,
-    pub correct:  i64,
+    pub correct: i64,
 }
 
 pub struct SpeedEntry {
-    pub user_id:      String,
-    pub avg_secs:     f64,
+    pub user_id: String,
+    pub avg_secs: f64,
     pub sample_count: i64,
 }
 
 #[derive(Clone, Debug)]
 pub struct AnswerRecord {
-    pub choice:         u8,
-    pub source:         &'static str,
-    pub submitted_at:   DateTime<Utc>,
+    pub choice: u8,
+    pub source: &'static str,
+    pub submitted_at: DateTime<Utc>,
     pub changed_answer: bool,
 }
 
@@ -89,7 +93,9 @@ impl Db {
     {
         let conn = Arc::clone(&self.conn);
         tokio::task::spawn_blocking(move || {
-            let mut guard = conn.lock().map_err(|_| anyhow::anyhow!("DB lock poisoned"))?;
+            let mut guard = conn
+                .lock()
+                .map_err(|_| anyhow::anyhow!("DB lock poisoned"))?;
             f(&mut guard)
         })
         .await
@@ -108,7 +114,9 @@ impl Db {
         .await
         .context("spawn_blocking open")??;
 
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -116,20 +124,25 @@ impl Db {
         //         "images → guesses" rename.  All ALTER TABLE ops are idempotent:
         //         we check sqlite_master first, so they only run once.
         self.run(|conn| {
-            let has_images: bool = conn.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='images'",
-                [],
-                |r| r.get::<_, i64>(0),
-            ).unwrap_or(0) > 0;
+            let has_images: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='images'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                > 0;
 
             if has_images {
                 info!("DB migration: renaming 'images' table → 'guesses'");
-                conn.execute_batch("
+                conn.execute_batch(
+                    "
                     ALTER TABLE images  RENAME TO guesses;
                     ALTER TABLE guesses RENAME COLUMN image_num  TO guess_num;
                     ALTER TABLE answers RENAME COLUMN image_id   TO guess_id;
                     ALTER TABLE rounds  RENAME COLUMN n_images   TO n_guesses;
-                ")?;
+                ",
+                )?;
             }
             Ok(())
         })
@@ -174,11 +187,11 @@ impl Db {
 impl Db {
     pub async fn start_round(
         &self,
-        room_id:      &str,
-        n_guesses:    u32,
+        room_id: &str,
+        n_guesses: u32,
         triggered_by: &str,
     ) -> Result<i64> {
-        let room_id      = room_id.to_owned();
+        let room_id = room_id.to_owned();
         let triggered_by = triggered_by.to_owned();
         self.run(move |conn| {
             conn.execute(
@@ -202,10 +215,8 @@ impl Db {
     }
 
     pub async fn round_count(&self) -> Result<i64> {
-        self.run(|conn| {
-            Ok(conn.query_row("SELECT COUNT(*) FROM rounds", [], |r| r.get(0))?)
-        })
-        .await
+        self.run(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM rounds", [], |r| r.get(0))?))
+            .await
     }
 
     /// Number of rounds started at/after `since` (a UTC instant). Used for
@@ -229,23 +240,23 @@ impl Db {
     #[allow(clippy::too_many_arguments)]
     pub async fn start_guess(
         &self,
-        round_id:     i64,
-        guess_num:    u32,
-        country:      &str,
-        region:       &str,
-        city:         Option<&str>,
-        source:       &str,
-        attribution:  Option<&str>,
-        choices:      &[String],
-        correct_idx:  u8,
+        round_id: i64,
+        guess_num: u32,
+        country: &str,
+        region: &str,
+        city: Option<&str>,
+        source: &str,
+        attribution: Option<&str>,
+        choices: &[String],
+        correct_idx: u8,
         timeout_secs: u64,
-        actual_lat:   Option<f64>,
-        actual_lon:   Option<f64>,
+        actual_lat: Option<f64>,
+        actual_lon: Option<f64>,
     ) -> Result<i64> {
-        let country     = country.to_owned();
-        let region      = region.to_owned();
-        let city        = city.map(|s| s.to_owned());
-        let source      = source.to_owned();
+        let country = country.to_owned();
+        let region = region.to_owned();
+        let city = city.map(|s| s.to_owned());
+        let source = source.to_owned();
         let attribution = attribution.map(|s| s.to_owned());
         let choices_json = serde_json::to_string(choices)?;
         self.run(move |conn| {
@@ -255,9 +266,18 @@ impl Db {
                     choices, correct_index, answer_timeout_secs, actual_lat, actual_lon)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                 params![
-                    round_id, guess_num, country, region, city, source, attribution,
-                    choices_json, correct_idx as i64, timeout_secs as i64,
-                    actual_lat, actual_lon,
+                    round_id,
+                    guess_num,
+                    country,
+                    region,
+                    city,
+                    source,
+                    attribution,
+                    choices_json,
+                    correct_idx as i64,
+                    timeout_secs as i64,
+                    actual_lat,
+                    actual_lon,
                 ],
             )?;
             Ok(conn.last_insert_rowid())
@@ -279,7 +299,7 @@ impl Db {
 
     pub async fn finish_guess(
         &self,
-        guess_id:  i64,
+        guess_id: i64,
         n_answers: usize,
         n_correct: usize,
     ) -> Result<()> {
@@ -303,9 +323,9 @@ impl Db {
                 params![round_id, guess_num],
                 |r| r.get::<_, i64>(0),
             ) {
-                Ok(id)                                    => Ok(Some(id)),
+                Ok(id) => Ok(Some(id)),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(e)                                    => Err(e.into()),
+                Err(e) => Err(e.into()),
             }
         })
         .await
@@ -333,9 +353,9 @@ impl Db {
 impl Db {
     pub async fn record_answers(
         &self,
-        guess_id:   i64,
-        round_id:   i64,
-        answers:    HashMap<String, AnswerRecord>,
+        guess_id: i64,
+        round_id: i64,
+        answers: HashMap<String, AnswerRecord>,
         correct_idx: u8,
     ) -> Result<()> {
         self.run(move |conn| {
@@ -354,9 +374,13 @@ impl Db {
                        submitted_at   = excluded.submitted_at,
                        changed_answer = excluded.changed_answer",
                     params![
-                        guess_id, round_id, user_id,
-                        rec.choice as i64, is_correct,
-                        rec.source, rec.submitted_at.to_rfc3339(),
+                        guess_id,
+                        round_id,
+                        user_id,
+                        rec.choice as i64,
+                        is_correct,
+                        rec.source,
+                        rec.submitted_at.to_rfc3339(),
                         if rec.changed_answer { 1i64 } else { 0 },
                     ],
                 )?;
@@ -385,7 +409,7 @@ impl Db {
             .iter()
             .map(|(uid, results)| {
                 let correct = results.iter().filter(|&&c| c).count() as i64;
-                let total   = results.len() as i64;
+                let total = results.len() as i64;
                 (uid.clone(), correct, total)
             })
             .collect();
@@ -410,9 +434,9 @@ impl Db {
     /// Record free-guess answers (distance + score instead of correct/wrong).
     pub async fn record_free_guess_answers(
         &self,
-        guess_id:  i64,
-        round_id:  i64,
-        guesses:   Vec<(String, String, f64, f64, f64, i64)>,
+        guess_id: i64,
+        round_id: i64,
+        guesses: Vec<(String, String, f64, f64, f64, i64)>,
         // (user_id, guess_text, guess_lat, guess_lon, distance_km, score)
     ) -> Result<()> {
         self.run(move |conn| {
@@ -430,7 +454,16 @@ impl Db {
                        distance_km  = excluded.distance_km,
                        score        = excluded.score,
                        missed       = 0",
-                    params![guess_id, round_id, user_id, guess_text, guess_lat, guess_lon, distance_km, score],
+                    params![
+                        guess_id,
+                        round_id,
+                        user_id,
+                        guess_text,
+                        guess_lat,
+                        guess_lon,
+                        distance_km,
+                        score
+                    ],
                 )?;
                 tx.execute(
                     "INSERT INTO players (user_id) VALUES (?1)
@@ -532,13 +565,15 @@ impl Db {
                   GROUP BY user_id
                   ORDER BY total_score DESC",
             )?;
-            let rows = stmt.query_map([round_id], |r| Ok(RoundStatsEntry {
-                user_id:          r.get(0)?,
-                total_score:      r.get(1)?,
-                guesses_played:   r.get(2)?,
-                avg_distance_km:  r.get(3)?,
-                best_distance_km: r.get(4)?,
-            }))?;
+            let rows = stmt.query_map([round_id], |r| {
+                Ok(RoundStatsEntry {
+                    user_id: r.get(0)?,
+                    total_score: r.get(1)?,
+                    guesses_played: r.get(2)?,
+                    avg_distance_km: r.get(3)?,
+                    best_distance_km: r.get(4)?,
+                })
+            })?;
             rows.map(|r| r.context("reading round stats row")).collect()
         })
         .await
@@ -573,16 +608,19 @@ impl Db {
                    ) a ON a.user_id = rs.user_id
                   GROUP BY rs.user_id",
             )?;
-            let rows = stmt.query_map([], |r| Ok(ScoreLeaderboardEntry {
-                user_id:          r.get(0)?,
-                total_score:      r.get(1)?,
-                rounds_played:    r.get(2)?,
-                guesses_played:   r.get(3)?,
-                guesses_answered: r.get(4)?,
-                avg_distance_km:  r.get(5)?,
-                best_distance_km: r.get(6)?,
-            }))?;
-            rows.map(|r| r.context("reading score leaderboard row")).collect()
+            let rows = stmt.query_map([], |r| {
+                Ok(ScoreLeaderboardEntry {
+                    user_id: r.get(0)?,
+                    total_score: r.get(1)?,
+                    rounds_played: r.get(2)?,
+                    guesses_played: r.get(3)?,
+                    guesses_answered: r.get(4)?,
+                    avg_distance_km: r.get(5)?,
+                    best_distance_km: r.get(6)?,
+                })
+            })?;
+            rows.map(|r| r.context("reading score leaderboard row"))
+                .collect()
         })
         .await
     }
@@ -696,9 +734,8 @@ impl Db {
                    AND actual_lon IS NOT NULL
                    AND asked_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-90 days')",
             )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?))
-            })?;
+            let rows =
+                stmt.query_map([], |row| Ok((row.get::<_, f64>(0)?, row.get::<_, f64>(1)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .context("reading played coords")
         })
@@ -738,12 +775,14 @@ impl Db {
                   GROUP BY user_id
                   ORDER BY total_correct DESC, total_questions ASC",
             )?;
-            let rows = stmt.query_map([], |r| Ok(LeaderboardEntry {
-                user_id:         r.get(0)?,
-                total_correct:   r.get(1)?,
-                total_questions: r.get(2)?,
-                rounds_played:   r.get(3)?,
-            }))?;
+            let rows = stmt.query_map([], |r| {
+                Ok(LeaderboardEntry {
+                    user_id: r.get(0)?,
+                    total_correct: r.get(1)?,
+                    total_questions: r.get(2)?,
+                    rounds_played: r.get(3)?,
+                })
+            })?;
             rows.map(|r| r.context("reading leaderboard row")).collect()
         })
         .await
@@ -756,13 +795,21 @@ impl Db {
                 "SELECT SUM(correct_count), SUM(total_count), COUNT(*)
                    FROM round_scores WHERE user_id = ?1",
                 params![user_id],
-                |r| Ok((r.get::<_,Option<i64>>(0)?, r.get::<_,Option<i64>>(1)?, r.get::<_,i64>(2)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, Option<i64>>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
             )?;
-            if res.2 == 0 { return Ok(None); }
+            if res.2 == 0 {
+                return Ok(None);
+            }
             Ok(Some(UserStatsRow {
-                total_correct:   res.0.unwrap_or(0),
+                total_correct: res.0.unwrap_or(0),
                 total_questions: res.1.unwrap_or(0),
-                rounds_played:   res.2,
+                rounds_played: res.2,
             }))
         })
         .await
@@ -780,14 +827,17 @@ impl Db {
                   GROUP BY g.country
                   ORDER BY times_asked DESC",
             )?;
-            let rows = stmt.query_map([], |r| Ok(CountryStat {
-                country:         r.get(0)?,
-                region:          r.get(1)?,
-                times_asked:     r.get(2)?,
-                total_answers:   r.get(3)?,
-                correct_answers: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
-            }))?;
-            rows.map(|r| r.context("reading country stat row")).collect()
+            let rows = stmt.query_map([], |r| {
+                Ok(CountryStat {
+                    country: r.get(0)?,
+                    region: r.get(1)?,
+                    times_asked: r.get(2)?,
+                    total_answers: r.get(3)?,
+                    correct_answers: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                })
+            })?;
+            rows.map(|r| r.context("reading country stat row"))
+                .collect()
         })
         .await
     }
@@ -803,12 +853,15 @@ impl Db {
                   GROUP BY g.country
                   ORDER BY (CAST(SUM(a.is_correct) AS REAL) / COUNT(*)) DESC",
             )?;
-            let rows = stmt.query_map(params![user_id], |r| Ok(UserCountryStat {
-                country:  r.get(0)?,
-                answered: r.get(1)?,
-                correct:  r.get::<_, Option<i64>>(2)?.unwrap_or(0),
-            }))?;
-            rows.map(|r| r.context("reading user country stat row")).collect()
+            let rows = stmt.query_map(params![user_id], |r| {
+                Ok(UserCountryStat {
+                    country: r.get(0)?,
+                    answered: r.get(1)?,
+                    correct: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                })
+            })?;
+            rows.map(|r| r.context("reading user country stat row"))
+                .collect()
         })
         .await
     }
@@ -829,11 +882,13 @@ impl Db {
                  HAVING COUNT(*) >= 3
                   ORDER BY avg_secs ASC",
             )?;
-            let rows = stmt.query_map([], |r| Ok(SpeedEntry {
-                user_id:      r.get(0)?,
-                avg_secs:     r.get(1)?,
-                sample_count: r.get(2)?,
-            }))?;
+            let rows = stmt.query_map([], |r| {
+                Ok(SpeedEntry {
+                    user_id: r.get(0)?,
+                    avg_secs: r.get(1)?,
+                    sample_count: r.get(2)?,
+                })
+            })?;
             rows.map(|r| r.context("reading speed row")).collect()
         })
         .await
@@ -865,7 +920,9 @@ mod tests {
         let conn = Connection::open_in_memory().expect("in-memory db");
         conn.execute_batch(include_str!("../migrations/schema.sql"))
             .expect("schema");
-        Db { conn: Arc::new(Mutex::new(conn)) }
+        Db {
+            conn: Arc::new(Mutex::new(conn)),
+        }
     }
 
     // ── find_guess_id ─────────────────────────────────────────────────────────
@@ -879,11 +936,27 @@ mod tests {
     #[tokio::test]
     async fn find_guess_id_returns_existing_row() {
         let db = mem_db().await;
-        let round_id = db.start_round("!room:example.com", 3, "test").await.unwrap();
-        let guess_id = db.start_guess(
-            round_id, 1, "Germany", "Europe", Some("Berlin"),
-            "test", None, &[], 0, 90, Some(52.52), Some(13.40),
-        ).await.unwrap();
+        let round_id = db
+            .start_round("!room:example.com", 3, "test")
+            .await
+            .unwrap();
+        let guess_id = db
+            .start_guess(
+                round_id,
+                1,
+                "Germany",
+                "Europe",
+                Some("Berlin"),
+                "test",
+                None,
+                &[],
+                0,
+                90,
+                Some(52.52),
+                Some(13.40),
+            )
+            .await
+            .unwrap();
 
         let found = db.find_guess_id(round_id, 1).await;
         assert_eq!(found, Some(guess_id));
@@ -892,8 +965,26 @@ mod tests {
     #[tokio::test]
     async fn find_guess_id_wrong_guess_num_returns_none() {
         let db = mem_db().await;
-        let round_id = db.start_round("!room:example.com", 3, "test").await.unwrap();
-        db.start_guess(round_id, 1, "Germany", "Europe", None, "test", None, &[], 0, 90, None, None).await.unwrap();
+        let round_id = db
+            .start_round("!room:example.com", 3, "test")
+            .await
+            .unwrap();
+        db.start_guess(
+            round_id,
+            1,
+            "Germany",
+            "Europe",
+            None,
+            "test",
+            None,
+            &[],
+            0,
+            90,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(db.find_guess_id(round_id, 2).await.is_none());
     }
@@ -901,8 +992,26 @@ mod tests {
     #[tokio::test]
     async fn find_guess_id_wrong_round_returns_none() {
         let db = mem_db().await;
-        let round_id = db.start_round("!room:example.com", 3, "test").await.unwrap();
-        db.start_guess(round_id, 1, "Germany", "Europe", None, "test", None, &[], 0, 90, None, None).await.unwrap();
+        let round_id = db
+            .start_round("!room:example.com", 3, "test")
+            .await
+            .unwrap();
+        db.start_guess(
+            round_id,
+            1,
+            "Germany",
+            "Europe",
+            None,
+            "test",
+            None,
+            &[],
+            0,
+            90,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(db.find_guess_id(round_id + 1, 1).await.is_none());
     }
@@ -910,9 +1019,44 @@ mod tests {
     #[tokio::test]
     async fn find_guess_id_multiple_guesses_in_round() {
         let db = mem_db().await;
-        let round_id = db.start_round("!room:example.com", 3, "test").await.unwrap();
-        let g1 = db.start_guess(round_id, 1, "France", "Europe", None, "test", None, &[], 0, 90, None, None).await.unwrap();
-        let g2 = db.start_guess(round_id, 2, "Japan",  "Asia",   None, "test", None, &[], 0, 90, None, None).await.unwrap();
+        let round_id = db
+            .start_round("!room:example.com", 3, "test")
+            .await
+            .unwrap();
+        let g1 = db
+            .start_guess(
+                round_id,
+                1,
+                "France",
+                "Europe",
+                None,
+                "test",
+                None,
+                &[],
+                0,
+                90,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let g2 = db
+            .start_guess(
+                round_id,
+                2,
+                "Japan",
+                "Asia",
+                None,
+                "test",
+                None,
+                &[],
+                0,
+                90,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(db.find_guess_id(round_id, 1).await, Some(g1));
         assert_eq!(db.find_guess_id(round_id, 2).await, Some(g2));
@@ -935,7 +1079,23 @@ mod tests {
     async fn finish_guess_updates_answer_count() {
         let db = mem_db().await;
         let round_id = db.start_round("!r:example.com", 1, "test").await.unwrap();
-        let guess_id = db.start_guess(round_id, 1, "Brazil", "S. America", None, "test", None, &[], 0, 90, None, None).await.unwrap();
+        let guess_id = db
+            .start_guess(
+                round_id,
+                1,
+                "Brazil",
+                "S. America",
+                None,
+                "test",
+                None,
+                &[],
+                0,
+                90,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         db.finish_guess(guess_id, 3, 1).await.unwrap();
         // Verify via round_stats (indirect).
         let stats = db.round_stats(round_id).await.unwrap();
@@ -949,7 +1109,20 @@ mod tests {
         let db = mem_db().await;
         let round_id = db.start_round("!r:example.com", 1, "test").await.unwrap();
         let guess_id = db
-            .start_guess(round_id, 1, "France", "Europe", None, "test", None, &[], 0, 90, Some(48.85), Some(2.35))
+            .start_guess(
+                round_id,
+                1,
+                "France",
+                "Europe",
+                None,
+                "test",
+                None,
+                &[],
+                0,
+                90,
+                Some(48.85),
+                Some(2.35),
+            )
             .await
             .unwrap();
 
@@ -957,7 +1130,14 @@ mod tests {
         db.record_free_guess_answers(
             guess_id,
             round_id,
-            vec![("@alice:example.com".to_owned(), "Paris".to_owned(), 48.85, 2.35, 0.0, 5000)],
+            vec![(
+                "@alice:example.com".to_owned(),
+                "Paris".to_owned(),
+                48.85,
+                2.35,
+                0.0,
+                5000,
+            )],
         )
         .await
         .unwrap();
@@ -968,11 +1148,19 @@ mod tests {
         let mut scores = HashMap::new();
         scores.insert("@alice:example.com".to_owned(), 5000i64);
         scores.insert("@bob:example.com".to_owned(), 0i64);
-        db.upsert_round_scores_free_guess(round_id, &scores).await.unwrap();
+        db.upsert_round_scores_free_guess(round_id, &scores)
+            .await
+            .unwrap();
 
         let board = db.score_leaderboard_alltime().await.unwrap();
-        let alice = board.iter().find(|e| e.user_id == "@alice:example.com").unwrap();
-        let bob = board.iter().find(|e| e.user_id == "@bob:example.com").unwrap();
+        let alice = board
+            .iter()
+            .find(|e| e.user_id == "@alice:example.com")
+            .unwrap();
+        let bob = board
+            .iter()
+            .find(|e| e.user_id == "@bob:example.com")
+            .unwrap();
 
         assert_eq!(alice.guesses_played, 1);
         assert_eq!(alice.guesses_answered, 1);
@@ -991,14 +1179,34 @@ mod tests {
         let db = mem_db().await;
         let round_id = db.start_round("!r:example.com", 1, "test").await.unwrap();
         let guess_id = db
-            .start_guess(round_id, 1, "Japan", "Asia", None, "test", None, &[], 0, 90, None, None)
+            .start_guess(
+                round_id,
+                1,
+                "Japan",
+                "Asia",
+                None,
+                "test",
+                None,
+                &[],
+                0,
+                90,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
         db.record_free_guess_answers(
             guess_id,
             round_id,
-            vec![("@late:example.com".to_owned(), "Tokyo".to_owned(), 35.6, 139.7, 12.3, 4800)],
+            vec![(
+                "@late:example.com".to_owned(),
+                "Tokyo".to_owned(),
+                35.6,
+                139.7,
+                12.3,
+                4800,
+            )],
         )
         .await
         .unwrap();
@@ -1010,10 +1218,15 @@ mod tests {
 
         let mut scores = HashMap::new();
         scores.insert("@late:example.com".to_owned(), 4800i64);
-        db.upsert_round_scores_free_guess(round_id, &scores).await.unwrap();
+        db.upsert_round_scores_free_guess(round_id, &scores)
+            .await
+            .unwrap();
 
         let board = db.score_leaderboard_alltime().await.unwrap();
-        let late = board.iter().find(|e| e.user_id == "@late:example.com").unwrap();
+        let late = board
+            .iter()
+            .find(|e| e.user_id == "@late:example.com")
+            .unwrap();
         assert_eq!(late.guesses_answered, 1);
         assert_eq!(late.total_score, 4800);
     }
@@ -1023,10 +1236,25 @@ mod tests {
         let db = mem_db().await;
         let round_id = db.start_round("!r:example.com", 1, "test").await.unwrap();
         let guess_id = db
-            .start_guess(round_id, 1, "Peru", "S. America", None, "test", None, &[], 0, 90, None, None)
+            .start_guess(
+                round_id,
+                1,
+                "Peru",
+                "S. America",
+                None,
+                "test",
+                None,
+                &[],
+                0,
+                90,
+                None,
+                None,
+            )
             .await
             .unwrap();
-        db.record_missed_guesses(guess_id, round_id, &[]).await.unwrap();
+        db.record_missed_guesses(guess_id, round_id, &[])
+            .await
+            .unwrap();
     }
 
     // ── Migration: existing data keeps working ──────────────────────────────
@@ -1107,14 +1335,19 @@ mod tests {
             ",
         )
         .unwrap();
-        let db = Db { conn: Arc::new(Mutex::new(conn)) };
+        let db = Db {
+            conn: Arc::new(Mutex::new(conn)),
+        };
 
         db.migrate().await.unwrap();
 
         // Old data survives, defaults to missed=0, and is fully queryable
         // through the leaderboard query that now depends on that column.
         let board = db.score_leaderboard_alltime().await.unwrap();
-        let entry = board.iter().find(|e| e.user_id == "@old-timer:example.com").unwrap();
+        let entry = board
+            .iter()
+            .find(|e| e.user_id == "@old-timer:example.com")
+            .unwrap();
         assert_eq!(entry.total_score, 4900);
         assert_eq!(entry.guesses_played, 1);
         assert_eq!(entry.guesses_answered, 1);
@@ -1128,11 +1361,11 @@ mod tests {
 
         // And the monthly leaderboard query (added after this migration
         // existed) also works against the migrated table.
-        let since = "2000-01-01T00:00:00.000Z"
-            .parse::<DateTime<Utc>>()
-            .unwrap();
+        let since = "2000-01-01T00:00:00.000Z".parse::<DateTime<Utc>>().unwrap();
         let monthly = db.score_leaderboard_month(since).await.unwrap();
-        assert!(monthly.iter().any(|e| e.user_id == "@old-timer:example.com"));
+        assert!(monthly
+            .iter()
+            .any(|e| e.user_id == "@old-timer:example.com"));
     }
 
     // ── Monthly leaderboard ───────────────────────────────────────────────────
@@ -1161,25 +1394,35 @@ mod tests {
         set_round_started_at(&db, july_round, "2026-07-15T12:00:00.000Z").await;
         let mut july_scores = HashMap::new();
         july_scores.insert("@alice:example.com".to_owned(), 5000i64);
-        db.upsert_round_scores_free_guess(july_round, &july_scores).await.unwrap();
+        db.upsert_round_scores_free_guess(july_round, &july_scores)
+            .await
+            .unwrap();
 
         let august_round = db.start_round("!r:example.com", 1, "test").await.unwrap();
         set_round_started_at(&db, august_round, "2026-08-15T12:00:00.000Z").await;
         let mut august_scores = HashMap::new();
         august_scores.insert("@alice:example.com".to_owned(), 3000i64);
-        db.upsert_round_scores_free_guess(august_round, &august_scores).await.unwrap();
+        db.upsert_round_scores_free_guess(august_round, &august_scores)
+            .await
+            .unwrap();
 
         let august_start = "2026-08-01T00:00:00.000Z".parse::<DateTime<Utc>>().unwrap();
 
         // All-time still includes both months' rounds.
         let alltime = db.score_leaderboard_alltime().await.unwrap();
-        let alice_all = alltime.iter().find(|e| e.user_id == "@alice:example.com").unwrap();
+        let alice_all = alltime
+            .iter()
+            .find(|e| e.user_id == "@alice:example.com")
+            .unwrap();
         assert_eq!(alice_all.total_score, 8000);
         assert_eq!(alice_all.rounds_played, 2);
 
         // Monthly only includes the August round.
         let monthly = db.score_leaderboard_month(august_start).await.unwrap();
-        let alice_month = monthly.iter().find(|e| e.user_id == "@alice:example.com").unwrap();
+        let alice_month = monthly
+            .iter()
+            .find(|e| e.user_id == "@alice:example.com")
+            .unwrap();
         assert_eq!(alice_month.total_score, 3000);
         assert_eq!(alice_month.rounds_played, 1);
 
@@ -1195,18 +1438,25 @@ mod tests {
         set_round_started_at(&db, december_round, "2025-12-20T09:00:00.000Z").await;
         let mut december_scores = HashMap::new();
         december_scores.insert("@alice:example.com".to_owned(), 4000i64);
-        db.upsert_round_scores_free_guess(december_round, &december_scores).await.unwrap();
+        db.upsert_round_scores_free_guess(december_round, &december_scores)
+            .await
+            .unwrap();
 
         let january_round = db.start_round("!r:example.com", 1, "test").await.unwrap();
         set_round_started_at(&db, january_round, "2026-01-05T09:00:00.000Z").await;
         let mut january_scores = HashMap::new();
         january_scores.insert("@alice:example.com".to_owned(), 2500i64);
-        db.upsert_round_scores_free_guess(january_round, &january_scores).await.unwrap();
+        db.upsert_round_scores_free_guess(january_round, &january_scores)
+            .await
+            .unwrap();
 
         let january_start = "2026-01-01T00:00:00.000Z".parse::<DateTime<Utc>>().unwrap();
 
         let monthly = db.score_leaderboard_month(january_start).await.unwrap();
-        let alice = monthly.iter().find(|e| e.user_id == "@alice:example.com").unwrap();
+        let alice = monthly
+            .iter()
+            .find(|e| e.user_id == "@alice:example.com")
+            .unwrap();
         assert_eq!(alice.total_score, 2500);
         assert_eq!(alice.rounds_played, 1);
         assert_eq!(db.round_count_since(january_start).await.unwrap(), 1);
@@ -1218,14 +1468,34 @@ mod tests {
         let round_id = db.start_round("!r:example.com", 1, "test").await.unwrap();
         set_round_started_at(&db, round_id, "2026-08-10T00:00:00.000Z").await;
         let guess_id = db
-            .start_guess(round_id, 1, "France", "Europe", None, "test", None, &[], 0, 90, Some(48.85), Some(2.35))
+            .start_guess(
+                round_id,
+                1,
+                "France",
+                "Europe",
+                None,
+                "test",
+                None,
+                &[],
+                0,
+                90,
+                Some(48.85),
+                Some(2.35),
+            )
             .await
             .unwrap();
 
         db.record_free_guess_answers(
             guess_id,
             round_id,
-            vec![("@alice:example.com".to_owned(), "Paris".to_owned(), 48.85, 2.35, 0.0, 5000)],
+            vec![(
+                "@alice:example.com".to_owned(),
+                "Paris".to_owned(),
+                48.85,
+                2.35,
+                0.0,
+                5000,
+            )],
         )
         .await
         .unwrap();
@@ -1236,14 +1506,19 @@ mod tests {
         let mut scores = HashMap::new();
         scores.insert("@alice:example.com".to_owned(), 5000i64);
         scores.insert("@bob:example.com".to_owned(), 0i64);
-        db.upsert_round_scores_free_guess(round_id, &scores).await.unwrap();
+        db.upsert_round_scores_free_guess(round_id, &scores)
+            .await
+            .unwrap();
 
         let august_start = "2026-08-01T00:00:00.000Z".parse::<DateTime<Utc>>().unwrap();
         let monthly = db.score_leaderboard_month(august_start).await.unwrap();
         let alltime = db.score_leaderboard_alltime().await.unwrap();
 
         for board in [&monthly, &alltime] {
-            let bob = board.iter().find(|e| e.user_id == "@bob:example.com").unwrap();
+            let bob = board
+                .iter()
+                .find(|e| e.user_id == "@bob:example.com")
+                .unwrap();
             assert_eq!(bob.guesses_played, 1);
             assert_eq!(bob.guesses_answered, 0);
             assert_eq!(bob.total_score, 0);

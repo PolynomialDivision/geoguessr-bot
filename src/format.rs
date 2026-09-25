@@ -42,11 +42,11 @@ fn default_label(token: &str) -> &str {
 /// `**bold**` markers, replacing them for both the plain body and the HTML
 /// body.  `label_for(mxid) -> &str` controls the pill label text.
 fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessageEventContent {
-    let mut plain    = String::with_capacity(text.len());
-    let mut html     = String::with_capacity(text.len() * 2);
-    let mut pos      = 0;
-    let mut found    = false;   // true when HTML output differs from plain
-    let mut in_bold  = false;
+    let mut plain = String::with_capacity(text.len());
+    let mut html = String::with_capacity(text.len() * 2);
+    let mut pos = 0;
+    let mut found = false; // true when HTML output differs from plain
+    let mut in_bold = false;
     // Every MXID pill rendered below must also land in `m.mentions` on this
     // same event — that field, not the HTML pill, is what current Matrix
     // clients/servers use to decide push notifications and highlights.
@@ -54,17 +54,15 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
 
     while pos < text.len() {
         // ── **bold** markers ──────────────────────────────────────────────────
-        if text.as_bytes().get(pos) == Some(&b'*')
-            && text.as_bytes().get(pos + 1) == Some(&b'*')
-        {
+        if text.as_bytes().get(pos) == Some(&b'*') && text.as_bytes().get(pos + 1) == Some(&b'*') {
             if in_bold {
                 html.push_str("</strong>");
             } else {
                 html.push_str("<strong>");
             }
             in_bold = !in_bold;
-            found   = true;
-            pos    += 2;
+            found = true;
+            pos += 2;
             continue;
         }
 
@@ -74,12 +72,12 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
                 let after_bracket = pos + 1 + bracket_end + 1;
                 if text.as_bytes().get(after_bracket) == Some(&b'(') {
                     if let Some(paren_end) = text[after_bracket + 1..].find(')') {
-                        let label = &text[pos + 1 .. pos + 1 + bracket_end];
-                        let url   = &text[after_bracket + 1 .. after_bracket + 1 + paren_end];
+                        let label = &text[pos + 1..pos + 1 + bracket_end];
+                        let url = &text[after_bracket + 1..after_bracket + 1 + paren_end];
                         plain.push_str(label);
                         html.push_str(&format!(r#"<a href="{url}">{label}</a>"#));
                         found = true;
-                        pos   = after_bracket + 1 + paren_end + 1;
+                        pos = after_bracket + 1 + paren_end + 1;
                         continue;
                     }
                 }
@@ -90,8 +88,7 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
         if text.as_bytes()[pos] == b'@' {
             let token_len = text[pos..]
                 .find(|c: char| {
-                    c.is_whitespace()
-                        || matches!(c, ',' | '!' | '?' | '*' | ')' | ']' | '"' | '\'')
+                    c.is_whitespace() || matches!(c, ',' | '!' | '?' | '*' | ')' | ']' | '"' | '\'')
                 })
                 .unwrap_or(text.len() - pos);
 
@@ -116,12 +113,12 @@ fn build<'a>(text: &'a str, label_for: impl Fn(&'a str) -> &'a str) -> RoomMessa
         let ch = text[pos..].chars().next().unwrap();
         plain.push(ch);
         match ch {
-            '&'  => html.push_str("&amp;"),
-            '<'  => html.push_str("&lt;"),
-            '>'  => html.push_str("&gt;"),
-            '"'  => html.push_str("&quot;"),
+            '&' => html.push_str("&amp;"),
+            '<' => html.push_str("&lt;"),
+            '>' => html.push_str("&gt;"),
+            '"' => html.push_str("&quot;"),
             '\n' => html.push_str("<br>"),
-            _    => html.push(ch),
+            _ => html.push(ch),
         }
         pos += ch.len_utf8();
     }
@@ -162,7 +159,7 @@ pub fn sanitize_filename(input: &str) -> String {
         Some(dot) => {
             let candidate = &input[dot + 1..];
             if candidate.len() <= 5 && candidate.chars().all(|c| c.is_ascii_alphanumeric()) {
-                (&input[..dot], &input[dot..])   // ext includes the dot
+                (&input[..dot], &input[dot..]) // ext includes the dot
             } else {
                 (input, "")
             }
@@ -181,7 +178,8 @@ pub fn sanitize_filename(input: &str) -> String {
     }
 
     // Collapse runs of `_`, drop empty segments, rejoin.
-    let clean: String = buf.split('_')
+    let clean: String = buf
+        .split('_')
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("_");
@@ -201,16 +199,13 @@ pub fn sanitize_filename(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use matrix_sdk::ruma::events::room::message::MessageType;
     use super::*;
+    use matrix_sdk::ruma::events::room::message::MessageType;
 
     /// Extract (plain_body, Option<html_body>) from a RoomMessageEventContent.
     fn bodies(c: &RoomMessageEventContent) -> (String, Option<String>) {
         match &c.msgtype {
-            MessageType::Text(t) => (
-                t.body.clone(),
-                t.formatted.as_ref().map(|f| f.body.clone()),
-            ),
+            MessageType::Text(t) => (t.body.clone(), t.formatted.as_ref().map(|f| f.body.clone())),
             _ => panic!("unexpected msgtype"),
         }
     }
@@ -273,10 +268,16 @@ mod tests {
         let c = mentionify("📍 Italy [Map](https://example.com/map)");
         let (plain, html) = bodies(&c);
         let html = html.expect("should have HTML body");
-        assert!(html.contains(r#"href="https://example.com/map""#), "html={html}");
+        assert!(
+            html.contains(r#"href="https://example.com/map""#),
+            "html={html}"
+        );
         assert!(html.contains(">Map<"), "html={html}");
         assert!(plain.contains("Map"), "plain={plain}");
-        assert!(!plain.contains("https://"), "raw URL should not appear in plain body");
+        assert!(
+            !plain.contains("https://"),
+            "raw URL should not appear in plain body"
+        );
     }
 
     #[test]
@@ -289,10 +290,7 @@ mod tests {
 
     #[test]
     fn sanitize_emoji_only() {
-        assert_eq!(
-            sanitize_filename("🔥🔥🔥.png").starts_with("file_"),
-            true
-        );
+        assert_eq!(sanitize_filename("🔥🔥🔥.png").starts_with("file_"), true);
         assert!(sanitize_filename("🔥🔥🔥.png").ends_with(".png"));
     }
 
@@ -303,7 +301,10 @@ mod tests {
 
     #[test]
     fn sanitize_collapses_underscores() {
-        assert_eq!(sanitize_filename("📸 My—cool:photo!!!.jpg"), "my_cool_photo.jpg");
+        assert_eq!(
+            sanitize_filename("📸 My—cool:photo!!!.jpg"),
+            "my_cool_photo.jpg"
+        );
     }
 
     #[test]
@@ -332,7 +333,10 @@ mod tests {
         // clients/servers key push/highlight behaviour off `m.mentions`.
         let c = mentionify("Hello @alice:example.org!");
         let mentions = c.mentions.expect("m.mentions must be set");
-        assert_eq!(mentions.user_ids, [uid("@alice:example.org")].into_iter().collect());
+        assert_eq!(
+            mentions.user_ids,
+            [uid("@alice:example.org")].into_iter().collect()
+        );
         assert!(!mentions.room);
     }
 

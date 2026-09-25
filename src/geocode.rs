@@ -6,7 +6,7 @@
 use serde::Deserialize;
 
 const NOMINATIM_URL: &str = "https://nominatim.openstreetmap.org/reverse";
-const USER_AGENT: &str    = concat!("geoguessr-bot/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("geoguessr-bot/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Deserialize)]
 struct NominatimResponse {
@@ -15,13 +15,13 @@ struct NominatimResponse {
 
 #[derive(Debug, Deserialize, Default)]
 struct NominatimAddress {
-    city:         Option<String>,
-    town:         Option<String>,
-    village:      Option<String>,
+    city: Option<String>,
+    town: Option<String>,
+    village: Option<String>,
     municipality: Option<String>,
-    county:       Option<String>,
-    state:        Option<String>,
-    country:      Option<String>,
+    county: Option<String>,
+    state: Option<String>,
+    country: Option<String>,
 }
 
 impl NominatimAddress {
@@ -50,23 +50,15 @@ pub async fn reverse_geocode(lat: f64, lon: f64, lang: &str) -> Option<String> {
         .build()
         .ok()?;
 
-    let url = format!(
-        "{NOMINATIM_URL}?lat={lat}&lon={lon}&format=json&zoom=10&accept-language={lang}",
-    );
-    let resp: NominatimResponse = client
-        .get(&url)
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
+    let url =
+        format!("{NOMINATIM_URL}?lat={lat}&lon={lon}&format=json&zoom=10&accept-language={lang}",);
+    let resp: NominatimResponse = client.get(&url).send().await.ok()?.json().await.ok()?;
 
     let addr = &resp.address;
     Some(match (addr.locality(), addr.country.as_deref()) {
         (Some(loc), Some(country)) => format!("{loc}, {country}"),
-        (Some(loc), None)          => loc.to_owned(),
-        (None,      Some(country)) => country.to_owned(),
-        (None,      None)          => return None,
+        (Some(loc), None) => loc.to_owned(),
+        (None, Some(country)) => country.to_owned(),
+        (None, None) => return None,
     })
 }

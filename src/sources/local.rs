@@ -26,13 +26,13 @@ use crate::sources::GeoImage;
 
 #[derive(Deserialize)]
 struct IndexEntry {
-    file:         String,
-    country:      String,
-    region:       String,
-    city:         Option<String>,
-    attribution:  Option<String>,
-    lat:          Option<f64>,
-    lon:          Option<f64>,
+    file: String,
+    country: String,
+    region: String,
+    city: Option<String>,
+    attribution: Option<String>,
+    lat: Option<f64>,
+    lon: Option<f64>,
 }
 
 pub async fn fetch(dir: &str) -> Result<GeoImage> {
@@ -41,14 +41,13 @@ pub async fn fetch(dir: &str) -> Result<GeoImage> {
         .await
         .with_context(|| format!("Reading {}", index_path.display()))?;
 
-    let entries: Vec<IndexEntry> = serde_json::from_str(&raw)
-        .context("Parsing index.json")?;
+    let entries: Vec<IndexEntry> = serde_json::from_str(&raw).context("Parsing index.json")?;
 
     if entries.is_empty() {
         bail!("local source: index.json is empty");
     }
 
-    let mut rng  = rand::thread_rng();
+    let mut rng = rand::thread_rng();
     let mut pool: Vec<&IndexEntry> = entries.iter().collect();
     pool.shuffle(&mut rng);
 
@@ -63,15 +62,15 @@ pub async fn fetch(dir: &str) -> Result<GeoImage> {
         .to_string();
 
     Ok(GeoImage {
-        country:          entry.country.clone(),
-        region:           entry.region.clone(),
-        city:             entry.city.clone(),
-        image_url:        abs_path,
-        source:           "local".to_owned(),
-        attribution:      entry.attribution.clone(),
-        lat:              entry.lat,
-        lon:              entry.lon,
-        sequence:         None,
+        country: entry.country.clone(),
+        region: entry.region.clone(),
+        city: entry.city.clone(),
+        image_url: abs_path,
+        source: "local".to_owned(),
+        attribution: entry.attribution.clone(),
+        lat: entry.lat,
+        lon: entry.lon,
+        sequence: None,
         extra_image_urls: vec![],
     })
 }

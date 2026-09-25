@@ -769,7 +769,12 @@ fn month_start_utc(tz: Tz, local_now: chrono::DateTime<Tz>) -> chrono::DateTime<
 /// round timestamps, so there's no separate monthly state to keep in sync
 /// and a restart or month rollover can't duplicate or drift scores.
 pub async fn build_monthly_leaderboard(ctx: &BotContext) -> Option<String> {
-    let tz: Tz = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
+    let tz: Tz = ctx
+        .config
+        .schedule
+        .timezone
+        .parse()
+        .unwrap_or(chrono_tz::UTC);
     let month_start = current_month_start_utc(tz);
 
     let board = ctx.db.score_leaderboard_month(month_start).await.ok()?;
@@ -777,7 +782,10 @@ pub async fn build_monthly_leaderboard(ctx: &BotContext) -> Option<String> {
         return None;
     }
     let round_count = ctx.db.round_count_since(month_start).await.unwrap_or(0);
-    let header = format!("{} Leaderboard", chrono::Utc::now().with_timezone(&tz).format("%B %Y"));
+    let header = format!(
+        "{} Leaderboard",
+        chrono::Utc::now().with_timezone(&tz).format("%B %Y")
+    );
     Some(format_leaderboard(
         board,
         &header,
@@ -1234,8 +1242,14 @@ mod tests {
         let new_player = score_entry("@new:example.com", 5_000, 3);
         let established = score_entry("@established:example.com", 100_000, 30);
 
-        assert!(is_provisional(&new_player, TEST_RATING.provisional_threshold));
-        assert!(!is_provisional(&established, TEST_RATING.provisional_threshold));
+        assert!(is_provisional(
+            &new_player,
+            TEST_RATING.provisional_threshold
+        ));
+        assert!(!is_provisional(
+            &established,
+            TEST_RATING.provisional_threshold
+        ));
     }
 
     #[test]
@@ -1313,7 +1327,10 @@ mod tests {
 
         assert_eq!(alltime_shaped[0].user_id, "@amy:example.com");
         assert_eq!(
-            alltime_shaped.iter().map(|e| &e.user_id).collect::<Vec<_>>(),
+            alltime_shaped
+                .iter()
+                .map(|e| &e.user_id)
+                .collect::<Vec<_>>(),
             month_shaped.iter().map(|e| &e.user_id).collect::<Vec<_>>(),
         );
     }
@@ -1335,7 +1352,10 @@ mod tests {
         farther_but_alphabetically_first.best_distance_km = 0.205;
         farther_but_alphabetically_first.avg_distance_km = 0.205;
 
-        let mut board = vec![farther_but_alphabetically_first, closer_but_alphabetically_later];
+        let mut board = vec![
+            farther_but_alphabetically_first,
+            closer_but_alphabetically_later,
+        ];
         sort_score_leaderboard(&mut board, TEST_RATING.k, 1800.0);
 
         assert_eq!(

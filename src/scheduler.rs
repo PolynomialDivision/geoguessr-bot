@@ -3,7 +3,7 @@ use chrono_tz::Tz;
 use matrix_sdk::Client;
 use tracing::{error, info, warn};
 
-use crate::{BotContext, config::ScheduleConfig, game::GameOverrides, state::ScheduledOnce};
+use crate::{config::ScheduleConfig, game::GameOverrides, state::ScheduledOnce, BotContext};
 
 pub async fn run(ctx: BotContext, client: Client) {
     info!("GeoGuessr scheduler started");
@@ -16,12 +16,17 @@ pub async fn run(ctx: BotContext, client: Client) {
 }
 
 async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
-    let tz: Tz     = ctx.config.schedule.timezone.parse().unwrap_or(chrono_tz::UTC);
-    let local_now  = chrono::Utc::now().with_timezone(&tz);
+    let tz: Tz = ctx
+        .config
+        .schedule
+        .timezone
+        .parse()
+        .unwrap_or(chrono_tz::UTC);
+    let local_now = chrono::Utc::now().with_timezone(&tz);
     let local_date = local_now.date_naive();
-    let now_hour   = local_now.hour();
+    let now_hour = local_now.hour();
     let now_minute = local_now.minute();
-    let offset     = ctx.config.schedule.reminder_before_secs as i64;
+    let offset = ctx.config.schedule.reminder_before_secs as i64;
 
     // Guard: at most one round may be spawned per tick.
     //
@@ -41,10 +46,10 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
             }
         };
 
-        let game_secs  = (qh * 3600 + qm * 60) as i64;
-        let fire_secs  = (game_secs - offset).rem_euclid(86400);
-        let fire_hour  = (fire_secs / 3600) as u32;
-        let fire_min   = ((fire_secs % 3600) / 60) as u32;
+        let game_secs = (qh * 3600 + qm * 60) as i64;
+        let fire_secs = (game_secs - offset).rem_euclid(86400);
+        let fire_hour = (fire_secs / 3600) as u32;
+        let fire_min = ((fire_secs % 3600) / 60) as u32;
 
         if now_hour != fire_hour || now_minute != fire_min {
             continue;
@@ -81,9 +86,9 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
 
         info!("Scheduled game firing for slot {time_str}");
         round_spawned = true;
-        let ctx2    = ctx.clone();
+        let ctx2 = ctx.clone();
         let client2 = client.clone();
-        let slot    = time_str.clone();
+        let slot = time_str.clone();
         let handle = tokio::spawn(async move {
             if let Err(e) = crate::game::start_round(ctx2, client2, false, Some(slot), None).await {
                 error!("Game error: {e}");
@@ -96,12 +101,17 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
     let once_entries: Vec<ScheduledOnce> = ctx.state.lock().await.scheduled_once.clone();
 
     for entry in once_entries {
-        if entry.date != local_date { continue; }
+        if entry.date != local_date {
+            continue;
+        }
 
         let (qh, qm) = match ScheduleConfig::parse_game_time(&entry.game_time) {
             Some(t) => t,
-            None    => {
-                warn!("Invalid scheduled_once time {:?} — removing", entry.game_time);
+            None => {
+                warn!(
+                    "Invalid scheduled_once time {:?} — removing",
+                    entry.game_time
+                );
                 let mut state = ctx.state.lock().await;
                 state.scheduled_once.retain(|e| e != &entry);
                 state.save(&ctx.state_path).await.ok();
@@ -109,14 +119,17 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
             }
         };
 
-        let reminder = entry.reminder_before_secs
+        let reminder = entry
+            .reminder_before_secs
             .unwrap_or(ctx.config.schedule.reminder_before_secs);
-        let game_secs  = (qh * 3600 + qm * 60) as i64;
-        let fire_secs  = (game_secs - reminder as i64).rem_euclid(86400);
-        let fire_hour  = (fire_secs / 3600) as u32;
-        let fire_min   = ((fire_secs % 3600) / 60) as u32;
+        let game_secs = (qh * 3600 + qm * 60) as i64;
+        let fire_secs = (game_secs - reminder as i64).rem_euclid(86400);
+        let fire_hour = (fire_secs / 3600) as u32;
+        let fire_min = ((fire_secs % 3600) / 60) as u32;
 
-        if now_hour != fire_hour || now_minute != fire_min { continue; }
+        if now_hour != fire_hour || now_minute != fire_min {
+            continue;
+        }
 
         // Remove before spawning so a restart can't double-fire.
         {
@@ -144,17 +157,22 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
             continue;
         }
 
-        info!("One-time game firing for {} (fire at {fire_hour}:{fire_min:02})", entry.game_time);
+        info!(
+            "One-time game firing for {} (fire at {fire_hour}:{fire_min:02})",
+            entry.game_time
+        );
         round_spawned = true;
-        let ctx2    = ctx.clone();
+        let ctx2 = ctx.clone();
         let client2 = client.clone();
         let overrides = GameOverrides {
             reminder_before_secs: entry.reminder_before_secs,
-            answer_timeout_secs:  entry.answer_timeout_secs,
-            guesses_per_round:    entry.guesses_per_round,
+            answer_timeout_secs: entry.answer_timeout_secs,
+            guesses_per_round: entry.guesses_per_round,
         };
         let handle = tokio::spawn(async move {
-            if let Err(e) = crate::game::start_round(ctx2, client2, false, None, Some(overrides)).await {
+            if let Err(e) =
+                crate::game::start_round(ctx2, client2, false, None, Some(overrides)).await
+            {
                 error!("One-time game error: {e}");
             }
         });

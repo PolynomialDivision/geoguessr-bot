@@ -41,24 +41,24 @@ pub fn min_dist_to_existing(lat: f64, lon: f64, existing: &[(f64, f64)]) -> f64 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct GeoImage {
     /// The correct country name (matches an entry in `countries::COUNTRIES`).
-    pub country:     String,
+    pub country: String,
     /// Continental region (e.g. "Europe", "Asia").
-    pub region:      String,
+    pub region: String,
     /// Optional city name shown in the reveal message.
-    pub city:        Option<String>,
+    pub city: Option<String>,
     /// Direct HTTP(S) URL or absolute file path to the primary image.
-    pub image_url:   String,
+    pub image_url: String,
     /// "wikimedia" | "mapillary" | "local"
-    pub source:      String,
+    pub source: String,
     /// Attribution string to include in the reveal (e.g. "© Wikimedia Commons").
     pub attribution: Option<String>,
     /// Actual coordinates of the photo — used for free-guess distance scoring.
     /// Falls back to the country capital if not available.
-    pub lat:         Option<f64>,
-    pub lon:         Option<f64>,
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
     /// Mapillary sequence ID — used to avoid reusing the same capture run.
     #[serde(default)]
-    pub sequence:    Option<String>,
+    pub sequence: Option<String>,
     /// Additional photos from the same area (optional, for multi-photo questions).
     /// Only the primary `image_url` / `lat` / `lon` are used for scoring.
     #[serde(default)]

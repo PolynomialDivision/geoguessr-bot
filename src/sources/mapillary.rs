@@ -491,7 +491,11 @@ async fn try_seed(
         );
         sb.partial_cmp(&sa)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then(dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal))
+            .then(
+                dist_a
+                    .partial_cmp(&dist_b)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
     });
 
     // ── Try each diversity-passing candidate through the quality filter ────────
@@ -632,7 +636,10 @@ enum ImagesFetchError {
 /// total) — but returning immediately on a persistent 4xx (401/403/404/...,
 /// where retrying is pointless) or on the "too much data" 500 (where
 /// retrying the *same* request is pointless — see `ImagesFetchError`).
-async fn get_images(client: &reqwest::Client, url: &str) -> Result<MapillaryResp, ImagesFetchError> {
+async fn get_images(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<MapillaryResp, ImagesFetchError> {
     const MAX_RETRIES: u32 = 5;
     let mut last_err: Option<anyhow::Error> = None;
 
@@ -717,7 +724,12 @@ fn seed_half_degs(lat: f64, radius_m: u32) -> (f64, f64) {
     (half_lat_deg, half_lon_deg)
 }
 
-fn bbox_from_half_degs(lat: f64, lon: f64, half_lat_deg: f64, half_lon_deg: f64) -> (f64, f64, f64, f64) {
+fn bbox_from_half_degs(
+    lat: f64,
+    lon: f64,
+    half_lat_deg: f64,
+    half_lon_deg: f64,
+) -> (f64, f64, f64, f64) {
     (
         lon - half_lon_deg,
         lat - half_lat_deg,
@@ -1027,7 +1039,10 @@ mod tests {
                 half_lat > 0.0 && half_lon > 0.0,
                 "shrink {step} produced a non-positive half-degree"
             );
-            assert!(half_lat < prev_lat && half_lon < prev_lon, "shrink {step} did not shrink");
+            assert!(
+                half_lat < prev_lat && half_lon < prev_lon,
+                "shrink {step} did not shrink"
+            );
         }
         // 4 halvings should take the area down to 1/256th.
         assert!((half_lat - start_lat / 16.0).abs() < 1e-12);
@@ -1043,7 +1058,9 @@ mod tests {
             SeedFailureCategory::TooDense
         ));
         assert!(matches!(
-            classify_seed_failure("no images found near Mombasa, Kenya within ~0.56km effective radius"),
+            classify_seed_failure(
+                "no images found near Mombasa, Kenya within ~0.56km effective radius"
+            ),
             SeedFailureCategory::NoImages
         ));
         assert!(matches!(
@@ -1095,7 +1112,10 @@ mod tests {
                     async move {
                         let i = counter.fetch_add(1, Ordering::SeqCst);
                         let (status, body) = responses[i.min(responses.len() - 1)];
-                        (axum::http::StatusCode::from_u16(status).unwrap(), body.to_owned())
+                        (
+                            axum::http::StatusCode::from_u16(status).unwrap(),
+                            body.to_owned(),
+                        )
                     }
                 }),
             )
@@ -1142,7 +1162,10 @@ mod tests {
 
         let result = get_images(&client, &url).await;
 
-        assert!(result.is_ok(), "expected recovery after one transient error");
+        assert!(
+            result.is_ok(),
+            "expected recovery after one transient error"
+        );
         assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
@@ -1173,9 +1196,12 @@ mod tests {
             spawn_canned_server(vec![(500, "internal server error")]).await; // not the too-much-data body
         let client = reqwest::Client::new();
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(30), get_images(&client, &url))
-            .await
-            .expect("get_images must terminate on its own, not hang forever");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            get_images(&client, &url),
+        )
+        .await
+        .expect("get_images must terminate on its own, not hang forever");
 
         assert!(matches!(result, Err(ImagesFetchError::Other(_))));
         assert_eq!(

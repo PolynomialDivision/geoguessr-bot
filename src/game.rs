@@ -466,7 +466,13 @@ async fn abort_round_no_images(ctx: &BotContext, client: &Client, round_id: i64,
 /// dangling in a "started" state. Called before the countdown timer, active
 /// game registration, or DB event-id linkage happen, so no player-facing
 /// state ever treats this guess as playable.
-async fn abort_guess_no_image(ctx: &BotContext, room: &Room, guess_id: i64, guess_num: u32, n_total: u32) {
+async fn abort_guess_no_image(
+    ctx: &BotContext,
+    room: &Room,
+    guess_id: i64,
+    guess_num: u32,
+    n_total: u32,
+) {
     room.send(format::mentionify(&format!(
         "⚠️ Guess {guess_num}/{n_total} skipped · failed to deliver the image to Matrix (see logs).",
     )))
@@ -657,12 +663,15 @@ async fn play_free_guess(
             let line = participants
                 .iter()
                 .map(|uid| {
-                    let lang = st.user_langs.get(uid.as_str())
+                    let lang = st
+                        .user_langs
+                        .get(uid.as_str())
                         .cloned()
                         .unwrap_or_else(|| "en".to_owned());
                     format!(
                         "[🗺️ {}](https://polynomialdivision.github.io/geo-picker/?lang={})",
-                        uid.localpart(), lang
+                        uid.localpart(),
+                        lang
                     )
                 })
                 .collect::<Vec<_>>()

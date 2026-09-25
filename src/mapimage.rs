@@ -3,12 +3,12 @@
 //! Uses OpenStreetMap tiles via the `staticmap` crate.
 //! All tile fetching is synchronous — call via `tokio::task::spawn_blocking`.
 
+use crate::avatar::{PIN_ANCHOR_X, PIN_ANCHOR_Y};
 use staticmap::{
     lat_to_y,
     tools::{CircleBuilder, Color, IconBuilder, LineBuilder},
     StaticMapBuilder,
 };
-use crate::avatar::{PIN_ANCHOR_X, PIN_ANCHOR_Y};
 
 const GUESS_MAP_W: u32 = 640;
 const GUESS_MAP_H: u32 = 400;
@@ -20,14 +20,14 @@ const GUESS_MAP_EFFECTIVE_H: f64 = 260.0;
 // (R, G, B, chat_emoji)  — visually distinct, works on both light and dark maps.
 // `pub` so game.rs can look up the colour for each player when rendering pins.
 pub const PLAYER_COLORS: &[(u8, u8, u8, &str)] = &[
-    ( 50, 120, 255, "🔵"),  // blue
-    (220,  60,  60, "🔴"),  // red
-    ( 50, 195,  80, "🟢"),  // green
-    (180,  50, 220, "🟣"),  // purple
-    (210, 165,   0, "🟡"),  // yellow
-    (  0, 185, 210, "🩵"),  // cyan
-    (240, 120,   0, "🟠"),  // orange
-    (200,   0, 140, "🩷"),  // pink
+    (50, 120, 255, "🔵"), // blue
+    (220, 60, 60, "🔴"),  // red
+    (50, 195, 80, "🟢"),  // green
+    (180, 50, 220, "🟣"), // purple
+    (210, 165, 0, "🟡"),  // yellow
+    (0, 185, 210, "🩵"),  // cyan
+    (240, 120, 0, "🟠"),  // orange
+    (200, 0, 140, "🩷"),  // pink
 ];
 
 // ── Single-player map ─────────────────────────────────────────────────────────
@@ -41,17 +41,19 @@ pub const PLAYER_COLORS: &[(u8, u8, u8, &str)] = &[
 /// Zoom is chosen automatically based on `dist_km`.
 /// Returns `None` if tile fetching or encoding fails.
 pub fn render_guess_map(
-    guess_lat:  f64,
-    guess_lon:  f64,
+    guess_lat: f64,
+    guess_lon: f64,
     actual_lat: f64,
     actual_lon: f64,
-    dist_km:    f64,
+    dist_km: f64,
     player_pin: Option<Vec<u8>>,
-    r: u8, g: u8, b: u8,
+    r: u8,
+    g: u8,
+    b: u8,
 ) -> Option<Vec<u8>> {
     let center_lat = (guess_lat + actual_lat) / 2.0;
     let (center_lon, arc_span) = minimum_lon_arc(&[guess_lon, actual_lon]);
-    let guess_lon  = normalize_lon(guess_lon,  center_lon);
+    let guess_lon = normalize_lon(guess_lon, center_lon);
     let actual_lon = normalize_lon(actual_lon, center_lon);
 
     let zoom = guess_map_zoom(guess_lat, actual_lat, arc_span, dist_km);
@@ -66,7 +68,9 @@ pub fn render_guess_map(
         .build()
         .ok()?;
 
-    add_line_shorter_arc(&mut map, guess_lat, guess_lon, actual_lat, actual_lon, r, g, b);
+    add_line_shorter_arc(
+        &mut map, guess_lat, guess_lon, actual_lat, actual_lon, r, g, b,
+    );
 
     // Avatar pin if available; plain circle as fallback.
     let placed = player_pin.and_then(|png| {
@@ -104,7 +108,7 @@ pub fn render_guess_map(
 /// The map uses the minimum-width arc to fit all points, with antimeridian-safe
 /// line drawing so lines always show the shorter path.
 pub fn render_round_map(
-    guesses:    &[(String, f64, f64, Option<Vec<u8>>)],   // (name, lat, lon, pin_png)
+    guesses: &[(String, f64, f64, Option<Vec<u8>>)], // (name, lat, lon, pin_png)
     actual_lat: f64,
     actual_lon: f64,
 ) -> Option<(Vec<u8>, Vec<(String, &'static str)>)> {
@@ -118,17 +122,23 @@ pub fn render_round_map(
 
     let (center_lon, lon_span) = minimum_lon_arc(&all_lons);
     let actual_lon = normalize_lon(actual_lon, center_lon);
-    let lat_min = all_lats.iter().cloned().fold(f64::INFINITY,     f64::min);
+    let lat_min = all_lats.iter().cloned().fold(f64::INFINITY, f64::min);
     let lat_max = all_lats.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let center_lat = (lat_min + lat_max) / 2.0;
 
     // Max zoom where lon span fits in effective width (700 - 2×40 = 620 px).
     let max_zoom_lon = if lon_span > 0.0 {
-        ((620.0_f64 / 256.0 * 360.0) / lon_span).log2().floor().clamp(0.0, 11.0) as u8
-    } else { 11u8 };
+        ((620.0_f64 / 256.0 * 360.0) / lon_span)
+            .log2()
+            .floor()
+            .clamp(0.0, 11.0) as u8
+    } else {
+        11u8
+    };
 
     // Max zoom where lat span fits in effective height (500 - 2×40 = 420 px).
-    let max_zoom_lat = (0u8..=11).rev()
+    let max_zoom_lat = (0u8..=11)
+        .rev()
         .find(|&z| {
             let y_span = (lat_to_y(lat_min, z) - lat_to_y(lat_max, z)).abs() * 256.0;
             y_span <= 420.0
@@ -211,44 +221,53 @@ pub fn render_round_map(
 /// that correctly for pixel placement even though tile fetching wraps separately.
 fn normalize_lon(lon: f64, center_lon: f64) -> f64 {
     let mut l = lon;
-    while l - center_lon >  180.0 { l -= 360.0; }
-    while l - center_lon < -180.0 { l += 360.0; }
+    while l - center_lon > 180.0 {
+        l -= 360.0;
+    }
+    while l - center_lon < -180.0 {
+        l += 360.0;
+    }
     l
 }
 
 /// Returns `(center_lon, arc_span_degrees)` for the minimum-width arc
 /// containing all given longitudes.  Handles antimeridian wrapping correctly.
 fn minimum_lon_arc(lons: &[f64]) -> (f64, f64) {
-    if lons.is_empty() { return (0.0, 360.0); }
+    if lons.is_empty() {
+        return (0.0, 360.0);
+    }
 
     // Convert lons to [0, 360) fractions, sort, deduplicate.
-    let mut fracs: Vec<f64> = lons.iter()
+    let mut fracs: Vec<f64> = lons
+        .iter()
         .map(|&l| (l + 180.0).rem_euclid(360.0))
         .collect();
     fracs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     fracs.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
 
     let n = fracs.len();
-    if n == 1 { return (fracs[0] - 180.0, 0.0); }
+    if n == 1 {
+        return (fracs[0] - 180.0, 0.0);
+    }
 
     // Find the largest gap between consecutive fracs (including the wrap-around gap).
-    let mut max_gap    = 0.0_f64;
-    let mut arc_start  = fracs[0];
+    let mut max_gap = 0.0_f64;
+    let mut arc_start = fracs[0];
     for i in 0..n {
         let gap = if i + 1 < n {
             fracs[i + 1] - fracs[i]
         } else {
-            360.0 - fracs[n - 1] + fracs[0]  // wrap-around gap
+            360.0 - fracs[n - 1] + fracs[0] // wrap-around gap
         };
         if gap > max_gap {
-            max_gap   = gap;
+            max_gap = gap;
             arc_start = if i + 1 < n { fracs[i + 1] } else { fracs[0] };
         }
     }
 
-    let span        = 360.0 - max_gap;
+    let span = 360.0 - max_gap;
     let center_frac = (arc_start + span / 2.0).rem_euclid(360.0);
-    let center_lon  = center_frac - 180.0;
+    let center_lon = center_frac - 180.0;
     (center_lon, span)
 }
 
@@ -264,7 +283,8 @@ fn guess_map_zoom(guess_lat: f64, actual_lat: f64, lon_span: f64, dist_km: f64) 
 
     let lat_min = guess_lat.min(actual_lat);
     let lat_max = guess_lat.max(actual_lat);
-    let max_zoom_lat = (0u8..=GUESS_MAP_MAX_ZOOM).rev()
+    let max_zoom_lat = (0u8..=GUESS_MAP_MAX_ZOOM)
+        .rev()
         .find(|&z| {
             let y_span = (lat_to_y(lat_min, z) - lat_to_y(lat_max, z)).abs() * 256.0;
             y_span <= GUESS_MAP_EFFECTIVE_H
@@ -295,7 +315,7 @@ mod tests {
     #[test]
     fn guess_map_uses_street_level_zoom_for_very_close_guesses() {
         let actual_lat = 50.8510;
-        let guess_lat  = 50.8518;
+        let guess_lat = 50.8518;
         let (_, lon_span) = minimum_lon_arc(&[4.3517, 4.3517]);
 
         assert_eq!(guess_map_zoom(guess_lat, actual_lat, lon_span, 0.1), 17);
@@ -307,9 +327,13 @@ mod tests {
 /// segments at ±180° so the staticmap crate renders it correctly.
 fn add_line_shorter_arc(
     map: &mut staticmap::StaticMap,
-    lat1: f64, lon1: f64,
-    lat2: f64, lon2: f64,
-    r: u8, g: u8, b: u8,
+    lat1: f64,
+    lon1: f64,
+    lat2: f64,
+    lon2: f64,
+    r: u8,
+    g: u8,
+    b: u8,
 ) {
     let diff = lon2 - lon1;
     if diff.abs() <= 180.0 {
@@ -319,22 +343,26 @@ fn add_line_shorter_arc(
     // Shorter arc crosses the antimeridian.  Express lon2 in the direction
     // that crosses ±180° so we can interpolate the crossing latitude.
     let (lon2_ext, cross_lon) = if diff > 0.0 {
-        (lon2 - 360.0, -180.0_f64)  // shorter path goes west
+        (lon2 - 360.0, -180.0_f64) // shorter path goes west
     } else {
-        (lon2 + 360.0,  180.0_f64)  // shorter path goes east
+        (lon2 + 360.0, 180.0_f64) // shorter path goes east
     };
-    let t         = (cross_lon - lon1) / (lon2_ext - lon1);
+    let t = (cross_lon - lon1) / (lon2_ext - lon1);
     let cross_lat = lat1 + t * (lat2 - lat1);
-    add_line(map, lat1,      lon1,       cross_lat, cross_lon,  r, g, b);
-    add_line(map, cross_lat, -cross_lon, lat2,      lon2,       r, g, b);
+    add_line(map, lat1, lon1, cross_lat, cross_lon, r, g, b);
+    add_line(map, cross_lat, -cross_lon, lat2, lon2, r, g, b);
 }
 
 /// Draw a white-underlined coloured line between two points.
 fn add_line(
     map: &mut staticmap::StaticMap,
-    lat1: f64, lon1: f64,
-    lat2: f64, lon2: f64,
-    r: u8, g: u8, b: u8,
+    lat1: f64,
+    lon1: f64,
+    lat2: f64,
+    lon2: f64,
+    r: u8,
+    g: u8,
+    b: u8,
 ) {
     if let Ok(ul) = LineBuilder::new()
         .lat_coordinates(vec![lat1, lat2])
@@ -359,11 +387,7 @@ fn add_line(
 }
 
 /// Draw a white-bordered filled circle at a given location.
-fn add_circle(
-    map: &mut staticmap::StaticMap,
-    lat: f64, lon: f64,
-    r: u8, g: u8, b: u8,
-) {
+fn add_circle(map: &mut staticmap::StaticMap, lat: f64, lon: f64, r: u8, g: u8, b: u8) {
     if let Ok(border) = CircleBuilder::new()
         .lat_coordinate(lat)
         .lon_coordinate(lon)

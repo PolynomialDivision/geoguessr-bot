@@ -8,15 +8,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::{
-    Router,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
+    Router,
 };
 use matrix_sdk::{
-    Client,
     ruma::{OwnedEventId, OwnedRoomId, OwnedUserId},
+    Client,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::Mutex};
@@ -29,10 +29,10 @@ use crate::game::{ActiveGame, ActiveGameMode, FreeGuess};
 /// One record per player per guess.
 #[derive(Clone, Debug)]
 pub struct GuessToken {
-    pub user_id:   OwnedUserId,
-    pub round_id:  i64,
+    pub user_id: OwnedUserId,
+    pub round_id: i64,
     pub guess_num: u32,
-    pub lang:      String,
+    pub lang: String,
 }
 
 /// Per-guess session shared across all tokens for the same (round_id, guess_num).
@@ -41,12 +41,12 @@ pub struct GuessSession {
     /// Event ID of the links message in the game room — edited on each submission.
     pub links_event_id: OwnedEventId,
     /// Ordered participant list (controls display order in status line).
-    pub participants:   Vec<OwnedUserId>,
+    pub participants: Vec<OwnedUserId>,
 }
 
 #[derive(Default)]
 pub struct TokenStore {
-    pub tokens:   HashMap<String, GuessToken>,
+    pub tokens: HashMap<String, GuessToken>,
     pub sessions: HashMap<(i64, u32), GuessSession>,
 }
 
@@ -60,23 +60,23 @@ pub fn new_token_store() -> SharedTokenStore {
 
 #[derive(Clone)]
 pub struct WebState {
-    pub store:       SharedTokenStore,
+    pub store: SharedTokenStore,
     pub active_game: Arc<Mutex<Option<ActiveGame>>>,
-    pub client:      Client,
-    pub room_id:     OwnedRoomId,
+    pub client: Client,
+    pub room_id: OwnedRoomId,
     /// 0 = unlimited updates; >0 = only the first submission counts.
     pub max_guesses: u32,
     /// Public base URL (no trailing slash).
-    pub public_url:  String,
+    pub public_url: String,
 }
 
 // ── Server entry point ────────────────────────────────────────────────────────
 
 pub async fn run(bind_addr: String, state: WebState) -> anyhow::Result<()> {
     let app = Router::new()
-        .route("/g/:token",        get(serve_map))
+        .route("/g/:token", get(serve_map))
         .route("/g/:token/submit", post(submit_guess))
-        .route("/map-test",        get(test_map))
+        .route("/map-test", get(test_map))
         .with_state(state);
 
     let listener = TcpListener::bind(&bind_addr).await?;
@@ -87,10 +87,7 @@ pub async fn run(bind_addr: String, state: WebState) -> anyhow::Result<()> {
 
 // ── Map page ──────────────────────────────────────────────────────────────────
 
-async fn serve_map(
-    Path(token): Path<String>,
-    State(ws):   State<WebState>,
-) -> Response {
+async fn serve_map(Path(token): Path<String>, State(ws): State<WebState>) -> Response {
     let info = {
         let store = ws.store.lock().await;
         store.tokens.get(&token).cloned()
@@ -99,11 +96,20 @@ async fn serve_map(
         return (StatusCode::NOT_FOUND, Html(expired_html())).into_response();
     };
     let one_shot = ws.max_guesses > 0;
-    Html(map_html(&token, tok.user_id.localpart(), one_shot, &tok.lang)).into_response()
+    Html(map_html(
+        &token,
+        tok.user_id.localpart(),
+        one_shot,
+        &tok.lang,
+    ))
+    .into_response()
 }
 
 async fn test_map(Query(params): Query<HashMap<String, String>>) -> Response {
-    let lang = params.get("lang").cloned().unwrap_or_else(|| "en".to_owned());
+    let lang = params
+        .get("lang")
+        .cloned()
+        .unwrap_or_else(|| "en".to_owned());
     Html(map_html("test", "test", false, &lang)).into_response()
 }
 
@@ -122,8 +128,8 @@ struct SubmitResponse {
 
 async fn submit_guess(
     Path(token): Path<String>,
-    State(ws):   State<WebState>,
-    Json(body):  Json<SubmitBody>,
+    State(ws): State<WebState>,
+    Json(body): Json<SubmitBody>,
 ) -> Response {
     if !is_valid_coords(body.lat, body.lon) {
         return (StatusCode::BAD_REQUEST, "Invalid coordinates").into_response();
@@ -133,7 +139,7 @@ async fn submit_guess(
         let store = ws.store.lock().await;
         match store.tokens.get(&token).cloned() {
             Some(t) => t,
-            None    => return (StatusCode::NOT_FOUND, "Link expired or invalid").into_response(),
+            None => return (StatusCode::NOT_FOUND, "Link expired or invalid").into_response(),
         }
     };
 
@@ -157,9 +163,9 @@ async fn submit_guess(
             g.record_free_guess(
                 tok.user_id.as_str().to_owned(),
                 FreeGuess {
-                    text:         format!("{:.4},{:.4}", body.lat, body.lon),
-                    lat:          body.lat,
-                    lon:          body.lon,
+                    text: format!("{:.4},{:.4}", body.lat, body.lon),
+                    lat: body.lat,
+                    lon: body.lon,
                     submitted_at: chrono::Utc::now(),
                 },
                 ws.max_guesses,
@@ -189,9 +195,11 @@ pub async fn update_links_message(ws: &WebState, round_id: i64, guess_num: u32) 
         let store = ws.store.lock().await;
         let session = match store.sessions.get(&(round_id, guess_num)).cloned() {
             Some(s) => s,
-            None    => return,
+            None => return,
         };
-        let token_by_user: HashMap<String, String> = store.tokens.iter()
+        let token_by_user: HashMap<String, String> = store
+            .tokens
+            .iter()
             .filter(|(_, t)| t.round_id == round_id && t.guess_num == guess_num)
             .map(|(tok, t)| (t.user_id.to_string(), tok.clone()))
             .collect();
@@ -206,20 +214,29 @@ pub async fn update_links_message(ws: &WebState, round_id: i64, guess_num: u32) 
         })
     };
 
-    let line = session.participants.iter().map(|uid| {
-        if submitted.contains(uid.as_str()) {
-            format!("✅ {}", uid.localpart())
-        } else if let Some(tok) = token_by_user.get(uid.as_str()) {
-            format!("[🗺️ {}]({}/g/{})", uid.localpart(), ws.public_url, tok)
-        } else {
-            format!("⏳ {}", uid.localpart())
-        }
-    }).collect::<Vec<_>>().join("  ·  ");
+    let line = session
+        .participants
+        .iter()
+        .map(|uid| {
+            if submitted.contains(uid.as_str()) {
+                format!("✅ {}", uid.localpart())
+            } else if let Some(tok) = token_by_user.get(uid.as_str()) {
+                format!("[🗺️ {}]({}/g/{})", uid.localpart(), ws.public_url, tok)
+            } else {
+                format!("⏳ {}", uid.localpart())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ·  ");
 
-    let Some(room) = ws.client.get_room(&ws.room_id) else { return };
+    let Some(room) = ws.client.get_room(&ws.room_id) else {
+        return;
+    };
     use matrix_sdk::ruma::events::room::message::ReplacementMetadata;
-    let edit = crate::format::mentionify(&line)
-        .make_replacement(ReplacementMetadata::new(session.links_event_id.clone(), None));
+    let edit = crate::format::mentionify(&line).make_replacement(ReplacementMetadata::new(
+        session.links_event_id.clone(),
+        None,
+    ));
     if let Err(e) = room.send(edit).await {
         warn!("Failed to update links message: {e}");
     }
@@ -247,10 +264,10 @@ pub fn is_valid_coords(lat: f64, lon: f64) -> bool {
 fn map_html(token: &str, display_name: &str, one_shot: bool, lang: &str) -> String {
     // Use placeholder replacement so Leaflet's {z}/{x}/{y}/{s} tokens and
     // JavaScript object literals don't need escaping in a format! string.
-    let token_json    = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_owned());
-    let name_json     = serde_json::to_string(display_name).unwrap_or_else(|_| "\"\"".to_owned());
-    let one_shot_js   = if one_shot { "true" } else { "false" };
-    let lang_json     = serde_json::to_string(lang).unwrap_or_else(|_| "\"en\"".to_owned());
+    let token_json = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_owned());
+    let name_json = serde_json::to_string(display_name).unwrap_or_else(|_| "\"\"".to_owned());
+    let one_shot_js = if one_shot { "true" } else { "false" };
+    let lang_json = serde_json::to_string(lang).unwrap_or_else(|_| "\"en\"".to_owned());
 
     LEAFLET_MAP_TEMPLATE
         .replace("__TOKEN__", &token_json)
@@ -533,7 +550,8 @@ p{color:#99aacc;font-size:0.95rem}
 <body><div>
 <h2>⏰ This link has expired</h2>
 <p>The round has ended or the link is invalid.</p>
-</div></body></html>"#.to_owned()
+</div></body></html>"#
+        .to_owned()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -541,9 +559,9 @@ p{color:#99aacc;font-size:0.95rem}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use matrix_sdk::ruma::OwnedUserId;
     use crate::game::{ActiveGame, ActiveGameMode};
+    use matrix_sdk::ruma::OwnedUserId;
+    use std::collections::HashMap;
 
     // ── Token generation ──────────────────────────────────────────────────────
 
@@ -551,14 +569,21 @@ mod tests {
     fn token_is_24_alphanumeric_chars() {
         let t = generate_token();
         assert_eq!(t.len(), 24, "token must be 24 chars");
-        assert!(t.chars().all(|c| c.is_ascii_alphanumeric()), "token must be alphanumeric");
+        assert!(
+            t.chars().all(|c| c.is_ascii_alphanumeric()),
+            "token must be alphanumeric"
+        );
     }
 
     #[test]
     fn tokens_are_unique() {
         let tokens: Vec<String> = (0..200).map(|_| generate_token()).collect();
         let set: HashSet<&String> = tokens.iter().collect();
-        assert_eq!(set.len(), tokens.len(), "all 200 generated tokens must be distinct");
+        assert_eq!(
+            set.len(),
+            tokens.len(),
+            "all 200 generated tokens must be distinct"
+        );
     }
 
     // ── Token store ───────────────────────────────────────────────────────────
@@ -567,9 +592,15 @@ mod tests {
     fn token_store_add_and_retrieve() {
         let uid: OwnedUserId = "@alice:example.com".try_into().unwrap();
         let mut store = TokenStore::default();
-        store.tokens.insert("tok1".to_owned(), GuessToken {
-            user_id: uid.clone(), round_id: 1, guess_num: 1, lang: "en".to_owned(),
-        });
+        store.tokens.insert(
+            "tok1".to_owned(),
+            GuessToken {
+                user_id: uid.clone(),
+                round_id: 1,
+                guess_num: 1,
+                lang: "en".to_owned(),
+            },
+        );
         let found = store.tokens.get("tok1");
         assert!(found.is_some());
         assert_eq!(found.unwrap().user_id, uid);
@@ -580,17 +611,52 @@ mod tests {
     fn token_store_clear_by_round_and_guess() {
         let uid: OwnedUserId = "@alice:example.com".try_into().unwrap();
         let mut store = TokenStore::default();
-        store.tokens.insert("t_r1g1".to_owned(), GuessToken { user_id: uid.clone(), round_id: 1, guess_num: 1, lang: "en".to_owned() });
-        store.tokens.insert("t_r1g2".to_owned(), GuessToken { user_id: uid.clone(), round_id: 1, guess_num: 2, lang: "en".to_owned() });
-        store.tokens.insert("t_r2g1".to_owned(), GuessToken { user_id: uid.clone(), round_id: 2, guess_num: 1, lang: "en".to_owned() });
+        store.tokens.insert(
+            "t_r1g1".to_owned(),
+            GuessToken {
+                user_id: uid.clone(),
+                round_id: 1,
+                guess_num: 1,
+                lang: "en".to_owned(),
+            },
+        );
+        store.tokens.insert(
+            "t_r1g2".to_owned(),
+            GuessToken {
+                user_id: uid.clone(),
+                round_id: 1,
+                guess_num: 2,
+                lang: "en".to_owned(),
+            },
+        );
+        store.tokens.insert(
+            "t_r2g1".to_owned(),
+            GuessToken {
+                user_id: uid.clone(),
+                round_id: 2,
+                guess_num: 1,
+                lang: "en".to_owned(),
+            },
+        );
 
         // Simulate clearing round 1, guess 1.
-        store.tokens.retain(|_, t| !(t.round_id == 1 && t.guess_num == 1));
+        store
+            .tokens
+            .retain(|_, t| !(t.round_id == 1 && t.guess_num == 1));
         store.sessions.remove(&(1, 1));
 
-        assert!(!store.tokens.contains_key("t_r1g1"), "cleared token must be gone");
-        assert!(store.tokens.contains_key("t_r1g2"), "other guess token must survive");
-        assert!(store.tokens.contains_key("t_r2g1"), "other round token must survive");
+        assert!(
+            !store.tokens.contains_key("t_r1g1"),
+            "cleared token must be gone"
+        );
+        assert!(
+            store.tokens.contains_key("t_r1g2"),
+            "other guess token must survive"
+        );
+        assert!(
+            store.tokens.contains_key("t_r2g1"),
+            "other round token must survive"
+        );
     }
 
     #[test]
@@ -598,7 +664,15 @@ mod tests {
         let uid: OwnedUserId = "@alice:example.com".try_into().unwrap();
         let mut store = TokenStore::default();
         for i in 0..5 {
-            store.tokens.insert(format!("tok{i}"), GuessToken { user_id: uid.clone(), round_id: 1, guess_num: i, lang: "en".to_owned() });
+            store.tokens.insert(
+                format!("tok{i}"),
+                GuessToken {
+                    user_id: uid.clone(),
+                    round_id: 1,
+                    guess_num: i,
+                    lang: "en".to_owned(),
+                },
+            );
         }
         store.tokens.clear();
         store.sessions.clear();
@@ -610,8 +684,8 @@ mod tests {
 
     #[test]
     fn coord_validation_accepts_valid() {
-        assert!(is_valid_coords(0.0,   0.0));
-        assert!(is_valid_coords(90.0,  180.0));
+        assert!(is_valid_coords(0.0, 0.0));
+        assert!(is_valid_coords(90.0, 180.0));
         assert!(is_valid_coords(-90.0, -180.0));
         assert!(is_valid_coords(48.13, 11.58));
         assert!(is_valid_coords(-33.87, 151.21));
@@ -619,18 +693,18 @@ mod tests {
 
     #[test]
     fn coord_validation_rejects_out_of_range() {
-        assert!(!is_valid_coords(90.01,  0.0));
+        assert!(!is_valid_coords(90.01, 0.0));
         assert!(!is_valid_coords(-90.01, 0.0));
-        assert!(!is_valid_coords(0.0,    180.01));
-        assert!(!is_valid_coords(0.0,   -180.01));
+        assert!(!is_valid_coords(0.0, 180.01));
+        assert!(!is_valid_coords(0.0, -180.01));
     }
 
     #[test]
     fn coord_validation_rejects_non_finite() {
-        assert!(!is_valid_coords(f64::NAN,       0.0));
-        assert!(!is_valid_coords(0.0,            f64::NAN));
-        assert!(!is_valid_coords(f64::INFINITY,  0.0));
-        assert!(!is_valid_coords(0.0,            f64::NEG_INFINITY));
+        assert!(!is_valid_coords(f64::NAN, 0.0));
+        assert!(!is_valid_coords(0.0, f64::NAN));
+        assert!(!is_valid_coords(f64::INFINITY, 0.0));
+        assert!(!is_valid_coords(0.0, f64::NEG_INFINITY));
     }
 
     // ── Guess recording ───────────────────────────────────────────────────────
@@ -639,7 +713,7 @@ mod tests {
         ActiveGame {
             event_id: "$test:example.com".try_into().unwrap(),
             mode: ActiveGameMode::FreeGuess {
-                guesses:    HashMap::new(),
+                guesses: HashMap::new(),
                 actual_lat: 48.13,
                 actual_lon: 11.58,
             },
@@ -647,7 +721,12 @@ mod tests {
     }
 
     fn make_guess(lat: f64, lon: f64) -> FreeGuess {
-        FreeGuess { text: format!("{lat},{lon}"), lat, lon, submitted_at: chrono::Utc::now() }
+        FreeGuess {
+            text: format!("{lat},{lon}"),
+            lat,
+            lon,
+            submitted_at: chrono::Utc::now(),
+        }
     }
 
     fn guesses_of(ag: &ActiveGame) -> &HashMap<String, FreeGuess> {
@@ -670,11 +749,18 @@ mod tests {
     fn one_shot_blocks_second_submission() {
         let mut ag = make_game();
         let uid = "@alice:example.com".to_owned();
-        let first  = ag.record_free_guess(uid.clone(), make_guess(10.0, 20.0), 1);
+        let first = ag.record_free_guess(uid.clone(), make_guess(10.0, 20.0), 1);
         let second = ag.record_free_guess(uid.clone(), make_guess(30.0, 40.0), 1);
-        assert!(first,  "first submission must be accepted in one-shot mode");
-        assert!(!second, "second submission must be rejected in one-shot mode");
-        assert_eq!(guesses_of(&ag)[&uid].lat, 10.0, "original guess must not be overwritten");
+        assert!(first, "first submission must be accepted in one-shot mode");
+        assert!(
+            !second,
+            "second submission must be rejected in one-shot mode"
+        );
+        assert_eq!(
+            guesses_of(&ag)[&uid].lat,
+            10.0,
+            "original guess must not be overwritten"
+        );
     }
 
     #[test]
@@ -684,7 +770,11 @@ mod tests {
         ag.record_free_guess(uid.clone(), make_guess(10.0, 20.0), 0);
         let updated = ag.record_free_guess(uid.clone(), make_guess(30.0, 40.0), 0);
         assert!(updated, "update must be accepted in unlimited mode");
-        assert_eq!(guesses_of(&ag)[&uid].lat, 30.0, "guess must be updated to latest value");
+        assert_eq!(
+            guesses_of(&ag)[&uid].lat,
+            30.0,
+            "guess must be updated to latest value"
+        );
     }
 
     #[test]
@@ -701,6 +791,9 @@ mod tests {
     #[test]
     fn authorization_wrong_token_not_found() {
         let store = TokenStore::default();
-        assert!(store.tokens.get("nonexistent").is_none(), "unknown token must not be found");
+        assert!(
+            store.tokens.get("nonexistent").is_none(),
+            "unknown token must not be found"
+        );
     }
 }
