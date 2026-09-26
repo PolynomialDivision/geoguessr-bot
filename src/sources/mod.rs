@@ -63,4 +63,9 @@ pub struct GeoImage {
     /// Only the primary `image_url` / `lat` / `lon` are used for scoring.
     #[serde(default)]
     pub extra_image_urls: Vec<String>,
+    /// `lat`/`lon` are confirmed by two independent position estimates
+    /// (Mapillary: GPS and reconstruction agree). Mapillary images cached
+    /// before this check existed lack it and are evicted.
+    #[serde(default)]
+    pub position_confirmed: bool,
 }

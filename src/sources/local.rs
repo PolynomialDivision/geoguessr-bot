@@ -72,5 +72,6 @@ pub async fn fetch(dir: &str) -> Result<GeoImage> {
         lon: entry.lon,
         sequence: None,
         extra_image_urls: vec![],
+        position_confirmed: false,
     })
 }

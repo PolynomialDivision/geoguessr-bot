@@ -66,7 +66,12 @@ struct MapillaryResp {
 #[derive(Deserialize, Clone)]
 struct MapillaryImage {
     id: String,
+    /// Position as reported by the capturing device's GPS.
     geometry: Geometry,
+    /// Position after Mapillary's structure-from-motion reconstruction, which
+    /// matches overlapping photos to recover where the camera actually stood.
+    #[serde(default)]
+    computed_geometry: Option<Geometry>,
     thumb_1024_url: Option<String>,
     creator: Option<Creator>,
     /// Mapillary v4 sequence UUID — images in the same sequence are from the
@@ -93,6 +98,29 @@ struct MapillaryImage {
 #[derive(Deserialize, Clone)]
 struct Geometry {
     coordinates: [f64; 2],
+}
+
+impl Geometry {
+    fn lat_lon(&self) -> (f64, f64) {
+        (self.coordinates[1], self.coordinates[0])
+    }
+}
+
+/// A reference image's GPS and reconstructed positions must agree this
+/// closely. Phone GPS alone is often 10–50 m off in cities, and a failed
+/// reconstruction can be off by more; where both independent estimates
+/// agree, the position is reliable.
+const MAX_POSITION_DISAGREEMENT_M: f64 = 10.0;
+
+impl MapillaryImage {
+    /// Where this photo was taken, if Mapillary's two position estimates
+    /// confirm each other — then the reconstructed one, the more precise.
+    fn trusted_position(&self) -> Option<(f64, f64)> {
+        let (glat, glon) = self.geometry.lat_lon();
+        let (clat, clon) = self.computed_geometry.as_ref()?.lat_lon();
+        (haversine_km(glat, glon, clat, clon) * 1000.0 <= MAX_POSITION_DISAGREEMENT_M)
+            .then_some((clat, clon))
+    }
 }
 
 #[derive(Deserialize, Clone)]
@@ -236,6 +264,7 @@ pub async fn fetch(
     let mut n_too_dense = 0u32;
     let mut n_no_images = 0u32;
     let mut n_deduped = 0u32;
+    let mut n_unconfirmed = 0u32;
     let mut n_other_failures = 0u32;
 
     for seed in candidates.iter().take(10) {
@@ -271,6 +300,7 @@ pub async fn fetch(
                     SeedFailureCategory::TooDense => n_too_dense += 1,
                     SeedFailureCategory::NoImages => n_no_images += 1,
                     SeedFailureCategory::Deduped => n_deduped += 1,
+                    SeedFailureCategory::Unconfirmed => n_unconfirmed += 1,
                     SeedFailureCategory::Other => n_other_failures += 1,
                 }
                 warn!(
@@ -285,7 +315,7 @@ pub async fn fetch(
         "Mapillary: could not find a suitable image after trying {n_tried} seed(s) \
          ({n_quality_rejected} quality-rejected, {n_too_dense} too dense for any bbox, \
          {n_no_images} with no images, {n_deduped} fully deduped against history/cache, \
-         {n_other_failures} other failures — see preceding WARNs for detail)"
+         {n_unconfirmed} without a confirmed position, {n_other_failures} other failures — see preceding WARNs for detail)"
     )
 }
 
@@ -305,6 +335,8 @@ enum SeedFailureCategory {
     /// Every candidate was within `MIN_DISTANCE_KM` of an already-known
     /// location or shared a sequence with one.
     Deduped,
+    /// No remaining candidate had GPS and reconstructed positions agreeing.
+    Unconfirmed,
     /// Network error, persistent HTTP error, or anything else.
     Other,
 }
@@ -319,6 +351,8 @@ fn classify_seed_failure(msg: &str) -> SeedFailureCategory {
         SeedFailureCategory::NoImages
     } else if msg.contains("of an existing location or share a sequence") {
         SeedFailureCategory::Deduped
+    } else if msg.contains("has a confirmed position") {
+        SeedFailureCategory::Unconfirmed
     } else {
         SeedFailureCategory::Other
     }
@@ -362,7 +396,7 @@ async fn try_seed(
             bbox_from_half_degs(seed.lat, seed.lon, half_lat_deg, half_lon_deg);
         let url = format!(
             "{API}?access_token={token}\
-             &fields=id,geometry,thumb_1024_url,creator,sequence,captured_at,width,height,compass_angle,quality_score\
+             &fields=id,geometry,computed_geometry,thumb_1024_url,creator,sequence,captured_at,width,height,compass_angle,quality_score\
              &bbox={left},{bottom},{right},{top}\
              &limit={MAPILLARY_IMAGES_LIMIT}",
             token = cfg.access_token,
@@ -456,6 +490,18 @@ async fn try_seed(
             "all {} candidates near {} are within {MIN_DISTANCE_KM:.0} km of an existing \
              location or share a sequence",
             candidates.len(),
+            seed.city
+        );
+    }
+
+    // The reference image is what players are scored against: only photos
+    // whose position is confirmed qualify. Context photos are unaffected.
+    let novel = passing.len();
+    passing.retain(|&i| candidates[i].trusted_position().is_some());
+    if passing.is_empty() {
+        bail!(
+            "none of the {novel} candidates near {} has a confirmed position \
+             (GPS and reconstruction within {MAX_POSITION_DISAGREEMENT_M:.0} m)",
             seed.city
         );
     }
@@ -568,8 +614,9 @@ async fn try_seed(
         );
 
         let primary = candidates.remove(primary_idx);
-        let lon = primary.geometry.coordinates[0];
-        let lat = primary.geometry.coordinates[1];
+        let (lat, lon) = primary
+            .trusted_position()
+            .expect("only candidates with a trusted position are tried");
 
         let attribution = primary
             .creator
@@ -609,6 +656,7 @@ async fn try_seed(
             lon: Some(lon),
             sequence: primary.sequence,
             extra_image_urls,
+            position_confirmed: true,
         }));
     }
 
@@ -1050,6 +1098,51 @@ mod tests {
         assert!((half_lon - start_lon / 16.0).abs() < 1e-12);
     }
 
+    fn image_at(gps: (f64, f64), computed: Option<(f64, f64)>) -> MapillaryImage {
+        let geom = |(lat, lon): (f64, f64)| Geometry {
+            coordinates: [lon, lat],
+        };
+        MapillaryImage {
+            id: "1".to_owned(),
+            geometry: geom(gps),
+            computed_geometry: computed.map(geom),
+            thumb_1024_url: Some("https://t/1.jpg".to_owned()),
+            creator: None,
+            sequence: None,
+            captured_at: None,
+            width: None,
+            height: None,
+            compass_angle: None,
+            quality_score: None,
+        }
+    }
+
+    #[test]
+    fn reference_position_needs_gps_and_reconstruction_to_agree() {
+        // ~5 m apart: confirmed, and the reconstructed position is used.
+        let agree = image_at((48.85660, 2.35220), Some((48.85664, 2.35222)));
+        assert_eq!(agree.trusted_position(), Some((48.85664, 2.35222)));
+
+        // ~30 m apart (the Havana round): one of the two is wrong.
+        let disagree = image_at((23.12999, -82.38005), Some((23.13023, -82.37988)));
+        assert_eq!(disagree.trusted_position(), None);
+
+        // Never reconstructed: nothing to confirm the GPS with.
+        assert_eq!(image_at((1.0, 2.0), None).trusted_position(), None);
+    }
+
+    #[test]
+    fn computed_geometry_is_read_from_the_api() {
+        let json = r#"{"id":"9","geometry":{"type":"Point","coordinates":[2.3522,48.8566]},
+            "computed_geometry":{"type":"Point","coordinates":[2.35221,48.85661]},
+            "thumb_1024_url":"https://t/9.jpg"}"#;
+
+        let img: MapillaryImage = serde_json::from_str(json).unwrap();
+
+        assert_eq!(img.geometry.lat_lon(), (48.8566, 2.3522));
+        assert_eq!(img.trusted_position(), Some((48.85661, 2.35221)));
+    }
+
     #[test]
     fn classify_seed_failure_buckets_each_try_seed_bail_message() {
         assert!(matches!(
@@ -1069,6 +1162,13 @@ mod tests {
                 "all 360 candidates near Iran are within 75 km of an existing location or share a sequence"
             ),
             SeedFailureCategory::Deduped
+        ));
+        assert!(matches!(
+            classify_seed_failure(
+                "none of the 12 candidates near Lagos has a confirmed position \
+                 (GPS and reconstruction within 10 m)"
+            ),
+            SeedFailureCategory::Unconfirmed
         ));
         assert!(matches!(
             classify_seed_failure("HTTP 403: forbidden"),

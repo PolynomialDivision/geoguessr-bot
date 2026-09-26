@@ -145,6 +145,7 @@ mod tests {
             lon: Some(11.5820),
             sequence: None,
             extra_image_urls: vec![],
+            position_confirmed: true,
         }
     }
 

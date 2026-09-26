@@ -563,7 +563,11 @@ fn draw_legend(
         let mid = y + ROW_H / 2.0;
         draw_badge(canvas, x + 16.0, mid, p.rank, player_color(i));
 
-        let stats = format!("{} · {} pts", crate::game::format_dist(p.dist_km), p.score);
+        let stats = format!(
+            "{} · {} pts",
+            crate::game::format_guess_dist(p.dist_km, false),
+            p.score
+        );
         let stats_w = text_width(&REGULAR, 14.0, &stats);
         let right = x + col_w - 18.0;
         draw_text(
@@ -809,6 +813,14 @@ mod tests {
 
         assert_eq!(fit_text(&BOLD, 14.0, "🦊 Fox", 200.0), "Fox");
         assert_eq!(fit_text(&BOLD, 14.0, "🦊", 200.0), "?");
+    }
+
+    #[test]
+    fn guesses_within_fifty_metres_read_as_exact() {
+        assert_eq!(crate::game::format_guess_dist(0.021, true), "🎯 exact");
+        assert_eq!(crate::game::format_guess_dist(0.049, false), "exact");
+        assert_eq!(crate::game::format_guess_dist(0.051, true), "51 m");
+        assert_eq!(crate::game::format_guess_dist(12.4, true), "12 km");
     }
 
     #[test]

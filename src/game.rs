@@ -994,7 +994,7 @@ async fn post_reveal_free_guess(
                 2 => "🥉",
                 _ => "  ",
             };
-            let dist_str = format_dist(*dist);
+            let dist_str = format_guess_dist(*dist, true);
             lines.push(format!(
                 "{medal} {} · {guess_link} · {} · {} pts",
                 uid, dist_str, score,
@@ -1041,7 +1041,7 @@ async fn post_reveal_free_guess(
                         2 => "🥉",
                         _ => "  ",
                     };
-                    let dist_str = format_dist(*dist);
+                    let dist_str = format_guess_dist(*dist, true);
                     sl.push(format!("{medal} {} · {} · {} pts", uid, dist_str, score));
                 }
                 sl.join("\n")
@@ -1074,7 +1074,7 @@ async fn post_reveal_free_guess(
                         2 => "🥉",
                         _ => "  ",
                     };
-                    let dist_str = format_dist(*dist);
+                    let dist_str = format_guess_dist(*dist, true);
                     format!(
                         "{medal} {} · {guess_link} · {} · {} pts",
                         uid, dist_str, score
@@ -1372,6 +1372,20 @@ pub fn format_dist(dist_km: f64) -> String {
         format!("{:.0} m", dist_km * 1000.0)
     } else {
         format!("{:.0} km", dist_km)
+    }
+}
+
+/// Guesses closer than this are shown as exact: below it, the remaining gap
+/// is photo-position and map-click uncertainty, not a worse guess.
+pub const EXACT_GUESS_KM: f64 = 0.05;
+
+/// A guess's distance for the result: "🎯 exact" (or "exact" where emoji
+/// can't be drawn) inside `EXACT_GUESS_KM`, otherwise the distance.
+pub fn format_guess_dist(dist_km: f64, emoji: bool) -> String {
+    match (dist_km < EXACT_GUESS_KM, emoji) {
+        (true, true) => "🎯 exact".to_owned(),
+        (true, false) => "exact".to_owned(),
+        (false, _) => format_dist(dist_km),
     }
 }
 
@@ -1852,11 +1866,24 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
                     >= crate::sources::MIN_DISTANCE_KM
             }
         });
-        let evicted = before - st.cached_guesses.len();
-        if evicted > 0 {
+        // Mapillary images cached before reference positions were checked
+        // may be scored against an unconfirmed GPS fix — fetch fresh ones.
+        let before_unconfirmed = st.cached_guesses.len();
+        st.cached_guesses
+            .retain(|img| img.source != "mapillary" || img.position_confirmed);
+        let unconfirmed = before_unconfirmed - st.cached_guesses.len();
+        let too_close = before - before_unconfirmed;
+        if too_close > 0 {
             warn!(
-                "GeoGuessr: evicted {evicted} stale cached image(s) too close to a played location"
+                "GeoGuessr: evicted {too_close} stale cached image(s) too close to a played location"
             );
+        }
+        if unconfirmed > 0 {
+            warn!(
+                "GeoGuessr: evicted {unconfirmed} cached Mapillary image(s) without a confirmed position"
+            );
+        }
+        if too_close + unconfirmed > 0 {
             st.save(&ctx.state_path).await.ok();
         }
     }
