@@ -158,9 +158,10 @@ async fn submit_guess(
         return (StatusCode::OK, Json(SubmitResponse { geocoded })).into_response();
     }
 
+    // None = this guess has already closed.
     let accepted = {
         let mut ag = ws.active_game.lock().await;
-        ag.as_mut().is_some_and(|g| {
+        ag.as_mut().map(|g| {
             g.record_free_guess(
                 tok.user_id.as_str().to_owned(),
                 FreeGuess {
@@ -175,12 +176,18 @@ async fn submit_guess(
     };
 
     info!(
-        "Web guess: {} → ({:.4}, {:.4}) accepted={}",
+        "Web guess: {} → ({:.4}, {:.4}) accepted={:?}",
         tok.user_id, body.lat, body.lon, accepted
     );
 
-    if accepted {
-        update_links_message(&ws, tok.round_id, tok.guess_num).await;
+    match accepted {
+        Some(true) => update_links_message(&ws, tok.round_id, tok.guess_num).await,
+        Some(false) => {}
+        // The page shows this text instead of a "recorded" confirmation that
+        // would never count.
+        None => {
+            return (StatusCode::GONE, "⏰ Time is up — this guess has closed.").into_response()
+        }
     }
 
     let geocoded = crate::geocode::reverse_geocode(body.lat, body.lon, &tok.lang).await;

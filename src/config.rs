@@ -10,6 +10,42 @@ pub struct Config {
     pub sources: SourcesConfig,
     #[serde(default)]
     pub web: Option<WebConfig>,
+    #[serde(default)]
+    pub map: MapConfig,
+}
+
+/// Tiles for the result map images.
+///
+/// ```toml
+/// [map]
+/// tile_url    = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+/// attribution = "© OpenStreetMap contributors"
+/// ```
+#[derive(Deserialize, Clone)]
+pub struct MapConfig {
+    /// XYZ tile URL template with `{z}`, `{x}`, `{y}`.
+    #[serde(default = "default_tile_url")]
+    pub tile_url: String,
+    /// Credit printed in the image corner, as the tile provider requires.
+    #[serde(default = "default_attribution")]
+    pub attribution: String,
+}
+
+impl Default for MapConfig {
+    fn default() -> Self {
+        Self {
+            tile_url: default_tile_url(),
+            attribution: default_attribution(),
+        }
+    }
+}
+
+fn default_tile_url() -> String {
+    "https://tile.openstreetmap.org/{z}/{x}/{y}.png".to_owned()
+}
+
+fn default_attribution() -> String {
+    "© OpenStreetMap contributors".to_owned()
 }
 
 /// Optional HTTP server for the interactive map-based guess interface.

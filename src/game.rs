@@ -336,9 +336,12 @@ pub async fn start_round(
 
     let mut round_scores_free: HashMap<String, i64> = HashMap::new();
 
+    // Number by what is actually played: dedup may leave fewer images than
+    // requested, and "Guess 3/3" for the first image confuses everyone.
+    let n_images = image_queue.len();
     let mut first_guess = true;
     while let Some(img) = image_queue.pop_front() {
-        let guess_num = (n - image_queue.len()) as u32; // 1-based after pop
+        let guess_num = (n_images - image_queue.len()) as u32; // 1-based after pop
 
         // Save active round state so a restart can resume.
         {
@@ -359,7 +362,7 @@ pub async fn start_round(
             st.active_round = Some(ActiveRoundState {
                 round_id,
                 guess_num,
-                total_guesses: n as u32,
+                total_guesses: n_images as u32,
                 current_image: img.clone(),
                 remaining_images: image_queue.clone(),
                 guess_started_at: chrono::Utc::now(),
@@ -384,7 +387,7 @@ pub async fn start_round(
             &room,
             round_id,
             guess_num,
-            n as u32,
+            n_images as u32,
             &img,
             &mut round_scores_free,
             &participants,
@@ -424,7 +427,8 @@ pub async fn start_round(
         st.save(&ctx.state_path).await.ok();
     }
 
-    post_round_summary_free_guess(&ctx, &client, &room, round_id, &round_scores_free).await;
+    post_round_summary_free_guess(&ctx, &client, &room, round_id, n_images, &round_scores_free)
+        .await;
 
     {
         let mut st = ctx.state.lock().await;
@@ -878,6 +882,8 @@ async fn play_free_guess(
     post_reveal_free_guess(
         ctx,
         client,
+        guess_num,
+        n_total,
         img,
         actual_lat,
         actual_lon,
@@ -896,6 +902,8 @@ async fn play_free_guess(
 async fn post_reveal_free_guess(
     ctx: &BotContext,
     client: &Client,
+    guess_num: u32,
+    n_total: u32,
     img: &GeoImage,
     actual_lat: f64,
     actual_lon: f64,
@@ -920,7 +928,7 @@ async fn post_reveal_free_guess(
     let mut guess_labels: Vec<String> = Vec::with_capacity(scored.len());
     let mut overview_entries: Vec<OverviewEntry<'_>> = Vec::with_capacity(scored.len());
     for (i, (uid, guess, dist, score)) in scored.iter().enumerate() {
-        let (r, g, b, _) = crate::mapimage::PLAYER_COLORS[i % crate::mapimage::PLAYER_COLORS.len()];
+        let (r, g, b) = crate::mapimage::player_color(i);
         let mxc = avatar_mxcs.get(uid.as_str()).cloned().unwrap_or_default();
         let map_url = build_guess_map_url(
             display_name(names, uid),
@@ -1009,9 +1017,16 @@ async fn post_reveal_free_guess(
     // Last resort: if even the summary alone is too large (30+ players all with
     // avatars), strip avatars from the overview URL.
     const MATRIX_SPLIT_THRESHOLD: usize = 28_000;
+    // Name pills without notifications: players are watching the game, a
+    // ping per player per guess is just noise.
+    let quiet = |text: &str| {
+        let mut content = format::mentionify(text);
+        content.mentions = Some(Mentions::new());
+        content
+    };
     if let Some(r) = client.get_room(&ctx.room_id) {
         if text.len() <= MATRIX_SPLIT_THRESHOLD || scored.is_empty() {
-            r.send(format::mentionify(&text)).await.ok();
+            r.send(quiet(&text)).await.ok();
         } else {
             // Build summary (overview URL + scores, no per-player map links).
             let make_summary = |ov: &str| -> String {
@@ -1045,7 +1060,7 @@ async fn post_reveal_free_guess(
             } else {
                 summary
             };
-            r.send(format::mentionify(&summary)).await.ok();
+            r.send(quiet(&summary)).await.ok();
 
             // Build all individual map links as one block of text.
             let link_lines: Vec<String> = scored
@@ -1069,110 +1084,81 @@ async fn post_reveal_free_guess(
             let links_text = link_lines.join("\n");
 
             if links_text.len() <= MATRIX_SPLIT_THRESHOLD {
-                r.send(format::mentionify(&links_text)).await.ok();
+                r.send(quiet(&links_text)).await.ok();
             } else {
                 for line in &link_lines {
-                    r.send(format::mentionify(line)).await.ok();
+                    r.send(quiet(line)).await.ok();
                 }
             }
         }
     }
 
-    // ── Main-room map images ──────────────────────────────────────────────────
-    let map_mime: mime::Mime = "image/png".parse().unwrap();
-
-    // 1. Winner's individual map (always shown when anyone guessed).
-    if let Some((winner_uid, winner_guess, winner_dist, _)) = scored.first() {
-        let (pr, pg, pb, _) = crate::mapimage::PLAYER_COLORS[0];
-        let winner_raw = raw_avatars.get(winner_uid.as_str()).cloned();
-        let (g_lat, g_lon, d) = (winner_guess.lat, winner_guess.lon, *winner_dist);
-        if let Ok(Some(png)) = tokio::task::spawn_blocking(move || {
-            let pin = crate::avatar::render_avatar_pin(winner_raw.as_deref(), pr, pg, pb);
-            crate::mapimage::render_guess_map(
-                g_lat, g_lon, actual_lat, actual_lon, d, pin, pr, pg, pb,
-            )
-        })
-        .await
-        {
-            let (w, h) = image_dimensions(&png);
-            let size = png.len();
-            if let Ok(resp) = client.media().upload(&map_mime, png, None).await {
-                let label = format!("🥇 Best guess · {} away", format_dist(d));
-                if let Some(r) = client.get_room(&ctx.room_id) {
-                    r.send(image_content_with_info(
-                        label,
-                        resp.content_uri,
-                        &map_mime,
-                        w,
-                        h,
-                        size,
-                    ))
-                    .await
-                    .ok();
-                }
-            }
-        }
+    // ── Result image: every guess, the answer, ranking ───────────────────────
+    // Best effort: the text result above is already posted, so a failure here
+    // (tile server down, render error) costs the picture, never the round.
+    if scored.is_empty() {
+        return;
     }
-
-    // 2. Combined round map — only when 2+ players guessed.
-    if scored.len() >= 2 {
-        // Collect (name, lat, lon, raw_avatar_bytes) — avatar rendering happens
-        // inside spawn_blocking alongside the map rendering (both CPU-bound).
-        let guess_data_raw: Vec<(String, f64, f64, Option<Vec<u8>>)> = scored
+    let result = crate::mapimage::ResultMap {
+        place: location_str.clone(),
+        actual_lat,
+        actual_lon,
+        players: scored
             .iter()
-            .map(|(uid, guess, _, _)| {
-                let raw = raw_avatars.get(uid.as_str()).cloned();
-                (
-                    display_name(names, uid).to_owned(),
-                    guess.lat,
-                    guess.lon,
-                    raw,
-                )
-            })
-            .collect();
-
-        if let Ok(Some((png, legend))) = tokio::task::spawn_blocking(move || {
-            use crate::mapimage::PLAYER_COLORS;
-            // Render each avatar into a pin PNG, then build the round map.
-            let guess_pins: Vec<(String, f64, f64, Option<Vec<u8>>)> = guess_data_raw
-                .into_iter()
-                .enumerate()
-                .map(|(idx, (name, lat, lon, raw))| {
-                    let (pr, pg, pb, _) = PLAYER_COLORS[idx % PLAYER_COLORS.len()];
-                    let pin = crate::avatar::render_avatar_pin(raw.as_deref(), pr, pg, pb);
-                    (name, lat, lon, pin)
-                })
-                .collect();
-            crate::mapimage::render_round_map(&guess_pins, actual_lat, actual_lon)
-        })
-        .await
+            .enumerate()
+            .map(
+                |(i, (uid, guess, dist, score))| crate::mapimage::ResultPlayer {
+                    rank: i + 1,
+                    name: display_name(names, uid).to_owned(),
+                    lat: guess.lat,
+                    lon: guess.lon,
+                    dist_km: *dist,
+                    score: *score,
+                    avatar: raw_avatars.get(uid.as_str()).cloned(),
+                },
+            )
+            .collect(),
+    };
+    let rendered = tokio::time::timeout(
+        std::time::Duration::from_secs(40),
+        crate::mapimage::render_result_map(&ctx.config.map, result),
+    )
+    .await;
+    let png = match rendered {
+        Ok(Some(png)) => png,
+        Ok(None) => {
+            warn!("GeoGuessr guess {guess_num}/{n_total}: result map could not be rendered");
+            return;
+        }
+        Err(_) => {
+            warn!("GeoGuessr guess {guess_num}/{n_total}: result map timed out");
+            return;
+        }
+    };
+    let map_mime: mime::Mime = "image/png".parse().unwrap();
+    let (w, h) = image_dimensions(&png);
+    let size = png.len();
+    let uploaded = match client.media().upload(&map_mime, png, None).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!("GeoGuessr guess {guess_num}/{n_total}: result map upload failed: {e}");
+            return;
+        }
+    };
+    let label = format!("🗺️ Guess {guess_num}/{n_total} · {location_str}");
+    if let Some(r) = client.get_room(&ctx.room_id) {
+        if let Err(e) = r
+            .send(image_content_with_info(
+                label,
+                uploaded.content_uri,
+                &map_mime,
+                w,
+                h,
+                size,
+            ))
+            .await
         {
-            let (w, h) = image_dimensions(&png);
-            let size = png.len();
-            if let Ok(resp) = client.media().upload(&map_mime, png, None).await {
-                let label = format!("🗺️ All {} guesses this round", scored.len());
-                if let Some(r) = client.get_room(&ctx.room_id) {
-                    r.send(image_content_with_info(
-                        label,
-                        resp.content_uri,
-                        &map_mime,
-                        w,
-                        h,
-                        size,
-                    ))
-                    .await
-                    .ok();
-
-                    // Legend: 🔵 @alice:s  🔴 @bob:s  ⬛ actual
-                    let mut parts: Vec<String> = scored
-                        .iter()
-                        .zip(legend.iter())
-                        .map(|((uid, _, _, _), (_, emoji))| format!("{} {}", emoji, uid))
-                        .collect();
-                    parts.push("⬛ actual location".to_owned());
-                    r.send(format::mentionify(&parts.join("   "))).await.ok();
-                }
-            }
+            warn!("GeoGuessr guess {guess_num}/{n_total}: result map send failed: {e}");
         }
     }
 }
@@ -1182,6 +1168,7 @@ async fn post_round_summary_free_guess(
     client: &Client,
     _room: &Room,
     round_id: i64,
+    n_guesses: usize,
     scores: &HashMap<String, i64>,
 ) {
     if scores.is_empty() {
@@ -1197,7 +1184,8 @@ async fn post_round_summary_free_guess(
     }
 
     // ── Round results (this round only) ──────────────────────────────────────
-    let n_guesses = ctx.effective_guesses_per_round().await;
+    // `n_guesses` is what was actually played — not the configured count,
+    // which ignores `!schedulegeo` overrides and images lost to dedup.
     let max_pts = 5000i64 * n_guesses as i64;
 
     // Fetch per-user stats for this round from DB.
@@ -2139,7 +2127,15 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
         .await
         .ok();
 
-    post_round_summary_free_guess(&ctx, &client, &room, ar.round_id, &round_scores_free).await;
+    post_round_summary_free_guess(
+        &ctx,
+        &client,
+        &room,
+        ar.round_id,
+        ar.total_guesses as usize,
+        &round_scores_free,
+    )
+    .await;
 
     {
         let mut st = ctx.state.lock().await;
@@ -2390,7 +2386,7 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         st.save(&ctx.state_path).await.ok();
     }
 
-    post_round_summary_free_guess(&ctx, &client, &room, round_id, &round_scores_free).await;
+    post_round_summary_free_guess(&ctx, &client, &room, round_id, total, &round_scores_free).await;
 
     *ctx.round_abort.lock().await = None;
 }

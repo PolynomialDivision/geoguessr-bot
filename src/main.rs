@@ -269,9 +269,10 @@ async fn main() -> Result<()> {
                             let max_g     = ctx2.config.schedule.max_guesses_per_player;
                             match game::geocode(&query).await {
                                 Some((lat, lon)) => {
+                                    // None = no guess open right now.
                                     let accepted = {
                                         let mut ag = ctx2.active_game.lock().await;
-                                        ag.as_mut().is_some_and(|g| {
+                                        ag.as_mut().map(|g| {
                                             g.record_free_guess(user, game::FreeGuess {
                                                 text:         query.clone(),
                                                 lat,
@@ -281,10 +282,10 @@ async fn main() -> Result<()> {
                                         })
                                     };
                                     if let Some(r) = room2 {
-                                        let msg = if accepted {
-                                            format!("✅ {sender} — guess recorded for \"{query}\"")
-                                        } else {
-                                            format!("❌ {sender} — you already submitted a guess")
+                                        let msg = match accepted {
+                                            Some(true) => format!("✅ {sender} — guess recorded for \"{query}\""),
+                                            Some(false) => format!("❌ {sender} — you already submitted a guess"),
+                                            None => format!("⏳ {sender} — no guess is open right now"),
                                         };
                                         r.send(format::mentionify(&msg)).await.ok();
                                     }

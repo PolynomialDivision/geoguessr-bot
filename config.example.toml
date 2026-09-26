@@ -129,3 +129,11 @@ require_encryption = true
 # Only accept admin commands from devices the bot has verified (recommended
 # once you and the bot have verified each other).
 require_verified_device = false
+
+# ── Result map images ─────────────────────────────────────────────────────────
+# After every guess the bot posts one image: all guesses, the actual location,
+# and a ranked legend. Tiles come from any XYZ tile server; missing tiles only
+# leave a blank background. Keep the attribution your provider requires.
+# [map]
+# tile_url    = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+# attribution = "© OpenStreetMap contributors"

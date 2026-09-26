@@ -44,6 +44,18 @@ impl NominatimAddress {
 /// Returns `None` on network/parse failure; callers should fall back to
 /// showing the raw coordinates.
 pub async fn reverse_geocode(lat: f64, lon: f64, lang: &str) -> Option<String> {
+    // Nominatim allows one request per second; a reveal geocodes every
+    // player's guess back to back.
+    static LAST_CALL: tokio::sync::Mutex<Option<std::time::Instant>> =
+        tokio::sync::Mutex::const_new(None);
+    let mut last = LAST_CALL.lock().await;
+    if let Some(at) = *last {
+        let wait = std::time::Duration::from_millis(1100).saturating_sub(at.elapsed());
+        tokio::time::sleep(wait).await;
+    }
+    *last = Some(std::time::Instant::now());
+    drop(last);
+
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(std::time::Duration::from_secs(5))
