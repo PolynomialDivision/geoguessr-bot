@@ -23,8 +23,8 @@ room_id = "!REPLACE_ME:example.org"
 game_times = ["19:00"]
 
 # Game mode: "multiple_choice" (default) or "free_guess".
-#   multiple_choice — 4 country options; react 🇦🇧🇨🇩 or type !a/!b/!c/!d
-#   free_guess      — type any location in the DM; scored by Haversine distance
+#   multiple_choice: 4 country options; react 🇦🇧🇨🇩 or type !a/!b/!c/!d
+#   free_guess: type any location in the DM; scored by Haversine distance
 #                     (GeoGuessr-style: 5000 pts at 0 km, ~1800 at 2000 km)
 #                     Accepts: city, country, full address (street + postcode),
 #                              or raw lat,lon coordinates.
@@ -56,7 +56,7 @@ timezone = "Europe/Berlin"
 #   rating = (n / (n + k)) * player_average + (k / (n + k)) * baseline
 # `n` is guesses played, counting missed/no-guess rounds as 0 (so skipping a
 # hard guess can't inflate your average). `baseline` is derived automatically
-# from the community's own average score per guess — not set here.
+# from the community's own average score per guess, not set here.
 #
 # How many "prior" guesses worth of pull toward the baseline a rating gets.
 # Higher = trusts a small sample less; lower = trusts it sooner. At n = k a
@@ -64,7 +64,7 @@ timezone = "Europe/Berlin"
 # k = 15
 
 # Guesses played below which a leaderboard entry is flagged "provisional"
-# (🔰) — a display hint only, doesn't change the rating math.
+# (🔰): a display hint only, doesn't change the rating math.
 # provisional_threshold = 10
 
 # Rating baseline used only when there's no community data yet (e.g. right
@@ -78,7 +78,7 @@ timezone = "Europe/Berlin"
 enabled = ["mapillary"]
 
 [sources.mapillary]
-# Free client access token — register at https://www.mapillary.com/developer
+# Free client access token: register at https://www.mapillary.com/developer
 access_token  = "MLY|REPLACE_ME"
 # Desired search radius in metres around the seed coordinate. Mapillary's API
 # hard-caps the actual search area at roughly 500 m-1.1 km per side (its bbox

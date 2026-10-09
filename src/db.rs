@@ -148,7 +148,7 @@ impl Db {
         })
         .await?;
 
-        // Step 2: apply the current schema (CREATE TABLE IF NOT EXISTS — safe to re-run).
+        // Step 2: apply the current schema (CREATE TABLE IF NOT EXISTS, safe to re-run).
         let schema = include_str!("../migrations/schema.sql");
         self.run(move |conn| {
             conn.execute_batch(schema).context("Applying schema")?;
@@ -220,7 +220,7 @@ impl Db {
     }
 
     /// Number of rounds started at/after `since` (a UTC instant). Used for
-    /// the monthly leaderboard's round count — see `score_leaderboard_month`.
+    /// the monthly leaderboard's round count, see `score_leaderboard_month`.
     pub async fn round_count_since(&self, since: DateTime<Utc>) -> Result<i64> {
         let since_str = since.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
         self.run(move |conn| {
@@ -480,7 +480,7 @@ impl Db {
     /// Record that `user_ids` were part of this guess's roster (join-phase
     /// participants, or players who already answered earlier in the round)
     /// but did not submit anything. Inserted as `score = 0, missed = 1` rows
-    /// so every joined round counts toward a player's average and stats —
+    /// so every joined round counts toward a player's average and stats:
     /// skipping a guess can no longer simply leave no trace.
     ///
     /// Uses `DO NOTHING` on conflict: a real answer (from
@@ -578,7 +578,7 @@ impl Db {
         .await
     }
 
-    /// All-time leaderboard — includes every round ever played.
+    /// All-time leaderboard: includes every round ever played.
     ///
     /// `guesses_played` counts every answer row (real + missed) so a player's
     /// average and rating reflect every guess they were on the hook for, not
@@ -624,7 +624,7 @@ impl Db {
         .await
     }
 
-    /// Rolling leaderboard — only rounds from the last 90 days.
+    /// Rolling leaderboard, only rounds from the last 90 days.
     /// Same real-vs-missed split as `score_leaderboard_alltime`; see there.
     pub async fn score_leaderboard(&self) -> Result<Vec<ScoreLeaderboardEntry>> {
         self.run(|conn| {
@@ -667,12 +667,12 @@ impl Db {
         .await
     }
 
-    /// Calendar-month leaderboard — only rounds started at/after `since`, a
+    /// Calendar-month leaderboard: only rounds started at/after `since` (a
     /// UTC instant marking the start of the target month in the bot's
-    /// configured timezone (see `commands::current_month_start_utc`). Same
+    /// configured timezone, see `commands::current_month_start_utc`). Same
     /// real-vs-missed split as `score_leaderboard_alltime`; see there. This
     /// is purely a filtered view of the same persisted `rounds`/`answers`
-    /// data — no separate monthly score state to keep in sync, so a bot
+    /// data: no separate monthly score state to keep in sync, so a bot
     /// restart or a month rolling over can never duplicate or drift scores.
     pub async fn score_leaderboard_month(
         &self,
@@ -1210,7 +1210,7 @@ mod tests {
         .await
         .unwrap();
         // Defensive: a real answer must win even if a miss is also recorded
-        // for the same (guess, user) — DO NOTHING on conflict.
+        // for the same (guess, user). DO NOTHING on conflict.
         db.record_missed_guesses(guess_id, round_id, &["@late:example.com".to_owned()])
             .await
             .unwrap();

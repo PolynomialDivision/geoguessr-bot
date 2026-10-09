@@ -89,14 +89,14 @@ pub struct ResultMap {
 
 /// Render the result image. Missing map tiles leave a plain background
 /// rather than failing; `None` only if rendering itself fails, which callers
-/// log and skip — the text result is posted independently.
+/// log and skip. The text result is posted independently.
 pub async fn render_result_map(config: &MapConfig, map: ResultMap) -> Option<Vec<u8>> {
     let view = plan_viewport(&map);
     let tiles = fetch_tiles(config, &view).await;
     let missing = tiles.iter().filter(|t| t.data.is_none()).count();
     if missing > 0 {
         warn!(
-            "Result map: {missing}/{} tile(s) unavailable from {} — drawing without them",
+            "Result map: {missing}/{} tile(s) unavailable from {}: drawing without them",
             tiles.len(),
             config.tile_url
         );
@@ -109,7 +109,7 @@ pub async fn render_result_map(config: &MapConfig, map: ResultMap) -> Option<Vec
 
 // ── Projection and viewport ───────────────────────────────────────────────────
 
-/// Web-Mercator pixel position at `zoom`. `lon` may lie outside ±180° — the
+/// Web-Mercator pixel position at `zoom`. `lon` may lie outside ±180°. The
 /// result simply continues past the world's edge, which keeps a view across
 /// the antimeridian continuous (tiles are wrapped when fetched).
 fn world_px(lat: f64, lon: f64, zoom: u8) -> (f64, f64) {
@@ -473,7 +473,7 @@ fn draw_pin(canvas: &mut Pixmap, x: f32, y: f32, avatar: Option<&[u8]>, (r, g, b
     }
 }
 
-/// Rank number in a coloured disc — the link between map and legend.
+/// Rank number in a coloured disc. The link between map and legend.
 fn draw_badge(canvas: &mut Pixmap, x: f32, y: f32, rank: usize, (r, g, b): (u8, u8, u8)) {
     let label = rank.to_string();
     let size = if label.len() > 1 { 11.5 } else { 13.0 };

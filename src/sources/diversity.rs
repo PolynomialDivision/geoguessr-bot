@@ -58,7 +58,7 @@ impl DiversityTracker {
     }
 
     /// Returns `true` when the top-3 most-sampled cells hold more than half of
-    /// all recorded locations — the cache has collapsed into a small cluster.
+    /// all recorded locations. The cache has collapsed into a small cluster.
     pub fn is_homogeneous(&self) -> bool {
         let total: u32 = self.cell_counts.values().sum();
         if total < 6 {
@@ -135,7 +135,7 @@ mod tests {
         for _ in 0..5 {
             t.accept(48.0, 11.0);
         }
-        // below the 6-sample minimum — should not trigger
+        // below the 6-sample minimum: should not trigger
         assert!(!t.is_homogeneous());
     }
 }

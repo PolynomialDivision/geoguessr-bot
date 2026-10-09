@@ -150,7 +150,8 @@ pub async fn start_round(
         let flags_str = JOIN_REACTION_FLAGS.join(" ");
         let join_msg = format!(
             "🌍 GeoGuessr starts in {}! @room\n\
-                 React with your flag to join and set the map language:\n\
+                 👇 React with your flag to join.\n\
+                 🌐 It also sets your map language:\n\
                  {}",
             format_duration(reminder_secs),
             flags_str,
@@ -218,7 +219,7 @@ pub async fn start_round(
         )
         .await;
 
-        // Clear pending_join — join window is over.
+        // Clear pending_join: join window is over.
         {
             let mut st = ctx.state.lock().await;
             st.pending_join = None;
@@ -253,7 +254,7 @@ pub async fn start_round(
         let n = sorted.len();
         room.send(
             format::mentionify(&format!(
-                "🌍 GeoGuessr starting now! {} player{}: {}",
+                "🌍 GeoGuessr starting now!\n👥 {} player{}: {}",
                 n,
                 if n == 1 { "" } else { "s" },
                 participant_list.join(", "),
@@ -402,7 +403,7 @@ pub async fn start_round(
         .upsert_round_scores_free_guess(round_id, &round_scores_free)
         .await?;
 
-    // Background refill — placed here so all DB writes for this round (including
+    // Background refill: placed here so all DB writes for this round (including
     // every start_guess call) are committed before recent_played_coords() is read
     // inside the next prefetch_if_needed.  Previously this was spawned right after
     // the pop, which created a window where the refill snapshot was missing the
@@ -448,7 +449,7 @@ pub async fn start_round(
 /// linger as active.
 async fn abort_round_no_images(ctx: &BotContext, client: &Client, round_id: i64, requested: usize) {
     error!(
-        "GeoGuessr round {round_id}: aborting — 0 of {requested} requested image(s) available \
+        "GeoGuessr round {round_id}: aborting, 0 of {requested} requested image(s) available \
          after quality/dedup filtering; see preceding 'pop-time dedup' warnings for the reason(s)"
     );
     if let Some(r) = client.get_room(&ctx.room_id) {
@@ -479,14 +480,14 @@ async fn abort_guess_no_image(
     n_total: u32,
 ) {
     room.send(format::mentionify(&format!(
-        "⚠️ Guess {guess_num}/{n_total} skipped · failed to deliver the image to Matrix (see logs).",
+        "⚠️ Guess {guess_num}/{n_total} skipped.\n📸 I couldn't send the image (see the logs).",
     )))
     .await
     .ok();
     ctx.db.finish_guess(guess_id, 0, 0).await.ok();
 }
 
-// ── Single image — free guess ─────────────────────────────────────────────────
+// ── Single image: free guess ─────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
 async fn play_free_guess(
@@ -533,7 +534,7 @@ async fn play_free_guess(
     };
 
     info!(
-        "GeoGuessr guess {guess_num}/{n_total}: selected {} ({}, source={}, lat={:?}, lon={:?}) — \
+        "GeoGuessr guess {guess_num}/{n_total}: selected {} ({}, source={}, lat={:?}, lon={:?}), \
          fetching/uploading image",
         img.city.as_deref().unwrap_or(&img.country),
         img.country,
@@ -565,7 +566,7 @@ async fn play_free_guess(
     let n_imgs = all_images.len();
 
     // Post all images to the main room. The primary (reference) image must
-    // be sent successfully before the round is allowed to become playable —
+    // be sent successfully before the round is allowed to become playable:
     // if it fails, abort the guess instead of starting a timer nobody can
     // see an image for. Extra context images are best-effort.
     for (i, media) in all_images.iter().enumerate() {
@@ -694,13 +695,13 @@ async fn play_free_guess(
     // otherwise show the !guess hint.
     let q_event = if !web_token_map.is_empty() {
         room.send(format::mentionify(&format!(
-            "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}",
+            "🌍 Guess {guess_num}/{n_total} · ⏳ {timeout_str}",
         )))
         .await?
     } else {
         room.send(format::mentionify(&format!(
-            "🌍 Guess {guess_num}/{n_total} | ⏳ {timeout_str}\n\
-             📍 Where is this? Type: **!guess** city, country, or lat,lon",
+            "🌍 Guess {guess_num}/{n_total} · ⏳ {timeout_str}\n\
+             📍 Where is this?\n💬 Type **!guess** with a city, a country or lat,lon",
         )))
         .await?
     };
@@ -724,7 +725,7 @@ async fn play_free_guess(
         });
     }
 
-    // Smooth countdown in the main room — edits the prompt message with a time bar.
+    // Smooth countdown in the main room: edits the prompt message with a time bar.
     // DMs are not updated (avoids spamming participants).
     // Early-exit: after each tick, check if every DM participant has already submitted.
     let edit_interval = (total_secs / 20).clamp(15, 900);
@@ -761,12 +762,12 @@ async fn play_free_guess(
         let time_str = format_duration(remaining);
         let edit_msg = if !web_token_map.is_empty() {
             format::mentionify(&format!(
-                "🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar}",
+                "🌍 Guess {guess_num}/{n_total} · ⏳ {time_str} {bar}",
             ))
         } else {
             format::mentionify(&format!(
-                "🌍 Guess {guess_num}/{n_total} | ⏳ {time_str}  {bar}\n\
-                 📍 Where is this? Type: **!guess** city, country, or lat,lon",
+                "🌍 Guess {guess_num}/{n_total} · ⏳ {time_str} {bar}\n\
+                 📍 Where is this?\n💬 Type **!guess** with a city, a country or lat,lon",
             ))
         };
         if let Some(r) = client.get_room(&ctx.room_id) {
@@ -777,7 +778,7 @@ async fn play_free_guess(
     }
 
     if all_in {
-        let final_msg = format!("🌍 Guess {guess_num}/{n_total} | ⚡ All guesses in!");
+        let final_msg = format!("🌍 Guess {guess_num}/{n_total} · ⚡ All guesses in!");
         if let Some(r) = client.get_room(&ctx.room_id) {
             let edit = RoomMessageEventContent::text_plain(&final_msg)
                 .make_replacement(ReplacementMetadata::new(q_event_id.clone(), None));
@@ -836,13 +837,13 @@ async fn play_free_guess(
 
     // ── Missed guesses: count every joined round, not just answered ones ───────
     // Roster = join-phase participants ∪ anyone who has already scored (real
-    // or missed) earlier this round — i.e. everyone known to be "in" this
+    // or missed) earlier this round, i.e. everyone known to be "in" this
     // round. Roster members who did not submit this guess are recorded as an
     // explicit 0-point "missed" answer instead of simply having no row, so a
     // player can't inflate their average by skipping the guesses they expect
     // to do badly on. `round_scores` already carries the roster forward guess
     // to guess (each miss is inserted with `.or_insert(0)`), so a walk-in who
-    // joins mid-round is only ever expected for guesses from that point on —
+    // joins mid-round is only ever expected for guesses from that point on,
     // never penalised retroactively for guesses before they showed up.
     let answered_uids: HashSet<&str> = scored.iter().map(|(uid, ..)| uid.as_str()).collect();
     let missed_uids: Vec<String> = participants
@@ -983,7 +984,7 @@ async fn post_reveal_free_guess(
     ];
 
     if scored.is_empty() {
-        lines.push("Nobody guessed.".to_owned());
+        lines.push("🤷 Nobody guessed.".to_owned());
     } else {
         for (i, ((uid, _guess, dist, score), guess_link)) in
             scored.iter().zip(guess_labels.iter()).enumerate()
@@ -992,7 +993,7 @@ async fn post_reveal_free_guess(
                 0 => "🥇",
                 1 => "🥈",
                 2 => "🥉",
-                _ => "  ",
+                _ => "▪️",
             };
             let dist_str = format_guess_dist(*dist, true);
             lines.push(format!(
@@ -1039,7 +1040,7 @@ async fn post_reveal_free_guess(
                         0 => "🥇",
                         1 => "🥈",
                         2 => "🥉",
-                        _ => "  ",
+                        _ => "▪️",
                     };
                     let dist_str = format_guess_dist(*dist, true);
                     sl.push(format!("{medal} {} · {} · {} pts", uid, dist_str, score));
@@ -1072,7 +1073,7 @@ async fn post_reveal_free_guess(
                         0 => "🥇",
                         1 => "🥈",
                         2 => "🥉",
-                        _ => "  ",
+                        _ => "▪️",
                     };
                     let dist_str = format_guess_dist(*dist, true);
                     format!(
@@ -1184,7 +1185,7 @@ async fn post_round_summary_free_guess(
     }
 
     // ── Round results (this round only) ──────────────────────────────────────
-    // `n_guesses` is what was actually played — not the configured count,
+    // `n_guesses` is what was actually played, not the configured count,
     // which ignores `!schedulegeo` overrides and images lost to dedup.
     let max_pts = 5000i64 * n_guesses as i64;
 
@@ -1195,7 +1196,7 @@ async fn post_round_summary_free_guess(
 
     let mut lines = vec![
         format!(
-            "🌍 **Round over!** {} guess(es) · max {} pts",
+            "🌍 **Round over!**\n🎯 {} guess(es) · max {} pts",
             n_guesses, max_pts
         ),
         String::new(),
@@ -1226,7 +1227,7 @@ async fn post_round_summary_free_guess(
             0 => "🥇",
             1 => "🥈",
             2 => "🥉",
-            _ => "  ",
+            _ => "▪️",
         };
 
         // Bar: fraction of max possible score.
@@ -1256,12 +1257,12 @@ async fn post_round_summary_free_guess(
             .unwrap_or_else(|| ("n/a".to_owned(), "n/a".to_owned()));
 
         lines.push(format!(
-            "{medal} {:>2}. {} : {} pts/guess",
+            "{medal} {}. {} · {} pts/guess",
             i + 1,
             uid,
             pts_per_guess
         ));
-        lines.push(format!("      {bar}  ⌀ {}  🏅 {}", avg_dist, best_dist));
+        lines.push(format!("{bar} · ⌀ {} · 🏅 {}", avg_dist, best_dist));
     }
 
     let round_text = lines.join("\n");
@@ -1549,7 +1550,7 @@ async fn reconcile_join_reactions(
 // ── Image upload ──────────────────────────────────────────────────────────────
 
 /// Upload the primary image and all extra images.
-/// Returns a vec of `UploadedMedia` — primary first.
+/// Returns a vec of `UploadedMedia`: primary first.
 /// Extra images that fail to upload are silently skipped (logged as warnings).
 async fn upload_all_images(client: &Client, img: &GeoImage) -> anyhow::Result<Vec<UploadedMedia>> {
     let primary = upload_image(client, img).await?;
@@ -1741,7 +1742,7 @@ fn compress_to_hash(params: &str) -> String {
 /// Build a compressed single-player reveal URL (used for per-player DM links).
 ///
 /// Inside the compressed payload the `g=` multi-guess format is used so the
-/// browser parses it with the same code path as the overview map — no separate
+/// browser parses it with the same code path as the overview map. No separate
 /// `glat`/`glon` handling needed.  The `mxc` data: URL is included raw (no
 /// percent-encoding) because it never contains `|` or `&`.
 #[allow(clippy::too_many_arguments)]
@@ -1850,7 +1851,7 @@ async fn fetch_names(room: &Room, user_ids: &[&str]) -> HashMap<String, String> 
 // ── Prefetch ──────────────────────────────────────────────────────────────────
 
 pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
-    // Load played coords once — used for both cache eviction and new-image dedup.
+    // Load played coords once: used for both cache eviction and new-image dedup.
     let db_coords: Vec<(f64, f64)> = ctx.db.recent_played_coords().await.unwrap_or_default();
 
     // Evict cached images that are now within MIN_DISTANCE_KM of a played location.
@@ -1867,7 +1868,7 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
             }
         });
         // Mapillary images cached before reference positions were checked
-        // may be scored against an unconfirmed GPS fix — fetch fresh ones.
+        // may be scored against an unconfirmed GPS fix: fetch fresh ones.
         let before_unconfirmed = st.cached_guesses.len();
         st.cached_guesses
             .retain(|img| img.source != "mapillary" || img.position_confirmed);
@@ -1889,12 +1890,12 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
     }
 
     // Only count cache entries that actually satisfy the *current*
-    // photos-per-location requirement — an entry with too few photos will be
+    // photos-per-location requirement. An entry with too few photos will be
     // discarded by the pop-time dedup gate in `start_round` and is therefore
     // not "available" from the caller's point of view.  Counting raw cache
     // length here previously let the cache silently fill up with images that
     // could never be used once `photos_per_location` was raised, so prefetch
-    // would think it had enough and stop fetching — permanently starving
+    // would think it had enough and stop fetching: permanently starving
     // every future round of usable images.
     let n_photos_needed = ctx.effective_photos_per_location().await;
     let (current, total_cached) = {
@@ -1943,9 +1944,7 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
     let diversity = crate::sources::diversity::DiversityTracker::from_coords(&existing_coords);
     let is_homogeneous = diversity.is_homogeneous();
     if is_homogeneous {
-        warn!(
-            "GeoGuessr: prefetch cache is geographically homogeneous — enabling exploration mode"
-        );
+        warn!("GeoGuessr: prefetch cache is geographically homogeneous, enabling exploration mode");
     }
 
     // Restore the anti-starvation streak; enable exploration when homogeneous.
@@ -1955,7 +1954,7 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
         is_homogeneous,
     );
 
-    // Countries seen too often recently — skip at seed-selection time.
+    // Countries seen too often recently: skip at seed-selection time.
     // Combines DB history (last 90 days) with what is already in the cache.
     let skip_countries: HashSet<String> = {
         let mut freq: HashMap<String, u32> =
@@ -2001,7 +2000,7 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
                 }
             },
             _ => {
-                warn!("GeoGuessr: unknown source '{}' — skipping", source);
+                warn!("GeoGuessr: unknown source '{}', skipping", source);
                 continue;
             }
         };
@@ -2062,7 +2061,7 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
     participants.sort();
 
     room.send(format::mentionify(&format!(
-        "⚠️ Bot restarted mid-round — replaying guess {}/{} with a fresh {} timer.",
+        "⚠️ I restarted mid-round.\n🔁 Replaying guess {}/{} with a fresh {} timer.",
         ar.guess_num,
         ar.total_guesses,
         format_duration(ar.answer_timeout_secs),
@@ -2261,7 +2260,7 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
     let n_players = sorted_participants.len();
     room.send(
         format::mentionify(&format!(
-            "🌍 GeoGuessr starting now! {} player{}: {}",
+            "🌍 GeoGuessr starting now!\n👥 {} player{}: {}",
             n_players,
             if n_players == 1 { "" } else { "s" },
             participant_list.join(", "),

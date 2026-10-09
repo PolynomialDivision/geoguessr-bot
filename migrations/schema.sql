@@ -1,4 +1,4 @@
--- GeoGuessr bot schema (single consolidated file — no migration history needed).
+-- GeoGuessr bot schema (single consolidated file, no migration history needed).
 
 CREATE TABLE IF NOT EXISTS players (
     user_id      TEXT PRIMARY KEY,

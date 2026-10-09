@@ -87,7 +87,7 @@ pub struct BotContext {
     /// Consecutive Mapillary quality-filter rejections across prefetch sessions.
     /// Persists the anti-starvation streak so it survives between prefetch calls.
     pub prefetch_streak: Arc<AtomicU32>,
-    /// Per-image-ID thumbnail metrics cache — avoids re-downloading thumbnails
+    /// Per-image-ID thumbnail metrics cache: avoids re-downloading thumbnails
     /// across prefetch sessions.  Stores (sharpness, overlay_penalty).
     /// Evicts oldest 20 % of entries at 1000-entry capacity.
     pub blur_cache: Arc<std::sync::Mutex<crate::sources::mapillary::BlurCache>>,
@@ -283,9 +283,9 @@ async fn main() -> Result<()> {
                                     };
                                     if let Some(r) = room2 {
                                         let msg = match accepted {
-                                            Some(true) => format!("✅ {sender} — guess recorded for \"{query}\""),
-                                            Some(false) => format!("❌ {sender} — you already submitted a guess"),
-                                            None => format!("⏳ {sender} — no guess is open right now"),
+                                            Some(true) => format!("✅ {sender}, your guess \"{query}\" is in."),
+                                            Some(false) => format!("☝️ {sender}, you already sent a guess."),
+                                            None => format!("⏳ {sender}, no guess is open right now."),
                                         };
                                         r.send(format::mentionify(&msg)).await.ok();
                                     }
@@ -293,7 +293,7 @@ async fn main() -> Result<()> {
                                 None => {
                                     if let Some(r) = room2 {
                                         r.send(format::mentionify(&format!(
-                                            "❓ {sender} — could not find \"{query}\", try a different name"
+                                            "❓ {sender}, I couldn't find \"{query}\".\n💡 Try a different name."
                                         )))
                                         .await
                                         .ok();
@@ -315,7 +315,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ── Reaction handler — game answers + join opt-in ─────────────────────────
+    // ── Reaction handler: game answers + join opt-in ─────────────────────────
     client.add_event_handler({
         let ctx = ctx.clone();
         let bot_user_id = bot.user_id.clone();
@@ -384,7 +384,7 @@ async fn main() -> Result<()> {
             let now_utc = chrono::Utc::now();
             if pj.game_at_utc > now_utc {
                 info!(
-                    "Resuming pending join phase — game starts at {} UTC",
+                    "Resuming pending join phase: game starts at {} UTC",
                     pj.game_at_utc.format("%H:%M")
                 );
                 // Restore in-memory JoinState so new reactions are still tracked.
@@ -403,7 +403,7 @@ async fn main() -> Result<()> {
                 });
                 *ctx.round_abort.lock().await = Some(handle.abort_handle());
             } else {
-                // Game time already passed — discard the stale pending join.
+                // Game time already passed: discard the stale pending join.
                 info!("Discarding stale pending_join (game_at was in the past)");
                 let mut st = ctx.state.lock().await;
                 st.pending_join = None;

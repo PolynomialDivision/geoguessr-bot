@@ -39,7 +39,7 @@ pub struct GuessToken {
 /// Per-guess session shared across all tokens for the same (round_id, guess_num).
 #[derive(Clone, Debug)]
 pub struct GuessSession {
-    /// Event ID of the links message in the game room — edited on each submission.
+    /// Event ID of the links message in the game room: edited on each submission.
     pub links_event_id: OwnedEventId,
     /// Ordered participant list (controls display order in status line).
     pub participants: Vec<OwnedUserId>,
@@ -185,9 +185,7 @@ async fn submit_guess(
         Some(false) => {}
         // The page shows this text instead of a "recorded" confirmation that
         // would never count.
-        None => {
-            return (StatusCode::GONE, "⏰ Time is up — this guess has closed.").into_response()
-        }
+        None => return (StatusCode::GONE, "⏰ Time is up. This guess has closed.").into_response(),
     }
 
     let geocoded = crate::geocode::reverse_geocode(body.lat, body.lon, &tok.lang).await;
@@ -353,32 +351,32 @@ html,body{height:100%;background:#1a1a2e;font-family:system-ui,sans-serif}
   var LANG     = __LANG__;
 
   var T = {
-    en:{tap:'Tap the map to place your pin',submit:'Submit guess',submitting:'Submitting…',locked_in:'✅ Locked in: ',locked_btn:'✅ Guess locked in',update:'✏️ Update guess',recorded:'✅ Guess recorded: ',net_err:'❌ Network error — try again',err:'Error — try again'},
-    de:{tap:'Karte antippen, um Stecknadel zu setzen',submit:'Antwort absenden',submitting:'Wird gesendet…',locked_in:'✅ Festgelegt: ',locked_btn:'✅ Antwort festgelegt',update:'✏️ Antwort ändern',recorded:'✅ Antwort gespeichert: ',net_err:'❌ Netzwerkfehler — erneut versuchen',err:'Fehler — erneut versuchen'},
-    fr:{tap:'Appuyez sur la carte pour placer votre repère',submit:'Soumettre',submitting:'Envoi…',locked_in:'✅ Verrouillé : ',locked_btn:'✅ Réponse verrouillée',update:'✏️ Modifier',recorded:'✅ Réponse enregistrée : ',net_err:'❌ Erreur réseau — réessayez',err:'Erreur — réessayez'},
-    es:{tap:'Toca el mapa para colocar tu pin',submit:'Enviar respuesta',submitting:'Enviando…',locked_in:'✅ Confirmado: ',locked_btn:'✅ Respuesta confirmada',update:'✏️ Actualizar respuesta',recorded:'✅ Respuesta guardada: ',net_err:'❌ Error de red — inténtalo de nuevo',err:'Error — inténtalo de nuevo'},
-    ru:{tap:'Нажмите на карту, чтобы поставить метку',submit:'Отправить ответ',submitting:'Отправка…',locked_in:'✅ Зафиксировано: ',locked_btn:'✅ Ответ зафиксирован',update:'✏️ Изменить ответ',recorded:'✅ Ответ записан: ',net_err:'❌ Ошибка сети — попробуйте снова',err:'Ошибка — попробуйте снова'},
-    it:{tap:'Tocca la mappa per posizionare il pin',submit:'Invia risposta',submitting:'Invio…',locked_in:'✅ Bloccato: ',locked_btn:'✅ Risposta bloccata',update:'✏️ Aggiorna risposta',recorded:'✅ Risposta registrata: ',net_err:'❌ Errore di rete — riprova',err:'Errore — riprova'},
-    pl:{tap:'Dotknij mapę, aby umieścić pinezkę',submit:'Prześlij odpowiedź',submitting:'Wysyłanie…',locked_in:'✅ Zablokowano: ',locked_btn:'✅ Odpowiedź zablokowana',update:'✏️ Zaktualizuj odpowiedź',recorded:'✅ Odpowiedź zapisana: ',net_err:'❌ Błąd sieci — spróbuj ponownie',err:'Błąd — spróbuj ponownie'},
-    nl:{tap:'Tik op de kaart om je pin te plaatsen',submit:'Antwoord verzenden',submitting:'Verzenden…',locked_in:'✅ Vergrendeld: ',locked_btn:'✅ Antwoord vergrendeld',update:'✏️ Antwoord bijwerken',recorded:'✅ Antwoord opgeslagen: ',net_err:'❌ Netwerkfout — probeer opnieuw',err:'Fout — probeer opnieuw'},
-    pt:{tap:'Toque no mapa para colocar seu marcador',submit:'Enviar resposta',submitting:'Enviando…',locked_in:'✅ Confirmado: ',locked_btn:'✅ Resposta confirmada',update:'✏️ Atualizar resposta',recorded:'✅ Resposta registada: ',net_err:'❌ Erro de rede — tente novamente',err:'Erro — tente novamente'},
-    uk:{tap:'Натисніть на карту, щоб поставити мітку',submit:'Надіслати відповідь',submitting:'Надсилання…',locked_in:'✅ Зафіксовано: ',locked_btn:'✅ Відповідь зафіксована',update:'✏️ Оновити відповідь',recorded:'✅ Відповідь збережено: ',net_err:'❌ Помилка мережі — спробуйте ще раз',err:'Помилка — спробуйте ще раз'},
-    ja:{tap:'地図をタップしてピンを置く',submit:'回答を送信',submitting:'送信中…',locked_in:'✅ 確定: ',locked_btn:'✅ 回答を確定',update:'✏️ 回答を更新',recorded:'✅ 回答を記録: ',net_err:'❌ ネットワークエラー — 再試行',err:'エラー — 再試行'},
-    zh:{tap:'点击地图放置图钉',submit:'提交答案',submitting:'提交中…',locked_in:'✅ 已确认: ',locked_btn:'✅ 答案已确认',update:'✏️ 更新答案',recorded:'✅ 答案已记录: ',net_err:'❌ 网络错误 — 请重试',err:'错误 — 请重试'},
-    ar:{tap:'اضغط على الخريطة لوضع الدبوس',submit:'إرسال الإجابة',submitting:'جارٍ الإرسال…',locked_in:'✅ تم التأكيد: ',locked_btn:'✅ تم تأكيد الإجابة',update:'✏️ تحديث الإجابة',recorded:'✅ تم تسجيل الإجابة: ',net_err:'❌ خطأ في الشبكة — حاول مرة أخرى',err:'خطأ — حاول مرة أخرى'},
-    tr:{tap:'Pini yerleştirmek için haritaya dokun',submit:'Tahmin gönder',submitting:'Gönderiliyor…',locked_in:'✅ Kilitlendi: ',locked_btn:'✅ Tahmin kilitlendi',update:'✏️ Tahmini güncelle',recorded:'✅ Tahmin kaydedildi: ',net_err:'❌ Ağ hatası — tekrar dene',err:'Hata — tekrar dene'},
-    sv:{tap:'Tryck på kartan för att placera din nål',submit:'Skicka svar',submitting:'Skickar…',locked_in:'✅ Låst: ',locked_btn:'✅ Svar låst',update:'✏️ Uppdatera svar',recorded:'✅ Svar registrerat: ',net_err:'❌ Nätverksfel — försök igen',err:'Fel — försök igen'},
-    fi:{tap:'Napauta karttaa asettaaksesi nuppineulan',submit:'Lähetä arvaus',submitting:'Lähetetään…',locked_in:'✅ Lukittu: ',locked_btn:'✅ Arvaus lukittu',update:'✏️ Päivitä arvaus',recorded:'✅ Arvaus tallennettu: ',net_err:'❌ Verkkovirhe — yritä uudelleen',err:'Virhe — yritä uudelleen'},
-    da:{tap:'Tryk på kortet for at placere din nål',submit:'Send gæt',submitting:'Sender…',locked_in:'✅ Låst: ',locked_btn:'✅ Gæt låst',update:'✏️ Opdater gæt',recorded:'✅ Gæt registreret: ',net_err:'❌ Netværksfejl — prøv igen',err:'Fejl — prøv igen'},
-    cs:{tap:'Klepněte na mapu a umístěte špendlík',submit:'Odeslat odpověď',submitting:'Odesílám…',locked_in:'✅ Uzamčeno: ',locked_btn:'✅ Odpověď uzamčena',update:'✏️ Aktualizovat odpověď',recorded:'✅ Odpověď zaznamenána: ',net_err:'❌ Chyba sítě — zkuste znovu',err:'Chyba — zkuste znovu'},
-    hu:{tap:'Koppintson a térképre a gombostű elhelyezéséhez',submit:'Tipp elküldése',submitting:'Küldés…',locked_in:'✅ Rögzítve: ',locked_btn:'✅ Tipp rögzítve',update:'✏️ Tipp frissítése',recorded:'✅ Tipp rögzítve: ',net_err:'❌ Hálózati hiba — próbálja újra',err:'Hiba — próbálja újra'},
-    ro:{tap:'Atinge harta pentru a plasa acul',submit:'Trimite răspuns',submitting:'Se trimite…',locked_in:'✅ Blocat: ',locked_btn:'✅ Răspuns blocat',update:'✏️ Actualizează răspuns',recorded:'✅ Răspuns înregistrat: ',net_err:'❌ Eroare de rețea — încearcă din nou',err:'Eroare — încearcă din nou'},
-    el:{tap:'Πατήστε στον χάρτη για να τοποθετήσετε την καρφίτσα',submit:'Αποστολή απάντησης',submitting:'Αποστολή…',locked_in:'✅ Κλειδωμένο: ',locked_btn:'✅ Απάντηση κλειδωμένη',update:'✏️ Ενημέρωση απάντησης',recorded:'✅ Απάντηση καταγράφηκε: ',net_err:'❌ Σφάλμα δικτύου — δοκιμάστε ξανά',err:'Σφάλμα — δοκιμάστε ξανά'},
-    he:{tap:'גע במפה כדי למקם את הסיכה',submit:'שלח תשובה',submitting:'שולח…',locked_in:'✅ נעול: ',locked_btn:'✅ תשובה נעולה',update:'✏️ עדכן תשובה',recorded:'✅ תשובה נרשמה: ',net_err:'❌ שגיאת רשת — נסה שוב',err:'שגיאה — נסה שוב'},
-    ko:{tap:'지도를 눌러 핀을 놓으세요',submit:'답안 제출',submitting:'제출 중…',locked_in:'✅ 확정됨: ',locked_btn:'✅ 답안 확정',update:'✏️ 답안 수정',recorded:'✅ 답안 기록됨: ',net_err:'❌ 네트워크 오류 — 다시 시도',err:'오류 — 다시 시도'},
-    th:{tap:'แตะแผนที่เพื่อวางหมุด',submit:'ส่งคำตอบ',submitting:'กำลังส่ง…',locked_in:'✅ ล็อคแล้ว: ',locked_btn:'✅ ล็อคคำตอบแล้ว',update:'✏️ อัปเดตคำตอบ',recorded:'✅ บันทึกคำตอบแล้ว: ',net_err:'❌ เครือข่ายผิดพลาด — ลองอีกครั้ง',err:'ผิดพลาด — ลองอีกครั้ง'},
-    vi:{tap:'Chạm vào bản đồ để đặt ghim',submit:'Gửi đoán',submitting:'Đang gửi…',locked_in:'✅ Đã xác nhận: ',locked_btn:'✅ Đã khóa đoán',update:'✏️ Cập nhật đoán',recorded:'✅ Đoán đã được ghi: ',net_err:'❌ Lỗi mạng — thử lại',err:'Lỗi — thử lại'},
-    id:{tap:'Ketuk peta untuk meletakkan pin',submit:'Kirim tebakan',submitting:'Mengirim…',locked_in:'✅ Dikunci: ',locked_btn:'✅ Tebakan dikunci',update:'✏️ Perbarui tebakan',recorded:'✅ Tebakan dicatat: ',net_err:'❌ Kesalahan jaringan — coba lagi',err:'Kesalahan — coba lagi'}
+    en:{tap:'Tap the map to place your pin',submit:'Submit guess',submitting:'Submitting…',locked_in:'✅ Locked in: ',locked_btn:'✅ Guess locked in',update:'✏️ Update guess',recorded:'✅ Guess recorded: ',net_err:'❌ Network error: try again',err:'Error: try again'},
+    de:{tap:'Karte antippen, um Stecknadel zu setzen',submit:'Antwort absenden',submitting:'Wird gesendet…',locked_in:'✅ Festgelegt: ',locked_btn:'✅ Antwort festgelegt',update:'✏️ Antwort ändern',recorded:'✅ Antwort gespeichert: ',net_err:'❌ Netzwerkfehler: erneut versuchen',err:'Fehler: erneut versuchen'},
+    fr:{tap:'Appuyez sur la carte pour placer votre repère',submit:'Soumettre',submitting:'Envoi…',locked_in:'✅ Verrouillé : ',locked_btn:'✅ Réponse verrouillée',update:'✏️ Modifier',recorded:'✅ Réponse enregistrée : ',net_err:'❌ Erreur réseau: réessayez',err:'Erreur: réessayez'},
+    es:{tap:'Toca el mapa para colocar tu pin',submit:'Enviar respuesta',submitting:'Enviando…',locked_in:'✅ Confirmado: ',locked_btn:'✅ Respuesta confirmada',update:'✏️ Actualizar respuesta',recorded:'✅ Respuesta guardada: ',net_err:'❌ Error de red: inténtalo de nuevo',err:'Error: inténtalo de nuevo'},
+    ru:{tap:'Нажмите на карту, чтобы поставить метку',submit:'Отправить ответ',submitting:'Отправка…',locked_in:'✅ Зафиксировано: ',locked_btn:'✅ Ответ зафиксирован',update:'✏️ Изменить ответ',recorded:'✅ Ответ записан: ',net_err:'❌ Ошибка сети: попробуйте снова',err:'Ошибка: попробуйте снова'},
+    it:{tap:'Tocca la mappa per posizionare il pin',submit:'Invia risposta',submitting:'Invio…',locked_in:'✅ Bloccato: ',locked_btn:'✅ Risposta bloccata',update:'✏️ Aggiorna risposta',recorded:'✅ Risposta registrata: ',net_err:'❌ Errore di rete: riprova',err:'Errore: riprova'},
+    pl:{tap:'Dotknij mapę, aby umieścić pinezkę',submit:'Prześlij odpowiedź',submitting:'Wysyłanie…',locked_in:'✅ Zablokowano: ',locked_btn:'✅ Odpowiedź zablokowana',update:'✏️ Zaktualizuj odpowiedź',recorded:'✅ Odpowiedź zapisana: ',net_err:'❌ Błąd sieci: spróbuj ponownie',err:'Błąd: spróbuj ponownie'},
+    nl:{tap:'Tik op de kaart om je pin te plaatsen',submit:'Antwoord verzenden',submitting:'Verzenden…',locked_in:'✅ Vergrendeld: ',locked_btn:'✅ Antwoord vergrendeld',update:'✏️ Antwoord bijwerken',recorded:'✅ Antwoord opgeslagen: ',net_err:'❌ Netwerkfout: probeer opnieuw',err:'Fout: probeer opnieuw'},
+    pt:{tap:'Toque no mapa para colocar seu marcador',submit:'Enviar resposta',submitting:'Enviando…',locked_in:'✅ Confirmado: ',locked_btn:'✅ Resposta confirmada',update:'✏️ Atualizar resposta',recorded:'✅ Resposta registada: ',net_err:'❌ Erro de rede: tente novamente',err:'Erro: tente novamente'},
+    uk:{tap:'Натисніть на карту, щоб поставити мітку',submit:'Надіслати відповідь',submitting:'Надсилання…',locked_in:'✅ Зафіксовано: ',locked_btn:'✅ Відповідь зафіксована',update:'✏️ Оновити відповідь',recorded:'✅ Відповідь збережено: ',net_err:'❌ Помилка мережі: спробуйте ще раз',err:'Помилка: спробуйте ще раз'},
+    ja:{tap:'地図をタップしてピンを置く',submit:'回答を送信',submitting:'送信中…',locked_in:'✅ 確定: ',locked_btn:'✅ 回答を確定',update:'✏️ 回答を更新',recorded:'✅ 回答を記録: ',net_err:'❌ ネットワークエラー: 再試行',err:'エラー: 再試行'},
+    zh:{tap:'点击地图放置图钉',submit:'提交答案',submitting:'提交中…',locked_in:'✅ 已确认: ',locked_btn:'✅ 答案已确认',update:'✏️ 更新答案',recorded:'✅ 答案已记录: ',net_err:'❌ 网络错误: 请重试',err:'错误: 请重试'},
+    ar:{tap:'اضغط على الخريطة لوضع الدبوس',submit:'إرسال الإجابة',submitting:'جارٍ الإرسال…',locked_in:'✅ تم التأكيد: ',locked_btn:'✅ تم تأكيد الإجابة',update:'✏️ تحديث الإجابة',recorded:'✅ تم تسجيل الإجابة: ',net_err:'❌ خطأ في الشبكة: حاول مرة أخرى',err:'خطأ: حاول مرة أخرى'},
+    tr:{tap:'Pini yerleştirmek için haritaya dokun',submit:'Tahmin gönder',submitting:'Gönderiliyor…',locked_in:'✅ Kilitlendi: ',locked_btn:'✅ Tahmin kilitlendi',update:'✏️ Tahmini güncelle',recorded:'✅ Tahmin kaydedildi: ',net_err:'❌ Ağ hatası: tekrar dene',err:'Hata: tekrar dene'},
+    sv:{tap:'Tryck på kartan för att placera din nål',submit:'Skicka svar',submitting:'Skickar…',locked_in:'✅ Låst: ',locked_btn:'✅ Svar låst',update:'✏️ Uppdatera svar',recorded:'✅ Svar registrerat: ',net_err:'❌ Nätverksfel: försök igen',err:'Fel: försök igen'},
+    fi:{tap:'Napauta karttaa asettaaksesi nuppineulan',submit:'Lähetä arvaus',submitting:'Lähetetään…',locked_in:'✅ Lukittu: ',locked_btn:'✅ Arvaus lukittu',update:'✏️ Päivitä arvaus',recorded:'✅ Arvaus tallennettu: ',net_err:'❌ Verkkovirhe: yritä uudelleen',err:'Virhe: yritä uudelleen'},
+    da:{tap:'Tryk på kortet for at placere din nål',submit:'Send gæt',submitting:'Sender…',locked_in:'✅ Låst: ',locked_btn:'✅ Gæt låst',update:'✏️ Opdater gæt',recorded:'✅ Gæt registreret: ',net_err:'❌ Netværksfejl: prøv igen',err:'Fejl: prøv igen'},
+    cs:{tap:'Klepněte na mapu a umístěte špendlík',submit:'Odeslat odpověď',submitting:'Odesílám…',locked_in:'✅ Uzamčeno: ',locked_btn:'✅ Odpověď uzamčena',update:'✏️ Aktualizovat odpověď',recorded:'✅ Odpověď zaznamenána: ',net_err:'❌ Chyba sítě: zkuste znovu',err:'Chyba: zkuste znovu'},
+    hu:{tap:'Koppintson a térképre a gombostű elhelyezéséhez',submit:'Tipp elküldése',submitting:'Küldés…',locked_in:'✅ Rögzítve: ',locked_btn:'✅ Tipp rögzítve',update:'✏️ Tipp frissítése',recorded:'✅ Tipp rögzítve: ',net_err:'❌ Hálózati hiba: próbálja újra',err:'Hiba: próbálja újra'},
+    ro:{tap:'Atinge harta pentru a plasa acul',submit:'Trimite răspuns',submitting:'Se trimite…',locked_in:'✅ Blocat: ',locked_btn:'✅ Răspuns blocat',update:'✏️ Actualizează răspuns',recorded:'✅ Răspuns înregistrat: ',net_err:'❌ Eroare de rețea: încearcă din nou',err:'Eroare: încearcă din nou'},
+    el:{tap:'Πατήστε στον χάρτη για να τοποθετήσετε την καρφίτσα',submit:'Αποστολή απάντησης',submitting:'Αποστολή…',locked_in:'✅ Κλειδωμένο: ',locked_btn:'✅ Απάντηση κλειδωμένη',update:'✏️ Ενημέρωση απάντησης',recorded:'✅ Απάντηση καταγράφηκε: ',net_err:'❌ Σφάλμα δικτύου: δοκιμάστε ξανά',err:'Σφάλμα: δοκιμάστε ξανά'},
+    he:{tap:'גע במפה כדי למקם את הסיכה',submit:'שלח תשובה',submitting:'שולח…',locked_in:'✅ נעול: ',locked_btn:'✅ תשובה נעולה',update:'✏️ עדכן תשובה',recorded:'✅ תשובה נרשמה: ',net_err:'❌ שגיאת רשת: נסה שוב',err:'שגיאה: נסה שוב'},
+    ko:{tap:'지도를 눌러 핀을 놓으세요',submit:'답안 제출',submitting:'제출 중…',locked_in:'✅ 확정됨: ',locked_btn:'✅ 답안 확정',update:'✏️ 답안 수정',recorded:'✅ 답안 기록됨: ',net_err:'❌ 네트워크 오류: 다시 시도',err:'오류: 다시 시도'},
+    th:{tap:'แตะแผนที่เพื่อวางหมุด',submit:'ส่งคำตอบ',submitting:'กำลังส่ง…',locked_in:'✅ ล็อคแล้ว: ',locked_btn:'✅ ล็อคคำตอบแล้ว',update:'✏️ อัปเดตคำตอบ',recorded:'✅ บันทึกคำตอบแล้ว: ',net_err:'❌ เครือข่ายผิดพลาด: ลองอีกครั้ง',err:'ผิดพลาด: ลองอีกครั้ง'},
+    vi:{tap:'Chạm vào bản đồ để đặt ghim',submit:'Gửi đoán',submitting:'Đang gửi…',locked_in:'✅ Đã xác nhận: ',locked_btn:'✅ Đã khóa đoán',update:'✏️ Cập nhật đoán',recorded:'✅ Đoán đã được ghi: ',net_err:'❌ Lỗi mạng: thử lại',err:'Lỗi: thử lại'},
+    id:{tap:'Ketuk peta untuk meletakkan pin',submit:'Kirim tebakan',submitting:'Mengirim…',locked_in:'✅ Dikunci: ',locked_btn:'✅ Tebakan dikunci',update:'✏️ Perbarui tebakan',recorded:'✅ Tebakan dicatat: ',net_err:'❌ Kesalahan jaringan: coba lagi',err:'Kesalahan: coba lagi'}
   };
 
   function t(key) {

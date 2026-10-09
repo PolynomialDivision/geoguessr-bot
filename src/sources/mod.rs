@@ -1,6 +1,6 @@
 //! Image source abstraction.
 //!
-//! Each source returns a `GeoImage` — metadata + a download URL (or file path)
+//! Each source returns a `GeoImage`: metadata + a download URL (or file path)
 //! for the image.  The game layer handles downloading and uploading to Matrix.
 
 pub mod diversity;
@@ -26,7 +26,7 @@ pub(super) fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 }
 
 /// Minimum distance from `(lat, lon)` to any point in `existing` (km).
-/// Returns `f64::INFINITY` when `existing` is empty (first fetch — always accepted).
+/// Returns `f64::INFINITY` when `existing` is empty (first fetch, always accepted).
 pub fn min_dist_to_existing(lat: f64, lon: f64, existing: &[(f64, f64)]) -> f64 {
     existing
         .iter()
@@ -52,11 +52,11 @@ pub struct GeoImage {
     pub source: String,
     /// Attribution string to include in the reveal (e.g. "© Wikimedia Commons").
     pub attribution: Option<String>,
-    /// Actual coordinates of the photo — used for free-guess distance scoring.
+    /// Actual coordinates of the photo: used for free-guess distance scoring.
     /// Falls back to the country capital if not available.
     pub lat: Option<f64>,
     pub lon: Option<f64>,
-    /// Mapillary sequence ID — used to avoid reusing the same capture run.
+    /// Mapillary sequence ID: used to avoid reusing the same capture run.
     #[serde(default)]
     pub sequence: Option<String>,
     /// Additional photos from the same area (optional, for multi-photo questions).

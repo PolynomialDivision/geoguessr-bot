@@ -33,7 +33,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
     //
     // active_game is only set inside play_free_guess (after the join-phase wait),
     // so checking it here is not sufficient to prevent two concurrent spawns within
-    // the same tick — e.g. a recurring slot and a one-time slot resolving to the
+    // the same tick, e.g. a recurring slot and a one-time slot resolving to the
     // same wall-clock minute.  This flag closes that window.
     let mut round_spawned = false;
 
@@ -42,7 +42,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         let (qh, qm) = match ScheduleConfig::parse_game_time(time_str) {
             Some(t) => t,
             None => {
-                warn!("Invalid game_times entry {:?} — skipping", time_str);
+                warn!("Invalid game_times entry {:?}, skipping", time_str);
                 continue;
             }
         };
@@ -72,7 +72,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         }
 
         if round_spawned {
-            warn!("Scheduler: fire time for {time_str} skipped — another round was already spawned this tick");
+            warn!("Scheduler: fire time for {time_str} skipped, another round was already spawned this tick");
             continue;
         }
 
@@ -110,7 +110,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
             Some(t) => t,
             None => {
                 warn!(
-                    "Invalid scheduled_once time {:?} — removing",
+                    "Invalid scheduled_once time {:?}, removing",
                     entry.game_time
                 );
                 let mut state = ctx.state.lock().await;
@@ -143,7 +143,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
             let ag = ctx.active_game.lock().await;
             if ag.is_some() {
                 warn!(
-                    "One-time game at {} would fire now but a game is already running — dropped",
+                    "One-time game at {} would fire now but a game is already running: dropped",
                     entry.game_time,
                 );
                 continue;
@@ -152,7 +152,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
 
         if round_spawned {
             warn!(
-                "One-time game at {} dropped — another round was already spawned this tick",
+                "One-time game at {} dropped: another round was already spawned this tick",
                 entry.game_time,
             );
             continue;

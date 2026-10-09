@@ -79,7 +79,7 @@ pub fn avatar_bytes_to_data_url(bytes: &[u8]) -> Option<String> {
 
     // Resize to 48 × 48 (fast, small enough for URL embedding).
     let img = img.resize_exact(48, 48, image::imageops::FilterType::Triangle);
-    // JPEG doesn't support alpha — convert to RGB first.
+    // JPEG doesn't support alpha: convert to RGB first.
     let rgb = img.into_rgb8();
 
     // JPEG-encode at quality 55.

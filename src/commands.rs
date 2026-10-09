@@ -86,7 +86,7 @@ async fn cmd_cancelgeo(
         .trim()
         .trim_matches(|c| c == '"' || c == '\'');
 
-    // !cancelgeo HH:MM — cancel a pending one-time game.
+    // !cancelgeo HH:MM: cancel a pending one-time game.
     if !time_arg.is_empty() {
         let (qh, qm) = match ScheduleConfig::parse_game_time(time_arg) {
             Some(t) => t,
@@ -111,7 +111,7 @@ async fn cmd_cancelgeo(
         };
     }
 
-    // !cancelgeo — abort the currently running round (join phase or active game).
+    // !cancelgeo: abort the currently running round (join phase or active game).
     let abort = ctx.round_abort.lock().await.take();
     let had_game = ctx.active_game.lock().await.take().is_some();
 
@@ -156,11 +156,11 @@ async fn cmd_cancelgeo(
 // ── !schedulegeo ──────────────────────────────────────────────────────────────
 //
 // Usage:
-//   !schedulegeo                                  — list pending one-time games
-//   !schedulegeo HH:MM                            — schedule with config defaults
-//   !schedulegeo HH:MM reminder=N                 — join-window before game (seconds)
-//   !schedulegeo HH:MM timeout=N                  — answer timeout (seconds)
-//   !schedulegeo HH:MM guesses=N                  — locations per round
+//   !schedulegeo: list pending one-time games
+//   !schedulegeo HH:MM: schedule with config defaults
+//   !schedulegeo HH:MM reminder=N: join-window before game (seconds)
+//   !schedulegeo HH:MM timeout=N: answer timeout (seconds)
+//   !schedulegeo HH:MM guesses=N: locations per round
 //   !schedulegeo HH:MM reminder=N timeout=N guesses=N
 //
 // Schedules for today if the game time is still in the future; tomorrow otherwise.
@@ -253,7 +253,7 @@ async fn cmd_schedulegeo(
             }
         } else {
             return Ok(Some(format!(
-                "❌ Unknown argument \"{arg}\"\nUsage: !schedulegeo HH:MM [reminder=N] [timeout=N] [guesses=N]"
+                "❌ Unknown argument \"{arg}\"\n💡 Usage: !schedulegeo HH:MM [reminder=N] [timeout=N] [guesses=N]"
             )));
         }
     }
@@ -272,14 +272,14 @@ async fn cmd_schedulegeo(
     let fire_secs = (game_secs - reminder as i64).rem_euclid(86400);
     let now_secs = (local_now.hour() * 3600 + local_now.minute() * 60 + local_now.second()) as i64;
 
-    // Reject if the reminder is longer than the time from midnight to the game —
-    // that wraps the fire time to later in the day than the game itself.
+    // Reject if the reminder is longer than the time from midnight to the game.
+    // That wraps the fire time to later in the day than the game itself.
     if fire_secs > game_secs {
         let hrs = reminder / 3600;
         let mins = (reminder % 3600) / 60;
         let mut msg = format!(
-            "❌ reminder={reminder}s (~{hrs}h {mins}m) is longer than the time from midnight to {qh:02}:{qm:02} \
-             — the join window would open at {:02}:{:02}, after the game itself.",
+            "❌ reminder={reminder}s (~{hrs}h {mins}m) is longer than the time from midnight to {qh:02}:{qm:02}.\n\
+             ⏰ The join window would open at {:02}:{:02}, after the game itself.",
             (fire_secs / 3600) as u32,
             ((fire_secs % 3600) / 60) as u32,
         );
@@ -361,7 +361,7 @@ async fn cmd_schedulegeo(
     if let Some(g) = guesses_override {
         detail.push_str(&format!(", {g} guess{}", if g == 1 { "" } else { "es" }));
     }
-    detail.push_str(&format!("\nCancel: !cancelgeo {game_time}"));
+    detail.push_str(&format!("\n🚫 Cancel: !cancelgeo {game_time}"));
     Ok(Some(detail))
 }
 
@@ -379,11 +379,11 @@ async fn cmd_prefetch(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<S
 // ── !setschedule ──────────────────────────────────────────────────────────────
 //
 // Usage:
-//   !setschedule                          — show current runtime overrides
-//   !setschedule guesses=N               — override guesses per round
-//   !setschedule photos=N                — override photos per guess location
-//   !setschedule timeout=N               — override answer timeout (seconds)
-//   !setschedule reset                   — clear all runtime overrides
+//   !setschedule: show current runtime overrides
+//   !setschedule guesses=N: override guesses per round
+//   !setschedule photos=N: override photos per guess location
+//   !setschedule timeout=N: override answer timeout (seconds)
+//   !setschedule reset: clear all runtime overrides
 
 async fn cmd_setschedule(
     ctx: &BotContext,
@@ -414,7 +414,7 @@ async fn cmd_setschedule(
                 )
             });
         return Ok(Some(format!(
-            "📅 Schedule overrides:\n· guesses: {guesses}\n· photos/guess: {photos}\n· timeout: {timeout}\nChange: !setschedule [guesses=N] [photos=N] [timeout=N] | !setschedule reset"
+            "📅 Schedule overrides\n🎯 Guesses: {guesses}\n📸 Photos per guess: {photos}\n⏳ Timeout: {timeout}\n\n✏️ !setschedule [guesses=N] [photos=N] [timeout=N]\n↩️ !setschedule reset"
         )));
     }
 
@@ -425,7 +425,7 @@ async fn cmd_setschedule(
             st.save(&ctx.state_path).await?;
         }
         return Ok(Some(
-            "✅ Schedule overrides cleared — using config defaults.".to_owned(),
+            "✅ Schedule overrides cleared. Using the config defaults.".to_owned(),
         ));
     }
 
@@ -464,7 +464,7 @@ async fn cmd_setschedule(
             }
         } else {
             return Ok(Some(format!(
-                "❌ Unknown argument \"{arg}\"\nUsage: !setschedule [guesses=N] [photos=N] [timeout=N] | reset"
+                "❌ Unknown argument \"{arg}\"\n💡 Usage: !setschedule [guesses=N] [photos=N] [timeout=N] or reset"
             )));
         }
     }
@@ -516,7 +516,7 @@ async fn cmd_resetstats(
         Ok(()) => Ok(Some("✅ All stats have been reset.".to_owned())),
         Err(e) => {
             error!("reset_stats failed: {e}");
-            Ok(Some("❌ Reset failed — check the logs.".to_owned()))
+            Ok(Some("❌ Reset failed. Check the logs.".to_owned()))
         }
     }
 }
@@ -531,7 +531,7 @@ async fn cmd_scores_free_guess(ctx: &BotContext) -> Result<Option<String>> {
     match build_alltime_leaderboard(ctx).await {
         Some(text) => Ok(Some(text)),
         None => Ok(Some(
-            "No scores yet — no games have been played.".to_owned(),
+            "🤷 No scores yet. No games have been played.".to_owned(),
         )),
     }
 }
@@ -539,14 +539,14 @@ async fn cmd_scores_free_guess(ctx: &BotContext) -> Result<Option<String>> {
 async fn cmd_scores_rolling(ctx: &BotContext) -> Result<Option<String>> {
     match build_rolling_leaderboard(ctx).await {
         Some(text) => Ok(Some(text)),
-        None => Ok(Some("No scores in the last 90 days.".to_owned())),
+        None => Ok(Some("🤷 No scores in the last 90 days.".to_owned())),
     }
 }
 
 async fn cmd_scores_month(ctx: &BotContext) -> Result<Option<String>> {
     match build_monthly_leaderboard(ctx).await {
         Some(text) => Ok(Some(text)),
-        None => Ok(Some("No scores yet this month.".to_owned())),
+        None => Ok(Some("🤷 No scores yet this month.".to_owned())),
     }
 }
 
@@ -557,14 +557,14 @@ async fn cmd_scores_month(ctx: &BotContext) -> Result<Option<String>> {
 //
 //   rating = (n / (n + k)) * player_average + (k / (n + k)) * baseline
 //
-// `n` is `guesses_played` — every guess a player was on the hook for, real
+// `n` is `guesses_played`. Every guess a player was on the hook for, real
 // submissions AND missed/no-guess rounds (recorded as 0, see
 // `Db::record_missed_guesses`). Counting misses as 0 rather than excluding
 // them is what makes "every round you join counts": skipping a hard guess
 // drags your average down instead of just not counting, so there's no
 // strategic benefit to only answering the easy ones.
 //
-// `baseline` is the community's own average score per guess — derived from
+// `baseline` is the community's own average score per guess: derived from
 // the leaderboard data itself (see `community_baseline`), not a fixed
 // constant, so it tracks the actual difficulty/skill level of this room's
 // games over time.
@@ -576,7 +576,7 @@ async fn cmd_scores_month(ctx: &BotContext) -> Result<Option<String>> {
 // perfect round from outranking someone with a long, consistently good
 // track record, while a player who plays a lot but badly still converges to
 // their own (low) rating rather than being propped up by participation
-// alone — shrinkage only pulls toward the baseline, it never adds points
+// alone: shrinkage only pulls toward the baseline, it never adds points
 // for volume.
 
 fn raw_score_average(entry: &crate::db::ScoreLeaderboardEntry) -> f64 {
@@ -600,7 +600,7 @@ fn community_baseline(board: &[crate::db::ScoreLeaderboardEntry], fallback: f64)
     }
 }
 
-/// Bayesian-shrinkage rating — see the module-level comment above.
+/// Bayesian-shrinkage rating, see the module-level comment above.
 fn shrunk_rating(entry: &crate::db::ScoreLeaderboardEntry, k: f64, baseline: f64) -> f64 {
     let n = entry.guesses_played as f64;
     if n <= 0.0 {
@@ -619,7 +619,7 @@ fn completion_pct(entry: &crate::db::ScoreLeaderboardEntry) -> f64 {
     }
 }
 
-/// A rating is "provisional" — not yet enough data to trust — below the
+/// A rating is "provisional" (not yet enough data to trust) below the
 /// configured `provisional_threshold` of guesses played. Display-only; the
 /// rating math already accounts for sample size via shrinkage regardless.
 fn is_provisional(entry: &crate::db::ScoreLeaderboardEntry, threshold: i64) -> bool {
@@ -633,8 +633,8 @@ fn sort_score_leaderboard(board: &mut [crate::db::ScoreLeaderboardEntry], k: f64
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(b.guesses_played.cmp(&a.guesses_played))
             // Same rating and volume (e.g. everyone's 1-for-1 this month):
-            // break the tie the same way a round itself does — closer best
-            // guess wins, see the `scored.sort_by` in game.rs — instead of
+            // break the tie the same way a round itself does: closer best
+            // guess wins, see the `scored.sort_by` in game.rs, instead of
             // falling straight through to an alphabetical user_id order that
             // has nothing to do with who actually played better.
             .then(
@@ -661,8 +661,8 @@ fn format_leaderboard(
     let mut lines = vec![
         format!("🏆 **{}** · {} rounds", header, round_count),
         format!(
-            "⭐ rating blends your average with the community baseline (⭐{}) until you've played \
-             enough to trust it · 🔰 = provisional (<{} guesses)",
+            "⭐ Rating: your average, blended with the group average (⭐{}) until you have played enough.\n\
+             🔰 Provisional: fewer than {} guesses.",
             baseline.round() as i64,
             rating_cfg.provisional_threshold,
         ),
@@ -695,7 +695,7 @@ fn format_leaderboard(
             ""
         };
         lines.push(format!(
-            "{medal} {}. {}{provisional} · ⭐{} {bar} · 🎯{}/g · ✅{}% · 🎮{} · 🏅{}",
+            "{medal} {}. {}{provisional}\n⭐{} {bar}\n🎯{}/g · ✅{}% · 🎮{} · 🏅{}",
             i + 1,
             entry.user_id,
             rating.round() as i64,
@@ -738,7 +738,7 @@ pub async fn build_rolling_leaderboard(ctx: &BotContext) -> Option<String> {
     ))
 }
 
-/// Start of the current calendar month, in `tz`, as a UTC instant — the SQL
+/// Start of the current calendar month, in `tz`, as a UTC instant. The SQL
 /// lower bound for "this month's" rounds. Uses the bot's configured
 /// timezone (`schedule.timezone`, UTC if unset/invalid) so the monthly
 /// leaderboard rolls over at local, not UTC, midnight on the 1st. On the
@@ -759,12 +759,12 @@ fn month_start_utc(tz: Tz, local_now: chrono::DateTime<Tz>) -> chrono::DateTime<
         .with_timezone(&chrono::Utc)
 }
 
-/// Calendar-month leaderboard — only rounds from the current month (in the
+/// Calendar-month leaderboard, only rounds from the current month (in the
 /// bot's configured timezone). Posted after each round instead of the
 /// all-time leaderboard so recent activity stays prominent; `!scores` /
 /// `!leaderboard` remain the all-time view, and `!scoresmonth` /
 /// `!leaderboardmonth` request this one explicitly. Uses the exact same
-/// rating math as the all-time leaderboard (`format_leaderboard`) — only
+/// rating math as the all-time leaderboard (`format_leaderboard`), only
 /// which rounds are included differs, computed straight from persisted
 /// round timestamps, so there's no separate monthly state to keep in sync
 /// and a restart or month rollover can't duplicate or drift scores.
@@ -804,7 +804,7 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
             error!("DB user_stats error: {e}");
             return Ok(Some("❌ Could not read stats from database.".to_owned()));
         }
-        Ok(None) => return Ok(Some("No rounds played yet.".to_owned())),
+        Ok(None) => return Ok(Some("🤷 No rounds played yet.".to_owned())),
         Ok(Some(s)) => s,
     };
 
@@ -873,7 +873,7 @@ async fn cmd_countries(ctx: &BotContext) -> Result<Option<String>> {
         }
     };
     if stats.is_empty() {
-        return Ok(Some("No guesses yet.".to_owned()));
+        return Ok(Some("🤷 No guesses yet.".to_owned()));
     }
 
     let total_q: i64 = stats.iter().map(|s| s.times_asked).sum();
@@ -894,7 +894,7 @@ async fn cmd_countries(ctx: &BotContext) -> Result<Option<String>> {
             0
         };
         lines.push(format!(
-            "{bar}  {:>2}x  {:>3}% ✓  {} ({})",
+            "{bar} {}x · ✅ {}% · {} ({})",
             s.times_asked, pct, s.country, s.region,
         ));
     }
@@ -916,7 +916,7 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
     };
     if board.is_empty() {
         return Ok(Some(
-            "Not enough data yet · need at least 3 correct answers per player.".to_owned(),
+            "⏳ Not enough data yet.\nEach player needs 3 correct answers.".to_owned(),
         ));
     }
 
@@ -929,10 +929,10 @@ async fn cmd_fastest(ctx: &BotContext) -> Result<Option<String>> {
             0 => "🥇",
             1 => "🥈",
             2 => "🥉",
-            _ => "  ",
+            _ => "▪️",
         };
         lines.push(format!(
-            "{medal} {:>2}. {} : {:.1}s avg · {} correct",
+            "{medal} {}. {} · {:.1}s avg · {} correct",
             i + 1,
             e.user_id,
             e.avg_secs,
@@ -965,8 +965,9 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
         String::new()
     };
 
-    let mode_line = "🗺️ Free guess · type a location in private chat\n\
-                     City, country, full address, or lat,lon · scored by distance";
+    let mode_line = "🗺️ Free guess: type a place in your private chat.\n\
+                     🏙️ City, country, address or lat,lon.\n\
+                     📏 Scored by distance.";
 
     let photos_line = if s.photos_per_location > 1 {
         format!("\n📸 {} photos per guess", s.photos_per_location)
@@ -1003,8 +1004,8 @@ async fn cmd_lang(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<
             .unwrap_or_else(|| "en".to_owned());
         let label = game::lang_label(&current);
         return Ok(Some(format!(
-            "Your language: **{current}** ({label})\n\
-             Change with: !lang <flag>  or  !lang <code>  (e.g. !lang 🇩🇪  or  !lang de)"
+            "🌐 Your language: **{current}** ({label})\n\
+             ✏️ Change it with !lang <flag> or !lang <code>, e.g. !lang 🇩🇪 or !lang de"
         )));
     }
 
@@ -1015,8 +1016,8 @@ async fn cmd_lang(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<
         l
     } else {
         return Ok(Some(format!(
-            "Unknown language «{arg}»\n\
-             Use !lang <flag>  or  !lang <code>  (e.g. !lang 🇩🇪  or  !lang de)"
+            "🤔 Unknown language «{arg}»\n\
+             💡 Use !lang <flag> or !lang <code>, e.g. !lang 🇩🇪 or !lang de"
         )));
     };
 
@@ -1030,35 +1031,34 @@ async fn cmd_lang(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Result<
     }
 
     Ok(Some(format!(
-        "Language set to **{lang}** ({label}) · your guess locations will now appear in {label}"
+        "✅ Language set to **{lang}** ({label}).\n🗺️ Your guess locations now appear in {label}."
     )))
 }
 
 // ── !help ─────────────────────────────────────────────────────────────────────
 
 fn help_text() -> String {
-    "🌍 **GeoGuessr** commands:
+    "🌍 **GeoGuessr**
 
-  !gameinfo          · schedule & how to play
-  !scores            · all-time leaderboard
-  !scoresmonth       · this month's leaderboard
-  !scores90          · last 90 days leaderboard
-  !mystats           · your rank and stats
-  !countries         · country accuracy chart
-  !fastest           · speed leaderboard
-  !lang <flag or code>   · set your language (e.g. !lang 🇩🇪  or  !lang de)
-  !help              · show this help
+ℹ️ !gameinfo · schedule and how to play
+🏆 !scores · all-time ranking
+📅 !scoresmonth · this month
+🗓️ !scores90 · last 90 days
+📊 !mystats · your rank and stats
+🗺️ !countries · country accuracy
+⚡ !fastest · speed ranking
+🌐 !lang <flag or code> · your language, e.g. !lang 🇩🇪
+❔ !help · this help
 
-**Admin:**
-  !startgeo                                  · start a round immediately (no join phase)
-  !cancelgeo                                 · abort current round
-  !cancelgeo HH:MM                           · cancel a scheduled game
-  !schedulegeo HH:MM [reminder=N] [timeout=N] [guesses=N]
-                                             · schedule a game (today if possible)
-  !setschedule [guesses=N] [photos=N] [timeout=N]  · override daily schedule defaults
-  !setschedule reset                         · clear overrides, use config values
-  !prefetch                                  · fill the image cache
-  !resetstats confirm                        · wipe all history"
+🛠️ **Admin**
+▶️ !startgeo · start now (no join phase)
+🛑 !cancelgeo · abort the current round
+🚫 !cancelgeo HH:MM · cancel a scheduled game
+⏰ !schedulegeo HH:MM [reminder=N] [timeout=N] [guesses=N]
+⚙️ !setschedule [guesses=N] [photos=N] [timeout=N]
+↩️ !setschedule reset · back to config values
+📥 !prefetch · fill the image cache
+🧹 !resetstats confirm · wipe all history"
         .to_owned()
 }
 
@@ -1175,7 +1175,7 @@ mod tests {
         let rating_newcomer = shrunk_rating(&mediocre_newcomer, TEST_RATING.k, baseline);
 
         // Volume alone must not lift the bad grinder above someone who merely
-        // played a couple of average rounds — the rating should track their
+        // played a couple of average rounds. The rating should track their
         // own poor average, not their participation count.
         assert!(
             rating_bad < rating_newcomer,
@@ -1197,8 +1197,8 @@ mod tests {
         let b = score_entry("@b:example.com", 100_000, 100); // avg 1000
 
         // Weighted: (1000 + 100000) / (10 + 100) = 918.18...
-        // A naive mean of the two per-player averages would give 550 instead
-        // — wrong, because it would let a low-volume player skew the
+        // A naive mean of the two per-player averages would give 550 instead:
+        // wrong, because it would let a low-volume player skew the
         // baseline as much as a high-volume one.
         let baseline = community_baseline(&[a, b], 1500.0);
         assert!((baseline - 918.18).abs() < 0.1, "baseline was {baseline}");
@@ -1214,7 +1214,7 @@ mod tests {
     #[test]
     fn legacy_style_entries_with_no_misses_behave_sanely() {
         // Every historical row defaults to missed=0, so guesses_answered ==
-        // guesses_played for all pre-existing data — completion should read
+        // guesses_played for all pre-existing data: completion should read
         // 100% and the rating/average math should behave exactly as before.
         let legacy = score_entry("@veteran-since-day-one:example.com", 4_000 * 30, 30);
 
@@ -1255,7 +1255,7 @@ mod tests {
     #[test]
     fn leaderboard_formatting_shows_rating_average_completion_and_volume() {
         // Single entry → the community baseline equals its own average, so
-        // shrinkage is a no-op and the rating is exactly the raw average —
+        // shrinkage is a no-op and the rating is exactly the raw average:
         // keeps the expected string deterministic.
         let text = format_leaderboard(
             vec![score_entry("@twenty-guesses:example.com", 100_000, 20)],
@@ -1265,7 +1265,7 @@ mod tests {
         );
 
         assert!(text.contains(
-            "🥇 1. @twenty-guesses:example.com · ⭐5000 ██████████ · 🎯5000/g · ✅100% · 🎮20 · 🏅100 km"
+            "🥇 1. @twenty-guesses:example.com\n⭐5000 ██████████\n🎯5000/g · ✅100% · 🎮20 · 🏅100 km"
         ));
     }
 
@@ -1296,8 +1296,8 @@ mod tests {
     #[test]
     fn month_start_utc_uses_configured_timezone_not_bare_utc() {
         let tz: Tz = "Europe/Berlin".parse().unwrap();
-        // Jan 1st 00:30 in Berlin (UTC+1 in winter) is still Dec 31st in UTC —
-        // the month boundary must follow the *local* midnight, not UTC's.
+        // Jan 1st 00:30 in Berlin (UTC+1 in winter) is still Dec 31st in UTC.
+        // The month boundary must follow the *local* midnight, not UTC's.
         let local_now = tz.with_ymd_and_hms(2026, 1, 1, 0, 30, 0).unwrap();
 
         let start = month_start_utc(tz, local_now);
@@ -1306,10 +1306,10 @@ mod tests {
     }
 
     /// Monthly and all-time leaderboards share the exact same sort/format
-    /// pipeline (`format_leaderboard` → `sort_score_leaderboard`) — the only
+    /// pipeline (`format_leaderboard` → `sort_score_leaderboard`). The only
     /// difference between them is which rounds the DB query includes before
     /// handing the board over. So tied entries (equal rating, equal volume,
-    /// *and* equal best distance — nothing left to distinguish them) must
+    /// *and* equal best distance, nothing left to distinguish them) must
     /// break the tie identically in both: alphabetically by user_id.
     #[test]
     fn ties_break_identically_regardless_of_leaderboard_type() {
@@ -1375,7 +1375,7 @@ mod tests {
         );
 
         assert!(text.starts_with("🏆 **August 2026 Leaderboard** · 5 rounds"));
-        // Raw "@user:server" mxid, unmodified — `format::mentionify` (applied
+        // Raw "@user:server" mxid, unmodified: `format::mentionify` (applied
         // uniformly wherever command output and round summaries are sent,
         // see main.rs/game.rs) turns this into a proper mention pill. The
         // formatter itself must never pre-render a display name or it would

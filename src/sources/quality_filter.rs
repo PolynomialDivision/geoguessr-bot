@@ -21,7 +21,7 @@
 //! when too many consecutive candidates are rejected, ensuring the prefetch
 //! pipeline never runs dry.
 //!
-//! No I/O, no allocations beyond input structs — safe at high frequency.
+//! No I/O, no allocations beyond input structs: safe at high frequency.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,7 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct SequenceFrame {
     pub lat: f64,
     pub lon: f64,
-    /// Unix milliseconds — used to sort frames into traversal order.
+    /// Unix milliseconds: used to sort frames into traversal order.
     pub captured_at_ms: Option<i64>,
     /// Camera heading in degrees [0, 360).  None = unavailable.
     pub compass_angle: Option<f32>,
@@ -42,10 +42,10 @@ pub struct SequenceFrame {
 /// of frames belonging to the same traversal.
 ///
 /// Three components (sub-weighted internally):
-/// - **Length**       (25%) — more frames → higher score; isolated frame penalty.
-/// - **Step consistency** (50%) — even, human-scale spacing; penalises GPS
+/// - **Length**       (25%): more frames → higher score; isolated frame penalty.
+/// - **Step consistency** (50%): even, human-scale spacing; penalises GPS
 ///   jumps > 200 m or duplicate positions < 0.1 m.
-/// - **Heading stability** (25%) — low mean angular change between frames;
+/// - **Heading stability** (25%): low mean angular change between frames;
 ///   neutral default when compass data is absent.
 pub fn score_sequence_continuity(frames: &[SequenceFrame]) -> f32 {
     match frames.len() {
@@ -70,7 +70,7 @@ fn score_seq_length(n: usize) -> f32 {
     }
     if n == 1 {
         return 0.1;
-    } // isolated frame — strong penalty
+    } // isolated frame: strong penalty
     const MAX: f64 = 15.0;
     ((n as f64 - 1.0) / (MAX - 1.0)).clamp(0.0, 1.0) as f32
 }
@@ -85,7 +85,7 @@ fn score_seq_length(n: usize) -> f32 {
 fn score_seq_steps(frames: &[SequenceFrame]) -> f32 {
     if frames.len() < 2 {
         return 0.5;
-    } // not enough data — neutral
+    } // not enough data: neutral
 
     let steps: Vec<f64> = frames
         .windows(2)
@@ -313,8 +313,8 @@ fn score_resolution(w: u32, h: u32) -> f32 {
         return 0.5;
     }
     let px = w as f64 * h as f64;
-    const MIN: f64 = 76_800.0; // 320 × 240  — barely usable
-    const MAX: f64 = 3_145_728.0; // 2048 × 1536 — solid quality
+    const MIN: f64 = 76_800.0; // 320 × 240, barely usable
+    const MAX: f64 = 3_145_728.0; // 2048 × 1536, solid quality
     ((px - MIN) / (MAX - MIN)).clamp(0.0, 1.0) as f32
 }
 
@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn blurry_image_rejected() {
-        // Low-res, moderately stale, sparse — with sharpness=0, this should reject
+        // Low-res, moderately stale, sparse, with sharpness=0, this should reject
         // and report "motion blur" as the weakest axis.
         let input = QualityInput {
             width: 1280,

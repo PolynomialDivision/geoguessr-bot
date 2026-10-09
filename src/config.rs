@@ -93,7 +93,7 @@ pub struct ScheduleConfig {
     #[serde(default = "default_photos_per_location")]
     pub photos_per_location: usize,
     /// Maximum guesses a player may submit per image.
-    /// 0 (default) = unlimited — each new guess overwrites the previous one.
+    /// 0 (default) = unlimited. Each new guess overwrites the previous one.
     /// 1 = only the first guess counts; subsequent attempts are rejected.
     #[serde(default)]
     pub max_guesses_per_player: u32,
@@ -103,7 +103,7 @@ pub struct ScheduleConfig {
     ///   500  = 50 km scores ~4512 pts.
     #[serde(default = "default_score_half_life_km")]
     pub score_half_life_km: f64,
-    /// Leaderboard rating tuning — see `RatingConfig`.
+    /// Leaderboard rating tuning, see `RatingConfig`.
     #[serde(default)]
     pub rating: RatingConfig,
 }
@@ -151,9 +151,9 @@ fn default_score_half_life_km() -> f64 {
 ///   rating = (n / (n + k)) * player_average + (k / (n + k)) * baseline
 ///
 /// where `n` is a player's guesses played (real submissions plus missed
-/// guesses, which count as 0 — see `Db::record_missed_guesses`), and
+/// guesses, which count as 0, see `Db::record_missed_guesses`), and
 /// `baseline` is the community's own average score per guess (derived from
-/// the leaderboard data itself, not configured here — see
+/// the leaderboard data itself, not configured here, see
 /// `commands::community_baseline`).
 #[derive(Deserialize, Clone, Copy)]
 pub struct RatingConfig {
@@ -165,7 +165,7 @@ pub struct RatingConfig {
     #[serde(default = "default_rating_k")]
     pub k: f64,
     /// Guesses played below which a leaderboard entry is flagged
-    /// "provisional" — not yet enough data to be a confident read on skill.
+    /// "provisional": not yet enough data to be a confident read on skill.
     /// Purely a display hint; does not change the rating math itself.
     #[serde(default = "default_provisional_threshold")]
     pub provisional_threshold: i64,
@@ -223,12 +223,12 @@ pub struct MapillaryConfig {
     #[serde(default)]
     pub access_token: String,
     /// Desired search radius in metres around the seed coordinate.
-    /// We search via Mapillary's `bbox` query (not `radius` — that param is
+    /// We search via Mapillary's `bbox` query (not `radius`: that param is
     /// capped by the API at 50 *metres*, far too small to find enough
     /// images). `bbox` has its own hard cap of "smaller than 0.01 degrees
     /// square", which works out to roughly 500 m–1.1 km per side depending
     /// on latitude. Any value here larger than that ceiling is silently
-    /// clamped down to it — there is no way to search a wider area via this
+    /// clamped down to it. There is no way to search a wider area via this
     /// endpoint. See `sources::mapillary::seed_bbox`.
     #[serde(default = "default_mapillary_radius")]
     pub search_radius: u32,
