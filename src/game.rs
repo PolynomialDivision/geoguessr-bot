@@ -1310,6 +1310,8 @@ pub async fn geocode(query: &str) -> Option<(f64, f64)> {
 
     let http = reqwest::Client::builder()
         .user_agent("geoguessr-bot/0.1 (matrix bot; contact: geoguessr-bot)")
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(20))
         .build()
         .ok()?;
 
@@ -1569,6 +1571,8 @@ async fn upload_all_images(client: &Client, img: &GeoImage) -> anyhow::Result<Ve
 async fn upload_http_url(client: &Client, url: &str) -> anyhow::Result<UploadedMedia> {
     let resp = reqwest::Client::builder()
         .user_agent("geoguessr-bot/0.1")
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
         .build()?
         .get(url)
         .send()

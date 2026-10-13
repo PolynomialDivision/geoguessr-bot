@@ -60,7 +60,24 @@ pub struct WebConfig {
     /// Address the bot listens on (e.g. "0.0.0.0:8080").
     pub bind_addr: String,
     /// Public base URL players open in their browser (no trailing slash).
+    /// Overridden by the environment variable [`PUBLIC_URL_ENV`] if it is set.
     pub public_url: String,
+}
+
+/// Environment variable that overrides `[web] public_url`, so the deployment can
+/// set the public address (e.g. after a domain change) without editing the config.
+pub const PUBLIC_URL_ENV: &str = "GEOGUESSR_PUBLIC_URL";
+
+impl WebConfig {
+    /// Uses `value` as `public_url` if it is set and not blank. A trailing slash is
+    /// dropped, because links are built as `{public_url}/g/{token}`.
+    pub fn apply_public_url_override(&mut self, value: Option<String>) {
+        if let Some(url) = value.map(|v| v.trim().trim_end_matches('/').to_owned()) {
+            if !url.is_empty() {
+                self.public_url = url;
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -246,4 +263,32 @@ pub struct LocalConfig {
     /// Directory that contains images and an `index.json` file.
     /// index.json format: array of { file, country, region, city?, attribution? }
     pub path: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn web() -> WebConfig {
+        WebConfig {
+            bind_addr: "0.0.0.0:80".to_owned(),
+            public_url: "https://old.example.net".to_owned(),
+        }
+    }
+
+    #[test]
+    fn public_url_override_replaces_the_config_value() {
+        let mut w = web();
+        w.apply_public_url_override(Some("https://geo.example.org/".to_owned()));
+        assert_eq!(w.public_url, "https://geo.example.org");
+    }
+
+    #[test]
+    fn missing_or_blank_override_keeps_the_config_value() {
+        let mut w = web();
+        w.apply_public_url_override(None);
+        assert_eq!(w.public_url, "https://old.example.net");
+        w.apply_public_url_override(Some("  ".to_owned()));
+        assert_eq!(w.public_url, "https://old.example.net");
+    }
 }

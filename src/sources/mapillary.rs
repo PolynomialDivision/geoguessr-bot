@@ -197,7 +197,11 @@ pub async fn fetch(
         bail!("Mapillary: access_token is not configured");
     }
 
-    let client = reqwest::Client::builder().user_agent(UA).build()?;
+    let client = reqwest::Client::builder()
+        .user_agent(UA)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
 
     let all_seeds = countries::location_seeds();
     let full_pool: Vec<&LocationSeed> = if cfg.countries.is_empty() {

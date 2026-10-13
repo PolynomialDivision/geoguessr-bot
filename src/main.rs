@@ -148,8 +148,12 @@ async fn command_reply(ctx: &BotContext, sender: &OwnedUserId, body: &str) -> Op
 async fn main() -> Result<()> {
     mxbot_common::logging::init("geoguessr_bot");
 
-    let config: Config =
+    let mut config: Config =
         mxbot_common::config::load_toml(&mxbot_common::config::config_path_from_args())?;
+    if let Some(web) = config.web.as_mut() {
+        web.apply_public_url_override(std::env::var(config::PUBLIC_URL_ENV).ok());
+        info!("Web public URL: {}", web.public_url);
+    }
     let config = Arc::new(config);
 
     let store_path = mxbot_common::config::store_path_from_env();
