@@ -17,7 +17,7 @@ use std::{
 };
 
 use anyhow::{bail, Result};
-use rand::seq::SliceRandom;
+use rand::{seq::SliceRandom, Rng as _};
 use serde::Deserialize;
 use tracing::{info, warn};
 
@@ -30,6 +30,12 @@ use crate::{
 };
 
 const API: &str = "https://graph.mapillary.com/images";
+
+/// Random points tried around each seed city when `spread_km` is set.
+const SPREAD_TRIES: usize = 3;
+
+/// A photo further than this from its seed city is labelled "near <city>".
+const NEAR_CITY_KM: f64 = 3.0;
 const UA: &str = "geoguessr-bot/0.1 (matrix bot)";
 
 /// Max candidate images to request per `bbox` query. Mapillary's documented
@@ -269,7 +275,38 @@ pub async fn fetch(
     let mut n_unconfirmed = 0u32;
     let mut n_other_failures = 0u32;
 
-    for seed in candidates.iter().take(10) {
+    // With `spread_km` every seed city is tried at a few random points
+    // around it instead of its centre: the countryside has far fewer photos,
+    // so one point would often find nothing.
+    let spread_km = cfg.spread_km.max(0.0);
+    let per_seed = if spread_km > 0.0 { SPREAD_TRIES } else { 1 };
+    let attempts: Vec<(LocationSeed, &LocationSeed)> = {
+        let mut rng = rand::thread_rng();
+        candidates
+            .iter()
+            .take(10)
+            .flat_map(|&origin| {
+                (0..per_seed)
+                    .map(|_| {
+                        let (lat, lon) = if spread_km > 0.0 {
+                            spread_point(origin.lat, origin.lon, spread_km, rng.gen(), rng.gen())
+                        } else {
+                            (origin.lat, origin.lon)
+                        };
+                        let seed = LocationSeed {
+                            country: origin.country,
+                            city: origin.city,
+                            lat,
+                            lon,
+                        };
+                        (seed, origin)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+
+    for (seed, origin) in &attempts {
         n_tried += 1;
         match try_seed(
             &client,
@@ -283,7 +320,12 @@ pub async fn fetch(
         )
         .await
         {
-            Ok(Some(img)) => {
+            Ok(Some(mut img)) => {
+                if let (Some(lat), Some(lon)) = (img.lat, img.lon) {
+                    if haversine_km(lat, lon, origin.lat, origin.lon) > NEAR_CITY_KM {
+                        img.city = Some(format!("near {}", origin.city));
+                    }
+                }
                 info!(
                     "Mapillary: found {} photo(s) for {} ({}): nearest existing {:.0} km",
                     1 + img.extra_image_urls.len(),
@@ -322,6 +364,21 @@ pub async fn fetch(
 }
 
 // ── Internals ─────────────────────────────────────────────────────────────────
+
+/// A point up to `spread_km` from (`lat`, `lon`), spread evenly over the
+/// disc: `u` picks the distance (√u, so the outskirts get their fair share
+/// of the area), `v` the bearing, both in 0..1.
+fn spread_point(lat: f64, lon: f64, spread_km: f64, u: f64, v: f64) -> (f64, f64) {
+    const EARTH_KM: f64 = 6371.0;
+    let d = spread_km * u.clamp(0.0, 1.0).sqrt() / EARTH_KM;
+    let bearing = v * std::f64::consts::TAU;
+    let (lat1, lon1) = (lat.to_radians(), lon.to_radians());
+    let lat2 = (lat1.sin() * d.cos() + lat1.cos() * d.sin() * bearing.cos()).asin();
+    let lon2 =
+        lon1 + (bearing.sin() * d.sin() * lat1.cos()).atan2(d.cos() - lat1.sin() * lat2.sin());
+    let lon2 = (lon2.to_degrees() + 540.0).rem_euclid(360.0) - 180.0;
+    (lat2.to_degrees(), lon2)
+}
 
 /// Coarse reason bucket for a single seed's failure, used only to build the
 /// aggregate diagnostic summary `fetch()` logs when it exhausts all seeds,
@@ -1032,6 +1089,30 @@ fn sequence_score_for(candidates: &[MapillaryImage], primary_idx: usize) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spread_points_stay_inside_the_chosen_radius() {
+        let (lat, lon) = (45.7640, 4.8357); // Lyon
+        for i in 0..50 {
+            let (u, v) = (i as f64 / 49.0, (i * 7 % 50) as f64 / 50.0);
+            let (la, lo) = spread_point(lat, lon, 40.0, u, v);
+            let d = haversine_km(lat, lon, la, lo);
+            assert!(d <= 40.0 + 1e-6, "{d} km is outside the spread");
+        }
+        // u = 1 lands right on the edge, u = 0 on the city itself.
+        let (la, lo) = spread_point(lat, lon, 40.0, 1.0, 0.25);
+        assert!((haversine_km(lat, lon, la, lo) - 40.0).abs() < 0.01);
+        let (la, lo) = spread_point(lat, lon, 40.0, 0.0, 0.6);
+        assert!(haversine_km(lat, lon, la, lo) < 1e-9);
+    }
+
+    #[test]
+    fn spread_points_wrap_around_the_date_line() {
+        let (la, lo) = spread_point(-17.7, 179.99, 30.0, 1.0, 0.25); // east of Fiji
+        assert!((-180.0..=180.0).contains(&lo), "longitude {lo}");
+        assert!(lo < 0.0, "crossed to the western side");
+        assert!((haversine_km(-17.7, 179.99, la, lo) - 30.0).abs() < 0.01);
+    }
 
     #[test]
     fn seed_bbox_never_exceeds_mapillarys_bbox_size_limit() {

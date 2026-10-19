@@ -29,8 +29,8 @@ game_times = ["19:00"]
 
 # Game mode: "multiple_choice" (default) or "free_guess".
 #   multiple_choice: 4 country options; react 🇦🇧🇨🇩 or type !a/!b/!c/!d
-#   free_guess: type any location in the DM; scored by Haversine distance
-#                     (GeoGuessr-style: 5000 pts at 0 km, ~1800 at 2000 km)
+#   free_guess: type any location in the DM; on every image each player
+#                     duels every other, the closer guess (to the metre) wins
 #                     Accepts: city, country, full address (street + postcode),
 #                              or raw lat,lon coordinates.
 # game_mode = "multiple_choice"
@@ -56,25 +56,15 @@ reminder_before_secs = 300
 # IANA timezone for scheduling.
 timezone = "Europe/Berlin"
 
-[schedule.rating]
-# Leaderboard rating = a Bayesian-shrinkage estimate of skill:
-#   rating = (n / (n + k)) * player_average + (k / (n + k)) * baseline
-# `n` is guesses played, counting missed/no-guess rounds as 0 (so skipping a
-# hard guess can't inflate your average). `baseline` is derived automatically
-# from the community's own average score per guess, not set here.
-#
-# How many "prior" guesses worth of pull toward the baseline a rating gets.
-# Higher = trusts a small sample less; lower = trusts it sooner. At n = k a
-# player's rating is exactly halfway between their own average and baseline.
-# k = 15
-
-# Guesses played below which a leaderboard entry is flagged "provisional"
-# (🔰): a display hint only, doesn't change the rating math.
-# provisional_threshold = 10
-
-# Rating baseline used only when there's no community data yet (e.g. right
-# after !resetstats). Ignored once any guesses exist.
-# baseline_fallback = 1500.0
+[schedule.leaderboard]
+# Rankings come from duels: on every image each player meets every other
+# player once, the closer guess (to the metre) wins +1, the same metre is ½
+# each, and a player who joined but didn't guess loses to everyone who did.
+# The monthly board adds up duel points (playing more counts). The 90-day and
+# all-time boards rank by the share of duels won, once a player has this many
+# images; below it they are listed apart. Nothing shifts afterwards: every
+# image's result is fixed when it closes.
+# min_images = 20
 
 [sources]
 # Sources to draw images from. Supported: "wikimedia", "mapillary", "local".
@@ -92,6 +82,12 @@ access_token  = "MLY|REPLACE_ME"
 search_radius = 5000
 # Optional: only seed in these ISO 3166-1 alpha-2 countries.
 # countries = ["DE", "FR", "IT", "ES", "GB"]
+# Difficulty. 0 (default) searches each seed city's centre. A value in km
+# searches at random points up to that far around the city instead (three
+# tries per city, the countryside has fewer photos): 10 reaches the suburbs,
+# 30 to 50 the countryside. Photos found more than 3 km out are revealed as
+# "near <city>". Images already in the cache are used up first.
+# spread_km = 0
 
 [sources.wikimedia]
 # Geosearch radius in metres (default 50 000).

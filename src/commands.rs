@@ -594,7 +594,12 @@ fn record_line(s: &Standing) -> String {
     parts.join(" · ")
 }
 
-fn format_leaderboard(mut board: Vec<Standing>, header: &str, round_count: i64, order: Order) -> String {
+fn format_leaderboard(
+    mut board: Vec<Standing>,
+    header: &str,
+    round_count: i64,
+    order: Order,
+) -> String {
     let mut lines = vec![format!("🏆 **{header}** · {round_count} rounds")];
     let (ranked, unranked) = match order {
         Order::Points => {
@@ -603,7 +608,9 @@ fn format_leaderboard(mut board: Vec<Standing>, header: &str, round_count: i64, 
             (board, Vec::new())
         }
         Order::Rate { min_images } => {
-            lines.push(format!("⚔️ Ranked by the share of duels won, from {min_images} images."));
+            lines.push(format!(
+                "⚔️ Ranked by the share of duels won, from {min_images} images."
+            ));
             let (mut ranked, mut unranked): (Vec<_>, Vec<_>) = board
                 .into_iter()
                 .partition(|s| s.images >= min_images && s.duels > 0);
@@ -723,7 +730,12 @@ pub async fn build_monthly_leaderboard(ctx: &BotContext) -> Option<String> {
         "{} Leaderboard",
         chrono::Utc::now().with_timezone(&tz).format("%B %Y")
     );
-    Some(format_leaderboard(board, &header, round_count, Order::Points))
+    Some(format_leaderboard(
+        board,
+        &header,
+        round_count,
+        Order::Points,
+    ))
 }
 
 // ── !mystats ──────────────────────────────────────────────────────────────────
@@ -754,7 +766,10 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
     let rank_str = match me {
         Some(s) if s.images >= min_images && s.duels > 0 => {
             let rank = board.iter().position(|e| e.user_id == user).unwrap_or(0) + 1;
-            let ranked = board.iter().filter(|e| e.images >= min_images && e.duels > 0).count();
+            let ranked = board
+                .iter()
+                .filter(|e| e.images >= min_images && e.duels > 0)
+                .count();
             format!(" · rank #{rank} of {ranked}")
         }
         _ => String::new(),
@@ -893,7 +908,8 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
 
     let mode_line = "🗺️ Free guess: type a place in your private chat.\n\
                      🏙️ City, country, address or lat,lon.\n\
-                     📏 Scored by distance.";
+                     ⚔️ Closest wins: +1 for every player you beat, ½ for a tie.\n\
+                     😴 Joined but no guess loses the duel.";
 
     let photos_line = if s.photos_per_location > 1 {
         format!("\n📸 {} photos per guess", s.photos_per_location)
@@ -1019,7 +1035,9 @@ mod tests {
         );
         assert!(text.starts_with("🏆 **October 2026 Leaderboard** · 17 rounds"));
         assert!(text.contains("+1 for every player you beat"));
-        let busy = text.find("🥇 1. @busy:example.com").expect("busy leads on points");
+        let busy = text
+            .find("🥇 1. @busy:example.com")
+            .expect("busy leads on points");
         assert!(text.find("🥈 2. @sharp:example.com").unwrap() > busy);
         assert!(text.contains("⚔️ 20½ of 40 duels · 51%"));
         assert!(text.contains("👑 10 · 🎮 17 · 🏅 3 m"));
@@ -1039,11 +1057,18 @@ mod tests {
             40,
             Order::Rate { min_images: 20 },
         );
-        let sharp = text.find("🥇 1. @sharp:example.com").expect("80% beats 50%");
+        let sharp = text
+            .find("🥇 1. @sharp:example.com")
+            .expect("80% beats 50%");
         assert!(text.find("🥈 2. @busy:example.com").unwrap() > sharp);
-        assert!(text.contains("🔰 Not ranked yet, under 20 images:
-▪️ @lucky:example.com · 🎮 2"));
-        assert!(!text.contains(". @lucky"), "two lucky images don't top the board");
+        assert!(text.contains(
+            "🔰 Not ranked yet, under 20 images:
+▪️ @lucky:example.com · 🎮 2"
+        ));
+        assert!(
+            !text.contains(". @lucky"),
+            "two lucky images don't top the board"
+        );
     }
 
     #[test]

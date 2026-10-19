@@ -25,32 +25,6 @@ pub struct LeaderboardEntry {
     pub rounds_played: i64,
 }
 
-pub struct RoundStatsEntry {
-    pub user_id: String,
-    pub total_score: i64,
-    pub guesses_played: i64,
-    pub avg_distance_km: f64,
-    pub best_distance_km: f64,
-}
-
-pub struct ScoreLeaderboardEntry {
-    pub user_id: String,
-    pub total_score: i64,
-    pub rounds_played: i64,
-    /// Total guesses counted toward this player: real submissions PLUS
-    /// missed/no-guess rounds recorded as 0 (see `Db::record_missed_guesses`).
-    /// This is the denominator for both the raw average and the leaderboard
-    /// rating, so a player can't inflate either by skipping hard guesses.
-    pub guesses_played: i64,
-    /// Of `guesses_played`, how many were real player submissions (i.e.
-    /// `guesses_played - guesses_answered` is the missed count).
-    pub guesses_answered: i64,
-    /// Average Haversine distance across real (non-missed) guesses (km).
-    pub avg_distance_km: f64,
-    /// Best (closest) single guess ever (km).
-    pub best_distance_km: f64,
-}
-
 pub struct UserStatsRow {
     pub total_correct: i64,
     pub total_questions: i64,
@@ -222,7 +196,7 @@ impl Db {
     }
 
     /// Number of rounds started at/after `since` (a UTC instant). Used for
-    /// the monthly leaderboard's round count, see `score_leaderboard_month`.
+    /// the monthly and 90-day leaderboards' round count.
     pub async fn round_count_since(&self, since: DateTime<Utc>) -> Result<i64> {
         let since_str = since.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
         self.run(move |conn| {
@@ -549,183 +523,12 @@ impl Db {
         })
         .await
     }
-
-    /// Leaderboard ranked by total GeoGuessr score (free-guess mode).
-    /// Also returns avg distance and images played per user.
-    pub async fn round_stats(&self, round_id: i64) -> Result<Vec<RoundStatsEntry>> {
-        self.run(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT user_id,
-                        SUM(score)         AS total_score,
-                        COUNT(*)           AS guesses_played,
-                        AVG(distance_km)   AS avg_distance_km,
-                        MIN(distance_km)   AS best_distance_km
-                   FROM answers
-                  WHERE round_id = ?1
-                    AND distance_km IS NOT NULL
-                  GROUP BY user_id
-                  ORDER BY total_score DESC",
-            )?;
-            let rows = stmt.query_map([round_id], |r| {
-                Ok(RoundStatsEntry {
-                    user_id: r.get(0)?,
-                    total_score: r.get(1)?,
-                    guesses_played: r.get(2)?,
-                    avg_distance_km: r.get(3)?,
-                    best_distance_km: r.get(4)?,
-                })
-            })?;
-            rows.map(|r| r.context("reading round stats row")).collect()
-        })
-        .await
-    }
-
-    /// All-time leaderboard: includes every round ever played.
-    ///
-    /// `guesses_played` counts every answer row (real + missed) so a player's
-    /// average and rating reflect every guess they were on the hook for, not
-    /// just the ones they chose to submit. `guesses_answered` (real
-    /// submissions only) is kept separately for completion-rate display, and
-    /// distance stats are computed only from real (non-missed) rows.
-    pub async fn score_leaderboard_alltime(&self) -> Result<Vec<ScoreLeaderboardEntry>> {
-        self.run(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT rs.user_id,
-                        SUM(rs.total_score)                AS total_score,
-                        COUNT(DISTINCT rs.round_id)        AS rounds_played,
-                        COALESCE(a.guesses_played, 0)      AS guesses_played,
-                        COALESCE(a.guesses_answered, 0)    AS guesses_answered,
-                        COALESCE(a.avg_distance_km, 0.0)   AS avg_distance_km,
-                        COALESCE(a.best_distance_km, 0.0)  AS best_distance_km
-                   FROM round_scores rs
-                   LEFT JOIN (
-                       SELECT user_id,
-                              COUNT(*) AS guesses_played,
-                              SUM(CASE WHEN missed = 0 THEN 1 ELSE 0 END) AS guesses_answered,
-                              AVG(CASE WHEN missed = 0 THEN distance_km END) AS avg_distance_km,
-                              MIN(CASE WHEN missed = 0 THEN distance_km END) AS best_distance_km
-                         FROM answers
-                        GROUP BY user_id
-                   ) a ON a.user_id = rs.user_id
-                  GROUP BY rs.user_id",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok(ScoreLeaderboardEntry {
-                    user_id: r.get(0)?,
-                    total_score: r.get(1)?,
-                    rounds_played: r.get(2)?,
-                    guesses_played: r.get(3)?,
-                    guesses_answered: r.get(4)?,
-                    avg_distance_km: r.get(5)?,
-                    best_distance_km: r.get(6)?,
-                })
-            })?;
-            rows.map(|r| r.context("reading score leaderboard row"))
-                .collect()
-        })
-        .await
-    }
-
-    /// Rolling leaderboard, only rounds from the last 90 days.
-    /// Same real-vs-missed split as `score_leaderboard_alltime`; see there.
-    pub async fn score_leaderboard(&self) -> Result<Vec<ScoreLeaderboardEntry>> {
-        self.run(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT rs.user_id,
-                        SUM(rs.total_score)                AS total_score,
-                        COUNT(DISTINCT rs.round_id)        AS rounds_played,
-                        COALESCE(a.guesses_played, 0)      AS guesses_played,
-                        COALESCE(a.guesses_answered, 0)    AS guesses_answered,
-                        COALESCE(a.avg_distance_km, 0.0)   AS avg_distance_km,
-                        COALESCE(a.best_distance_km, 0.0)  AS best_distance_km
-                   FROM round_scores rs
-                   JOIN rounds ro ON ro.id = rs.round_id
-                    AND ro.started_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-90 days')
-                   LEFT JOIN (
-                       SELECT ans.user_id,
-                              COUNT(*) AS guesses_played,
-                              SUM(CASE WHEN ans.missed = 0 THEN 1 ELSE 0 END) AS guesses_answered,
-                              AVG(CASE WHEN ans.missed = 0 THEN ans.distance_km END) AS avg_distance_km,
-                              MIN(CASE WHEN ans.missed = 0 THEN ans.distance_km END) AS best_distance_km
-                         FROM answers ans
-                         JOIN guesses g  ON g.id  = ans.guess_id
-                         JOIN rounds  ri ON ri.id = g.round_id
-                        WHERE ri.started_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-90 days')
-                        GROUP BY ans.user_id
-                   ) a ON a.user_id = rs.user_id
-                  GROUP BY rs.user_id",
-            )?;
-            let rows = stmt.query_map([], |r| Ok(ScoreLeaderboardEntry {
-                user_id:          r.get(0)?,
-                total_score:      r.get(1)?,
-                rounds_played:    r.get(2)?,
-                guesses_played:   r.get(3)?,
-                guesses_answered: r.get(4)?,
-                avg_distance_km:  r.get(5)?,
-                best_distance_km: r.get(6)?,
-            }))?;
-            rows.map(|r| r.context("reading score leaderboard row")).collect()
-        })
-        .await
-    }
-
-    /// Calendar-month leaderboard: only rounds started at/after `since` (a
-    /// UTC instant marking the start of the target month in the bot's
-    /// configured timezone, see `commands::current_month_start_utc`). Same
-    /// real-vs-missed split as `score_leaderboard_alltime`; see there. This
-    /// is purely a filtered view of the same persisted `rounds`/`answers`
-    /// data: no separate monthly score state to keep in sync, so a bot
-    /// restart or a month rolling over can never duplicate or drift scores.
-    pub async fn score_leaderboard_month(
-        &self,
-        since: DateTime<Utc>,
-    ) -> Result<Vec<ScoreLeaderboardEntry>> {
-        let since_str = since.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-        self.run(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT rs.user_id,
-                        SUM(rs.total_score)                AS total_score,
-                        COUNT(DISTINCT rs.round_id)        AS rounds_played,
-                        COALESCE(a.guesses_played, 0)      AS guesses_played,
-                        COALESCE(a.guesses_answered, 0)    AS guesses_answered,
-                        COALESCE(a.avg_distance_km, 0.0)   AS avg_distance_km,
-                        COALESCE(a.best_distance_km, 0.0)  AS best_distance_km
-                   FROM round_scores rs
-                   JOIN rounds ro ON ro.id = rs.round_id
-                    AND ro.started_at >= ?1
-                   LEFT JOIN (
-                       SELECT ans.user_id,
-                              COUNT(*) AS guesses_played,
-                              SUM(CASE WHEN ans.missed = 0 THEN 1 ELSE 0 END) AS guesses_answered,
-                              AVG(CASE WHEN ans.missed = 0 THEN ans.distance_km END) AS avg_distance_km,
-                              MIN(CASE WHEN ans.missed = 0 THEN ans.distance_km END) AS best_distance_km
-                         FROM answers ans
-                         JOIN guesses g  ON g.id  = ans.guess_id
-                         JOIN rounds  ri ON ri.id = g.round_id
-                        WHERE ri.started_at >= ?1
-                        GROUP BY ans.user_id
-                   ) a ON a.user_id = rs.user_id
-                  GROUP BY rs.user_id",
-            )?;
-            let rows = stmt.query_map(params![since_str], |r| Ok(ScoreLeaderboardEntry {
-                user_id:          r.get(0)?,
-                total_score:      r.get(1)?,
-                rounds_played:    r.get(2)?,
-                guesses_played:   r.get(3)?,
-                guesses_answered: r.get(4)?,
-                avg_distance_km:  r.get(5)?,
-                best_distance_km: r.get(6)?,
-            }))?;
-            rows.map(|r| r.context("reading score leaderboard row")).collect()
-        })
-        .await
-    }
 }
 
 // ── Duels ─────────────────────────────────────────────────────────────────────
 
 impl Db {
-    /// Every free-guess row (real and missed) of rounds started at/after
+    /// Every free-guess row (real with a distance, or missed) of rounds started at/after
     /// `since` (all rounds when `None`), the input for `duels::standings`.
     pub async fn duel_entries(&self, since: Option<DateTime<Utc>>) -> Result<Vec<Entry>> {
         let since_str = since
@@ -736,8 +539,9 @@ impl Db {
                 "SELECT a.guess_id, a.user_id, a.missed, a.distance_km
                    FROM answers a
                    JOIN rounds r ON r.id = a.round_id
-                  WHERE a.source IN ('free_guess', 'missed')
-                    AND r.started_at >= ?1",
+                  WHERE (a.distance_km IS NOT NULL OR a.missed = 1)
+                    AND r.started_at >= ?1
+                  ORDER BY a.guess_id, a.user_id",
             )?;
             let rows = stmt.query_map(params![since_str], |r| {
                 let missed: i64 = r.get(2)?;
@@ -759,7 +563,8 @@ impl Db {
             let mut stmt = conn.prepare(
                 "SELECT guess_id, user_id, missed, distance_km
                    FROM answers
-                  WHERE round_id = ?1 AND source IN ('free_guess', 'missed')",
+                  WHERE round_id = ?1 AND (distance_km IS NOT NULL OR missed = 1)
+                  ORDER BY guess_id, user_id",
             )?;
             let rows = stmt.query_map(params![round_id], |r| {
                 let missed: i64 = r.get(2)?;
@@ -1152,21 +957,20 @@ mod tests {
             .await
             .unwrap();
         db.finish_guess(guess_id, 3, 1).await.unwrap();
-        // Verify via round_stats (indirect).
-        let stats = db.round_stats(round_id).await.unwrap();
-        assert!(stats.is_empty()); // no answer rows → no stats rows
+        // Verify via the duel rows (indirect).
+        let rows = db.round_duel_entries(round_id).await.unwrap();
+        assert!(rows.is_empty()); // no answer rows → no duel rows
     }
 
-    // ── Missed guesses ────────────────────────────────────────────────────────
+    // ── Duel rows ─────────────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn record_missed_guesses_counts_as_zero_in_leaderboard() {
-        let db = mem_db().await;
-        let round_id = db.start_round("!r:example.com", 1, "test").await.unwrap();
+    /// Test-only: one image in `round_id`, `(user, Some(km))` guessed,
+    /// `(user, None)` joined but missed.
+    async fn add_image(db: &Db, round_id: i64, num: u32, players: &[(&str, Option<f64>)]) -> i64 {
         let guess_id = db
             .start_guess(
                 round_id,
-                1,
+                num,
                 "France",
                 "Europe",
                 None,
@@ -1180,110 +984,100 @@ mod tests {
             )
             .await
             .unwrap();
+        let real = players
+            .iter()
+            .filter_map(|(u, d)| {
+                d.map(|d| {
+                    (
+                        (*u).to_owned(),
+                        "48.85,2.35".to_owned(),
+                        48.85,
+                        2.35,
+                        d,
+                        4999,
+                    )
+                })
+            })
+            .collect();
+        db.record_free_guess_answers(guess_id, round_id, real)
+            .await
+            .unwrap();
+        let missed: Vec<String> = players
+            .iter()
+            .filter(|(_, d)| d.is_none())
+            .map(|(u, _)| (*u).to_owned())
+            .collect();
+        db.record_missed_guesses(guess_id, round_id, &missed)
+            .await
+            .unwrap();
+        guess_id
+    }
 
-        // @alice answers for real; @bob is on the roster but never guesses.
-        db.record_free_guess_answers(
-            guess_id,
+    #[tokio::test]
+    async fn missed_guesses_come_back_as_missed_duel_rows() {
+        let db = mem_db().await;
+        let round_id = db.start_round("!r:example.com", 1, "test").await.unwrap();
+        add_image(
+            &db,
             round_id,
-            vec![(
-                "@alice:example.com".to_owned(),
-                "Paris".to_owned(),
-                48.85,
-                2.35,
-                0.0,
-                5000,
-            )],
+            1,
+            &[
+                ("@alice:example.com", Some(0.004)),
+                ("@bob:example.com", None),
+            ],
         )
-        .await
-        .unwrap();
-        db.record_missed_guesses(guess_id, round_id, &["@bob:example.com".to_owned()])
-            .await
-            .unwrap();
+        .await;
 
-        let mut scores = HashMap::new();
-        scores.insert("@alice:example.com".to_owned(), 5000i64);
-        scores.insert("@bob:example.com".to_owned(), 0i64);
-        db.upsert_round_scores_free_guess(round_id, &scores)
-            .await
-            .unwrap();
-
-        let board = db.score_leaderboard_alltime().await.unwrap();
+        let rows = db.duel_entries(None).await.unwrap();
+        let board = crate::duels::standings(&rows);
         let alice = board
             .iter()
-            .find(|e| e.user_id == "@alice:example.com")
+            .find(|s| s.user_id == "@alice:example.com")
             .unwrap();
         let bob = board
             .iter()
-            .find(|e| e.user_id == "@bob:example.com")
+            .find(|s| s.user_id == "@bob:example.com")
             .unwrap();
-
-        assert_eq!(alice.guesses_played, 1);
-        assert_eq!(alice.guesses_answered, 1);
-        assert_eq!(alice.total_score, 5000);
-
-        // The missed guess still counts: it shows up as a played (but not
-        // answered) guess with 0 score, and the round still counts for @bob.
-        assert_eq!(bob.guesses_played, 1);
-        assert_eq!(bob.guesses_answered, 0);
-        assert_eq!(bob.total_score, 0);
-        assert_eq!(bob.rounds_played, 1);
+        assert_eq!(
+            (alice.halves, alice.duels, alice.best_km),
+            (2, 1, Some(0.004))
+        );
+        assert_eq!((bob.halves, bob.duels, bob.missed), (0, 1, 1));
+        assert_eq!(rows, db.round_duel_entries(round_id).await.unwrap());
     }
 
     #[tokio::test]
     async fn record_missed_guesses_does_not_clobber_a_real_answer() {
         let db = mem_db().await;
         let round_id = db.start_round("!r:example.com", 1, "test").await.unwrap();
-        let guess_id = db
-            .start_guess(
-                round_id,
-                1,
-                "Japan",
-                "Asia",
-                None,
-                "test",
-                None,
-                &[],
-                0,
-                90,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-
-        db.record_free_guess_answers(
-            guess_id,
-            round_id,
-            vec![(
-                "@late:example.com".to_owned(),
-                "Tokyo".to_owned(),
-                35.6,
-                139.7,
-                12.3,
-                4800,
-            )],
-        )
-        .await
-        .unwrap();
+        let guess_id = add_image(&db, round_id, 1, &[("@late:example.com", Some(12.3))]).await;
         // Defensive: a real answer must win even if a miss is also recorded
         // for the same (guess, user). DO NOTHING on conflict.
         db.record_missed_guesses(guess_id, round_id, &["@late:example.com".to_owned()])
             .await
             .unwrap();
 
-        let mut scores = HashMap::new();
-        scores.insert("@late:example.com".to_owned(), 4800i64);
-        db.upsert_round_scores_free_guess(round_id, &scores)
-            .await
-            .unwrap();
+        let rows = db.duel_entries(None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].dist_km, Some(12.3));
+    }
 
-        let board = db.score_leaderboard_alltime().await.unwrap();
-        let late = board
-            .iter()
-            .find(|e| e.user_id == "@late:example.com")
-            .unwrap();
-        assert_eq!(late.guesses_answered, 1);
-        assert_eq!(late.total_score, 4800);
+    #[tokio::test]
+    async fn multiple_choice_answers_are_not_duels() {
+        let db = mem_db().await;
+        let round_id = db.start_round("!r:example.com", 1, "test").await.unwrap();
+        let guess_id = add_image(&db, round_id, 1, &[("@alice:example.com", Some(1.0))]).await;
+        db.run(move |conn| {
+            conn.execute(
+                "INSERT INTO answers (guess_id, round_id, user_id, source) VALUES (?1, ?2, '@mc:example.com', 'reaction')",
+                params![guess_id, round_id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let rows = db.duel_entries(None).await.unwrap();
+        assert!(rows.iter().all(|e| e.user_id != "@mc:example.com"));
     }
 
     #[tokio::test]
@@ -1396,17 +1190,14 @@ mod tests {
 
         db.migrate().await.unwrap();
 
-        // Old data survives, defaults to missed=0, and is fully queryable
-        // through the leaderboard query that now depends on that column.
-        let board = db.score_leaderboard_alltime().await.unwrap();
-        let entry = board
+        // Old data survives, defaults to missed=0, and is read back as a real
+        // guess by the duel query that now depends on that column.
+        let rows = db.duel_entries(None).await.unwrap();
+        let old = rows
             .iter()
             .find(|e| e.user_id == "@old-timer:example.com")
             .unwrap();
-        assert_eq!(entry.total_score, 4900);
-        assert_eq!(entry.guesses_played, 1);
-        assert_eq!(entry.guesses_answered, 1);
-        assert_eq!(entry.rounds_played, 1);
+        assert_eq!(old.dist_km, Some(5.0));
 
         // And the new missed-guess write path works on the migrated table.
         let guess_id = db.find_guess_id(1, 1).await.unwrap();
@@ -1414,16 +1205,15 @@ mod tests {
             .await
             .unwrap();
 
-        // And the monthly leaderboard query (added after this migration
-        // existed) also works against the migrated table.
+        // And a period filter also works against the migrated table.
         let since = "2000-01-01T00:00:00.000Z".parse::<DateTime<Utc>>().unwrap();
-        let monthly = db.score_leaderboard_month(since).await.unwrap();
-        assert!(monthly
+        let rows = db.duel_entries(Some(since)).await.unwrap();
+        assert!(rows
             .iter()
-            .any(|e| e.user_id == "@old-timer:example.com"));
+            .any(|e| e.user_id == "@newcomer:example.com" && e.dist_km.is_none()));
     }
 
-    // ── Monthly leaderboard ───────────────────────────────────────────────────
+    // ── Periods ───────────────────────────────────────────────────────────────
 
     /// Test-only: back-date a round's `started_at` so month-boundary
     /// filtering can be exercised deterministically instead of racing the
@@ -1442,142 +1232,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn monthly_leaderboard_excludes_previous_month_but_alltime_includes_it() {
+    async fn a_period_excludes_earlier_rounds_but_all_time_includes_them() {
         let db = mem_db().await;
-
-        let july_round = db.start_round("!r:example.com", 1, "test").await.unwrap();
-        set_round_started_at(&db, july_round, "2026-07-15T12:00:00.000Z").await;
-        let mut july_scores = HashMap::new();
-        july_scores.insert("@alice:example.com".to_owned(), 5000i64);
-        db.upsert_round_scores_free_guess(july_round, &july_scores)
-            .await
-            .unwrap();
-
-        let august_round = db.start_round("!r:example.com", 1, "test").await.unwrap();
-        set_round_started_at(&db, august_round, "2026-08-15T12:00:00.000Z").await;
-        let mut august_scores = HashMap::new();
-        august_scores.insert("@alice:example.com".to_owned(), 3000i64);
-        db.upsert_round_scores_free_guess(august_round, &august_scores)
-            .await
-            .unwrap();
+        let july = db.start_round("!r:example.com", 1, "test").await.unwrap();
+        set_round_started_at(&db, july, "2026-07-15T12:00:00.000Z").await;
+        add_image(&db, july, 1, &[("@alice:example.com", Some(1.0))]).await;
+        let august = db.start_round("!r:example.com", 1, "test").await.unwrap();
+        set_round_started_at(&db, august, "2026-08-15T12:00:00.000Z").await;
+        add_image(&db, august, 1, &[("@alice:example.com", Some(2.0))]).await;
 
         let august_start = "2026-08-01T00:00:00.000Z".parse::<DateTime<Utc>>().unwrap();
-
-        // All-time still includes both months' rounds.
-        let alltime = db.score_leaderboard_alltime().await.unwrap();
-        let alice_all = alltime
-            .iter()
-            .find(|e| e.user_id == "@alice:example.com")
-            .unwrap();
-        assert_eq!(alice_all.total_score, 8000);
-        assert_eq!(alice_all.rounds_played, 2);
-
-        // Monthly only includes the August round.
-        let monthly = db.score_leaderboard_month(august_start).await.unwrap();
-        let alice_month = monthly
-            .iter()
-            .find(|e| e.user_id == "@alice:example.com")
-            .unwrap();
-        assert_eq!(alice_month.total_score, 3000);
-        assert_eq!(alice_month.rounds_played, 1);
-
+        assert_eq!(db.duel_entries(None).await.unwrap().len(), 2);
+        let month = db.duel_entries(Some(august_start)).await.unwrap();
+        assert_eq!(month.len(), 1);
+        assert_eq!(month[0].dist_km, Some(2.0));
         assert_eq!(db.round_count_since(august_start).await.unwrap(), 1);
         assert_eq!(db.round_count().await.unwrap(), 2);
     }
 
     #[tokio::test]
-    async fn monthly_leaderboard_handles_december_to_january_rollover() {
+    async fn a_period_handles_december_to_january_rollover() {
         let db = mem_db().await;
-
-        let december_round = db.start_round("!r:example.com", 1, "test").await.unwrap();
-        set_round_started_at(&db, december_round, "2025-12-20T09:00:00.000Z").await;
-        let mut december_scores = HashMap::new();
-        december_scores.insert("@alice:example.com".to_owned(), 4000i64);
-        db.upsert_round_scores_free_guess(december_round, &december_scores)
-            .await
-            .unwrap();
-
-        let january_round = db.start_round("!r:example.com", 1, "test").await.unwrap();
-        set_round_started_at(&db, january_round, "2026-01-05T09:00:00.000Z").await;
-        let mut january_scores = HashMap::new();
-        january_scores.insert("@alice:example.com".to_owned(), 2500i64);
-        db.upsert_round_scores_free_guess(january_round, &january_scores)
-            .await
-            .unwrap();
+        let december = db.start_round("!r:example.com", 1, "test").await.unwrap();
+        set_round_started_at(&db, december, "2025-12-20T09:00:00.000Z").await;
+        add_image(&db, december, 1, &[("@alice:example.com", Some(1.0))]).await;
+        let january = db.start_round("!r:example.com", 1, "test").await.unwrap();
+        set_round_started_at(&db, january, "2026-01-05T09:00:00.000Z").await;
+        add_image(&db, january, 1, &[("@alice:example.com", None)]).await;
 
         let january_start = "2026-01-01T00:00:00.000Z".parse::<DateTime<Utc>>().unwrap();
-
-        let monthly = db.score_leaderboard_month(january_start).await.unwrap();
-        let alice = monthly
-            .iter()
-            .find(|e| e.user_id == "@alice:example.com")
-            .unwrap();
-        assert_eq!(alice.total_score, 2500);
-        assert_eq!(alice.rounds_played, 1);
+        let month = db.duel_entries(Some(january_start)).await.unwrap();
+        assert_eq!(month.len(), 1);
+        assert_eq!(
+            month[0].dist_km, None,
+            "the missed January guess, not December's"
+        );
         assert_eq!(db.round_count_since(january_start).await.unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn monthly_leaderboard_counts_missed_guesses_as_zero_same_as_alltime() {
-        let db = mem_db().await;
-        let round_id = db.start_round("!r:example.com", 1, "test").await.unwrap();
-        set_round_started_at(&db, round_id, "2026-08-10T00:00:00.000Z").await;
-        let guess_id = db
-            .start_guess(
-                round_id,
-                1,
-                "France",
-                "Europe",
-                None,
-                "test",
-                None,
-                &[],
-                0,
-                90,
-                Some(48.85),
-                Some(2.35),
-            )
-            .await
-            .unwrap();
-
-        db.record_free_guess_answers(
-            guess_id,
-            round_id,
-            vec![(
-                "@alice:example.com".to_owned(),
-                "Paris".to_owned(),
-                48.85,
-                2.35,
-                0.0,
-                5000,
-            )],
-        )
-        .await
-        .unwrap();
-        db.record_missed_guesses(guess_id, round_id, &["@bob:example.com".to_owned()])
-            .await
-            .unwrap();
-
-        let mut scores = HashMap::new();
-        scores.insert("@alice:example.com".to_owned(), 5000i64);
-        scores.insert("@bob:example.com".to_owned(), 0i64);
-        db.upsert_round_scores_free_guess(round_id, &scores)
-            .await
-            .unwrap();
-
-        let august_start = "2026-08-01T00:00:00.000Z".parse::<DateTime<Utc>>().unwrap();
-        let monthly = db.score_leaderboard_month(august_start).await.unwrap();
-        let alltime = db.score_leaderboard_alltime().await.unwrap();
-
-        for board in [&monthly, &alltime] {
-            let bob = board
-                .iter()
-                .find(|e| e.user_id == "@bob:example.com")
-                .unwrap();
-            assert_eq!(bob.guesses_played, 1);
-            assert_eq!(bob.guesses_answered, 0);
-            assert_eq!(bob.total_score, 0);
-            assert_eq!(bob.rounds_played, 1);
-        }
     }
 }

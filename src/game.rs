@@ -152,7 +152,9 @@ pub async fn start_round(
             "🌍 GeoGuessr starts in {}! @room\n\
                  👇 React with your flag to join.\n\
                  🌐 It also sets your map language:\n\
-                 {}",
+                 {}\n\
+                 ⚔️ Closest guess wins the duel.\n\
+                 😴 Joined but no guess loses it.",
             format_duration(reminder_secs),
             flags_str,
         );
@@ -814,9 +816,10 @@ async fn play_free_guess(
             (uid, guess, dist, score)
         })
         .collect();
+    // Closest first, to the metre, the same order the duels use.
     scored.sort_by(|a, b| {
-        b.3.cmp(&a.3)
-            .then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+        crate::duels::metres(a.2)
+            .cmp(&crate::duels::metres(b.2))
             .then(a.0.cmp(&b.0))
     });
 
@@ -860,7 +863,7 @@ async fn play_free_guess(
             .record_missed_guesses(guess_id, round_id, &missed_uids)
             .await?;
         info!(
-            "GeoGuessr guess {guess_num}/{n_total}: {} player(s) missed (recorded as 0 pts): {:?}",
+            "GeoGuessr guess {guess_num}/{n_total}: {} player(s) missed (recorded as lost duels): {:?}",
             missed_uids.len(),
             missed_uids,
         );
@@ -868,6 +871,25 @@ async fn play_free_guess(
             round_scores.entry(uid.clone()).or_insert(0);
         }
     }
+
+    // Duels of this image: every guess against every other, misses lose.
+    let entries: Vec<crate::duels::Entry> = scored
+        .iter()
+        .map(|(uid, _, dist, _)| crate::duels::Entry {
+            image: guess_id,
+            user_id: uid.clone(),
+            dist_km: Some(*dist),
+        })
+        .chain(missed_uids.iter().map(|uid| crate::duels::Entry {
+            image: guess_id,
+            user_id: uid.clone(),
+            dist_km: None,
+        }))
+        .collect();
+    let duels: HashMap<String, crate::duels::ImageResult> = crate::duels::score_image(&entries)
+        .into_iter()
+        .map(|r| (r.user_id.clone(), r))
+        .collect();
 
     let user_ids: Vec<&str> = scored.iter().map(|(uid, _, _, _)| uid.as_str()).collect();
     let names = fetch_names(room, &user_ids).await;
@@ -889,6 +911,7 @@ async fn play_free_guess(
         actual_lat,
         actual_lon,
         &scored,
+        &duels,
         missed_uids.len(),
         &names,
         &raw_avatars,
@@ -909,6 +932,7 @@ async fn post_reveal_free_guess(
     actual_lat: f64,
     actual_lon: f64,
     scored: &[(String, FreeGuess, f64, i64)],
+    duels: &HashMap<String, crate::duels::ImageResult>,
     missed_count: usize,
     names: &HashMap<String, String>,
     raw_avatars: &HashMap<String, Vec<u8>>,
@@ -986,27 +1010,14 @@ async fn post_reveal_free_guess(
     if scored.is_empty() {
         lines.push("🤷 Nobody guessed.".to_owned());
     } else {
-        for (i, ((uid, _guess, dist, score), guess_link)) in
-            scored.iter().zip(guess_labels.iter()).enumerate()
-        {
-            let medal = match i {
-                0 => "🥇",
-                1 => "🥈",
-                2 => "🥉",
-                _ => "▪️",
-            };
-            let dist_str = format_guess_dist(*dist, true);
-            lines.push(format!(
-                "{medal} {} · {guess_link} · {} · {} pts",
-                uid, dist_str, score,
-            ));
+        for ((uid, _guess, dist, _score), guess_link) in scored.iter().zip(guess_labels.iter()) {
+            let medal = place_medal(duels.get(uid).and_then(|r| r.place));
+            let stats = reveal_stats(*dist, duels.get(uid));
+            lines.push(format!("{medal} {uid} · {guess_link} · {stats}"));
         }
     }
     if missed_count > 0 {
-        lines.push(format!(
-            "😴 {missed_count} player{} missed this one (0 pts, counts toward their average)",
-            if missed_count == 1 { "" } else { "s" },
-        ));
+        lines.push(missed_line(missed_count));
     }
     let text = lines.join("\n");
 
@@ -1035,15 +1046,10 @@ async fn post_reveal_free_guess(
                     format!("📍 **{}** [{header_map_label}]({})", location_str, ov),
                     String::new(),
                 ];
-                for (i, (uid, _guess, dist, score)) in scored.iter().enumerate() {
-                    let medal = match i {
-                        0 => "🥇",
-                        1 => "🥈",
-                        2 => "🥉",
-                        _ => "▪️",
-                    };
-                    let dist_str = format_guess_dist(*dist, true);
-                    sl.push(format!("{medal} {} · {} · {} pts", uid, dist_str, score));
+                for (uid, _guess, dist, _score) in scored {
+                    let medal = place_medal(duels.get(uid).and_then(|r| r.place));
+                    let stats = reveal_stats(*dist, duels.get(uid));
+                    sl.push(format!("{medal} {uid} · {stats}"));
                 }
                 sl.join("\n")
             };
@@ -1067,19 +1073,10 @@ async fn post_reveal_free_guess(
             let link_lines: Vec<String> = scored
                 .iter()
                 .zip(guess_labels.iter())
-                .enumerate()
-                .map(|(i, ((uid, _guess, dist, score), guess_link))| {
-                    let medal = match i {
-                        0 => "🥇",
-                        1 => "🥈",
-                        2 => "🥉",
-                        _ => "▪️",
-                    };
-                    let dist_str = format_guess_dist(*dist, true);
-                    format!(
-                        "{medal} {} · {guess_link} · {} · {} pts",
-                        uid, dist_str, score
-                    )
+                .map(|((uid, _guess, dist, _score), guess_link)| {
+                    let medal = place_medal(duels.get(uid).and_then(|r| r.place));
+                    let stats = reveal_stats(*dist, duels.get(uid));
+                    format!("{medal} {uid} · {guess_link} · {stats}")
                 })
                 .collect();
             let links_text = link_lines.join("\n");
@@ -1108,13 +1105,13 @@ async fn post_reveal_free_guess(
             .iter()
             .enumerate()
             .map(
-                |(i, (uid, guess, dist, score))| crate::mapimage::ResultPlayer {
-                    rank: i + 1,
+                |(i, (uid, guess, dist, _score))| crate::mapimage::ResultPlayer {
+                    rank: duels.get(uid).and_then(|r| r.place).unwrap_or(i + 1),
                     name: display_name(names, uid).to_owned(),
                     lat: guess.lat,
                     lon: guess.lon,
                     dist_km: *dist,
-                    score: *score,
+                    duel: duels.get(uid).filter(|r| r.duels > 0).map(|r| r.halves),
                     avatar: raw_avatars.get(uid.as_str()).cloned(),
                 },
             )
@@ -1164,6 +1161,60 @@ async fn post_reveal_free_guess(
     }
 }
 
+/// Medal for a place on one image; a shared place shares the medal.
+fn place_medal(place: Option<usize>) -> &'static str {
+    match place {
+        Some(1) => "🥇",
+        Some(2) => "🥈",
+        Some(3) => "🥉",
+        _ => "▪️",
+    }
+}
+
+/// "🎯 7 m · ⚔️ +2": the duel points only when there was someone to duel.
+fn reveal_stats(dist_km: f64, duel: Option<&crate::duels::ImageResult>) -> String {
+    let dist = format_guess_dist(dist_km, true);
+    match duel.filter(|r| r.duels > 0) {
+        Some(r) => format!("{dist} · ⚔️ +{}", crate::duels::fmt_points(r.halves)),
+        None => dist,
+    }
+}
+
+fn missed_line(missed_count: usize) -> String {
+    if missed_count == 1 {
+        "😴 1 player joined but didn't guess: lost every duel.".to_owned()
+    } else {
+        format!("😴 {missed_count} players joined but didn't guess: lost every duel.")
+    }
+}
+
+/// The round's result: duel points over all its images, best first.
+fn round_summary_text(n_guesses: usize, mut board: Vec<crate::duels::Standing>) -> String {
+    crate::duels::sort_by_points(&mut board);
+    let mut lines = vec![
+        format!(
+            "🌍 **Round over!**\n🎯 {n_guesses} guess{}",
+            if n_guesses == 1 { "" } else { "es" }
+        ),
+        String::new(),
+    ];
+    for (i, s) in board.iter().enumerate() {
+        let medal = place_medal(Some(i + 1));
+        let mut parts = vec![format!("{medal} {}. {}", i + 1, s.user_id)];
+        if s.duels > 0 {
+            parts.push(format!("⚔️ {}", crate::duels::fmt_points(s.halves)));
+        }
+        if let Some(best) = s.best_km {
+            parts.push(format!("🏅 {}", format_dist(best)));
+        }
+        if s.missed > 0 {
+            parts.push(format!("😴 {}", s.missed));
+        }
+        lines.push(parts.join(" · "));
+    }
+    lines.join("\n")
+}
+
 async fn post_round_summary_free_guess(
     ctx: &BotContext,
     client: &Client,
@@ -1187,85 +1238,12 @@ async fn post_round_summary_free_guess(
     // ── Round results (this round only) ──────────────────────────────────────
     // `n_guesses` is what was actually played, not the configured count,
     // which ignores `!schedulegeo` overrides and images lost to dedup.
-    let max_pts = 5000i64 * n_guesses as i64;
-
-    // Fetch per-user stats for this round from DB.
-    let round_stats = ctx.db.round_stats(round_id).await.unwrap_or_default();
-
-    const BAR_W: usize = 10;
-
-    let mut lines = vec![
-        format!(
-            "🌍 **Round over!**\n🎯 {} guess(es) · max {} pts",
-            n_guesses, max_pts
-        ),
-        String::new(),
-    ];
-
-    // Sort by total score desc, then avg distance asc (from DB), then username asc.
-    let mut ranking: Vec<(&str, i64)> = scores.iter().map(|(u, &s)| (u.as_str(), s)).collect();
-    ranking.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then_with(|| {
-                let da = round_stats
-                    .iter()
-                    .find(|e| e.user_id == a.0)
-                    .map(|e| e.avg_distance_km)
-                    .unwrap_or(f64::MAX);
-                let db = round_stats
-                    .iter()
-                    .find(|e| e.user_id == b.0)
-                    .map(|e| e.avg_distance_km)
-                    .unwrap_or(f64::MAX);
-                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then(a.0.cmp(b.0))
-    });
-
-    for (i, (uid, score)) in ranking.iter().enumerate() {
-        let medal = match i {
-            0 => "🥇",
-            1 => "🥈",
-            2 => "🥉",
-            _ => "▪️",
-        };
-
-        // Bar: fraction of max possible score.
-        let filled = ((*score as f64 / max_pts as f64) * BAR_W as f64).round() as usize;
-        let bar = format!(
-            "{}{}",
-            "█".repeat(filled.min(BAR_W)),
-            "░".repeat(BAR_W - filled.min(BAR_W))
-        );
-
-        let pts_per_guess = if n_guesses > 0 {
-            score / n_guesses as i64
-        } else {
-            0
-        };
-
-        // Distance stats from DB if available for this user.
-        let (avg_dist, best_dist) = round_stats
-            .iter()
-            .find(|e| e.user_id == *uid)
-            .map(|e| {
-                (
-                    format_dist(e.avg_distance_km),
-                    format_dist(e.best_distance_km),
-                )
-            })
-            .unwrap_or_else(|| ("n/a".to_owned(), "n/a".to_owned()));
-
-        lines.push(format!(
-            "{medal} {}. {} · {} pts/guess",
-            i + 1,
-            uid,
-            pts_per_guess
-        ));
-        lines.push(format!("{bar} · ⌀ {} · 🏅 {}", avg_dist, best_dist));
-    }
-
-    let round_text = lines.join("\n");
+    let entries = ctx
+        .db
+        .round_duel_entries(round_id)
+        .await
+        .unwrap_or_default();
+    let round_text = round_summary_text(n_guesses, crate::duels::standings(&entries));
 
     if let Some(r) = client.get_room(&ctx.room_id) {
         if let Ok(ev) = r.send(format::mentionify(&round_text)).await {
@@ -1362,10 +1340,12 @@ fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     R * 2.0 * a.sqrt().asin()
 }
 
-/// Score: 5000 × e^(−distance_km / half_life_km).
+/// Classic score: 5000 × e^(−distance_km / half_life_km), stored with each
+/// answer and passed to the shared reveal page. Rankings use duels instead,
+/// because this curve gives every guess within about 400 m the same 4999.
 /// Uses floor() so 5000 is only achievable at exactly 0 km.
-/// Default half_life = 2000 km: 50 km → 4876, 500 km → 2840.
-/// Lower half_life rewards precision: 1000 → 50 km scores 4753.
+/// Default 2000 km: 50 km → 4876, 500 km → 3894, 2000 km → 1839.
+/// A lower value rewards precision: 1000 → 50 km scores 4756.
 fn distance_score(distance_km: f64, half_life_km: f64) -> i64 {
     (5000.0 * (-distance_km / half_life_km.max(1.0)).exp()).floor() as i64
 }
@@ -1378,17 +1358,17 @@ pub fn format_dist(dist_km: f64) -> String {
     }
 }
 
-/// Guesses closer than this are shown as exact: below it, the remaining gap
-/// is photo-position and map-click uncertainty, not a worse guess.
-pub const EXACT_GUESS_KM: f64 = 0.05;
+/// Guesses closer than this get a 🎯: the spot was found.
+pub const SPOT_ON_KM: f64 = 0.05;
 
-/// A guess's distance for the result: "🎯 exact" (or "exact" where emoji
-/// can't be drawn) inside `EXACT_GUESS_KM`, otherwise the distance.
+/// A guess's distance for the result, always to the metre because duels are
+/// decided on it: "🎯 7 m" inside `SPOT_ON_KM` (plain "7 m" where emoji
+/// can't be drawn), otherwise the distance.
 pub fn format_guess_dist(dist_km: f64, emoji: bool) -> String {
-    match (dist_km < EXACT_GUESS_KM, emoji) {
-        (true, true) => "🎯 exact".to_owned(),
-        (true, false) => "exact".to_owned(),
-        (false, _) => format_dist(dist_km),
+    if emoji && dist_km < SPOT_ON_KM {
+        format!("🎯 {}", format_dist(dist_km))
+    } else {
+        format_dist(dist_km)
     }
 }
 
@@ -2419,4 +2399,77 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
     post_round_summary_free_guess(&ctx, &client, &room, round_id, total, &round_scores_free).await;
 
     *ctx.round_abort.lock().await = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::duels::{score_image, standings, Entry};
+
+    fn e(user: &str, metres: Option<f64>) -> Entry {
+        Entry {
+            image: 1,
+            user_id: user.to_owned(),
+            dist_km: metres.map(|m| m / 1000.0),
+        }
+    }
+
+    #[test]
+    fn a_reveal_line_shows_the_metres_and_the_duels_won() {
+        let r = score_image(&[e("@a", Some(7.0)), e("@b", Some(9.0)), e("@c", None)]);
+        let a = r.iter().find(|r| r.user_id == "@a").unwrap();
+        assert_eq!(reveal_stats(0.007, Some(a)), "🎯 7 m · ⚔️ +2");
+        let solo = score_image(&[e("@a", Some(7.0))]);
+        assert_eq!(
+            reveal_stats(0.007, solo.first()),
+            "🎯 7 m",
+            "nobody to duel"
+        );
+        assert_eq!(reveal_stats(262.0, None), "262 km");
+    }
+
+    #[test]
+    fn tied_guesses_share_the_medal() {
+        let r = score_image(&[
+            e("@a", Some(12.2)),
+            e("@b", Some(11.9)),
+            e("@c", Some(40.0)),
+        ]);
+        let medals: Vec<&str> = r.iter().map(|r| place_medal(r.place)).collect();
+        assert_eq!(medals, vec!["🥇", "🥇", "🥉"]);
+        assert_eq!(place_medal(None), "▪️");
+    }
+
+    #[test]
+    fn the_missed_line_says_what_skipping_costs() {
+        assert_eq!(
+            missed_line(1),
+            "😴 1 player joined but didn't guess: lost every duel."
+        );
+        assert!(missed_line(2).starts_with("😴 2 players"));
+    }
+
+    #[test]
+    fn the_round_summary_ranks_by_duel_points() {
+        let mut rows = vec![e("@a", Some(3.0)), e("@b", Some(30.0)), e("@c", None)];
+        rows.push(Entry {
+            image: 2,
+            user_id: "@b".to_owned(),
+            dist_km: Some(0.001),
+        });
+        rows.push(Entry {
+            image: 2,
+            user_id: "@a".to_owned(),
+            dist_km: Some(0.002),
+        });
+        let text = round_summary_text(2, standings(&rows));
+        assert!(text.starts_with("🌍 **Round over!**\n🎯 2 guesses"));
+        // @a: 2 + 0, @b: 1 + 1, @c: 0. Same points, share and images won,
+        // so the closest guess of the round decides.
+        let b = text.find("🥇 1. @b · ⚔️ 2 · 🏅 1 m").expect("b leads");
+        let a = text.find("🥈 2. @a · ⚔️ 2 · 🏅 2 m").expect("a second");
+        assert!(b < a);
+        assert!(text.contains("🥉 3. @c · ⚔️ 0 · 😴 1"));
+        assert!(!text.contains("pts"));
+    }
 }

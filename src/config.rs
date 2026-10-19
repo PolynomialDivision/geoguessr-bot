@@ -114,10 +114,10 @@ pub struct ScheduleConfig {
     /// 1 = only the first guess counts; subsequent attempts are rejected.
     #[serde(default)]
     pub max_guesses_per_player: u32,
-    /// Half-life distance for the scoring curve: score = 5000 × e^(−dist_km / half_life).
-    /// Default 2000 km (original GeoGuessr-style). Lower values reward precision more:
-    ///   1000 = 50 km scores ~4753 pts instead of 4876.
-    ///   500  = 50 km scores ~4512 pts.
+    /// Scale of the classic score = 5000 × e^(−dist_km / scale), despite the
+    /// name not a half-life (at dist = scale 37% remain). Only stored with each
+    /// answer and shown on the shared reveal page; every ranking uses duels.
+    /// Default 2000 km: 50 km scores 4876, 1000 → 4756, 500 → 4524.
     #[serde(default = "default_score_half_life_km")]
     pub score_half_life_km: f64,
     /// Leaderboard tuning, see `LeaderboardConfig`. An old `[schedule.rating]`
@@ -226,6 +226,12 @@ pub struct MapillaryConfig {
     /// Optional ISO 3166-1 alpha-2 country filter (same as wikimedia).
     #[serde(default)]
     pub countries: Vec<String>,
+    /// Difficulty: 0 (default) searches each seed city's centre. A value in
+    /// km searches at random points up to that far around the city instead,
+    /// so 10 reaches the suburbs and 30 to 50 the countryside. Photos found
+    /// more than 3 km out are revealed as "near <city>".
+    #[serde(default)]
+    pub spread_km: f64,
 }
 
 fn default_mapillary_radius() -> u32 {

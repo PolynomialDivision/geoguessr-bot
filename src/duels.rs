@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 /// One player's row on one image: `dist_km` is `None` for a missed guess.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
     pub image: i64,
     pub user_id: String,
@@ -240,7 +240,11 @@ mod tests {
     fn a_missed_guess_loses_to_everyone_who_guessed() {
         let r = score_image(&[e(1, "a", Some(5.0)), e(1, "b", Some(9e6)), e(1, "z", None)]);
         assert_eq!(by_user(&r, "a").halves, 4);
-        assert_eq!(by_user(&r, "b").halves, 2, "even a wild guess beats skipping");
+        assert_eq!(
+            by_user(&r, "b").halves,
+            2,
+            "even a wild guess beats skipping"
+        );
         let z = by_user(&r, "z");
         assert_eq!((z.halves, z.duels, z.place), (0, 2, None));
         assert_eq!(r.last().unwrap().user_id, "z");
@@ -251,7 +255,10 @@ mod tests {
         let r = score_image(&[e(1, "y", None), e(1, "z", None)]);
         assert!(r.iter().all(|r| r.duels == 0));
         let solo = score_image(&[e(1, "a", Some(3.0))]);
-        assert_eq!((solo[0].halves, solo[0].duels, solo[0].place), (0, 0, Some(1)));
+        assert_eq!(
+            (solo[0].halves, solo[0].duels, solo[0].place),
+            (0, 0, Some(1))
+        );
     }
 
     #[test]
@@ -266,8 +273,15 @@ mod tests {
         let board = standings(&rows);
         let a = board.iter().find(|s| s.user_id == "a").unwrap();
         let b = board.iter().find(|s| s.user_id == "b").unwrap();
-        assert_eq!((a.halves, a.duels, a.wins, a.images, a.missed), (2, 2, 1, 3, 1));
-        assert_eq!((b.halves, b.duels, b.wins, b.images, b.missed), (2, 2, 1, 2, 0));
+        assert_eq!(
+            (a.halves, a.duels, a.wins, a.images, a.missed),
+            (2, 2, 1, 3, 1)
+        );
+        // Beating only someone who skipped wins the duel, not the image.
+        assert_eq!(
+            (b.halves, b.duels, b.wins, b.images, b.missed),
+            (2, 2, 0, 2, 0)
+        );
         assert_eq!(a.best_km, Some(0.001));
         assert_eq!(a.rate(), Some(0.5));
     }
@@ -275,7 +289,10 @@ mod tests {
     #[test]
     fn a_lone_guess_is_not_an_image_win() {
         let board = standings(&[e(1, "a", Some(1.0))]);
-        assert_eq!((board[0].wins, board[0].images, board[0].rate()), (0, 1, None));
+        assert_eq!(
+            (board[0].wins, board[0].images, board[0].rate()),
+            (0, 1, None)
+        );
     }
 
     #[test]

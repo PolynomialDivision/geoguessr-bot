@@ -67,13 +67,14 @@ static BOLD: LazyLock<FontRef<'static>> = LazyLock::new(|| {
 
 /// One player's line in the result.
 pub struct ResultPlayer {
-    /// 1-based rank of this guess.
+    /// 1-based place of this guess, shared on the same metre.
     pub rank: usize,
     pub name: String,
     pub lat: f64,
     pub lon: f64,
     pub dist_km: f64,
-    pub score: i64,
+    /// Duel points won on this image, in halves; `None` without a duel.
+    pub duel: Option<i64>,
     /// Raw avatar image bytes (any format), shown in the pin when present.
     pub avatar: Option<Vec<u8>>,
 }
@@ -563,11 +564,11 @@ fn draw_legend(
         let mid = y + ROW_H / 2.0;
         draw_badge(canvas, x + 16.0, mid, p.rank, player_color(i));
 
-        let stats = format!(
-            "{} · {} pts",
-            crate::game::format_guess_dist(p.dist_km, false),
-            p.score
-        );
+        let dist = crate::game::format_guess_dist(p.dist_km, false);
+        let stats = match p.duel {
+            Some(halves) => format!("{dist} · +{}", crate::duels::fmt_points(halves)),
+            None => dist,
+        };
         let stats_w = text_width(&REGULAR, 14.0, &stats);
         let right = x + col_w - 18.0;
         draw_text(
@@ -712,7 +713,7 @@ mod tests {
             lat,
             lon,
             dist_km: 100.0 * rank as f64,
-            score: 5000 - 100 * rank as i64,
+            duel: Some(2 * rank as i64),
             avatar: None,
         }
     }
@@ -816,9 +817,10 @@ mod tests {
     }
 
     #[test]
-    fn guesses_within_fifty_metres_read_as_exact() {
-        assert_eq!(crate::game::format_guess_dist(0.021, true), "🎯 exact");
-        assert_eq!(crate::game::format_guess_dist(0.049, false), "exact");
+    fn close_guesses_still_show_their_metres() {
+        assert_eq!(crate::game::format_guess_dist(0.0, true), "🎯 0 m");
+        assert_eq!(crate::game::format_guess_dist(0.021, true), "🎯 21 m");
+        assert_eq!(crate::game::format_guess_dist(0.049, false), "49 m");
         assert_eq!(crate::game::format_guess_dist(0.051, true), "51 m");
         assert_eq!(crate::game::format_guess_dist(12.4, true), "12 km");
     }
