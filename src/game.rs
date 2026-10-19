@@ -28,12 +28,16 @@ use matrix_sdk::{
     Client, Room,
 };
 use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
+use std::{path::Path, sync::Arc};
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::{
     countries, format,
     sources::GeoImage,
-    state::{ActiveDmParticipant, ActiveRoundState, PendingJoin},
+    state::{ActiveDmParticipant, ActiveRoundState, OpenGuess, PendingJoin, State},
+    web::{GuessSession, GuessToken},
     BotContext,
 };
 
@@ -60,7 +64,7 @@ pub struct GameOverrides {
 
 // ── Free-guess answer ─────────────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FreeGuess {
     pub text: String,
     pub lat: f64,
@@ -68,7 +72,11 @@ pub struct FreeGuess {
     pub submitted_at: chrono::DateTime<chrono::Utc>,
 }
 
-// ── Active game state (in-memory only) ────────────────────────────────────────
+// ── Active game state ─────────────────────────────────────────────────────────
+//
+// The guesses of the open image live here while the countdown runs; every
+// accepted submission is also copied to state.json (`persist_guesses`) so a
+// restart carries on with them instead of replaying the image.
 
 #[derive(Clone, Debug)]
 pub struct ActiveGame {
@@ -103,6 +111,89 @@ impl ActiveGame {
         guesses.insert(user_id, guess);
         true
     }
+}
+
+/// Copies the guesses of the open image into the state file so a restart keeps
+/// them. Called after every accepted submission (the room command and the web
+/// form); nothing to do while no guess is open.
+pub async fn persist_guesses(
+    state: &Arc<Mutex<State>>,
+    state_path: &Path,
+    active_game: &Arc<Mutex<Option<ActiveGame>>>,
+) {
+    let guesses = {
+        let ag = active_game.lock().await;
+        match ag.as_ref() {
+            Some(ActiveGame {
+                mode: ActiveGameMode::FreeGuess { guesses, .. },
+                ..
+            }) => guesses.clone(),
+            None => return,
+        }
+    };
+    let mut st = state.lock().await;
+    let Some(open) = st.active_round.as_mut().and_then(|ar| ar.open.as_mut()) else {
+        return;
+    };
+    open.guesses = guesses;
+    if let Err(e) = st.save(state_path).await {
+        warn!("GeoGuessr: could not save the guesses to the state file: {e}");
+    }
+}
+
+/// Seconds of the answer window left at `now` for a guess opened at `opened_at`.
+fn time_left(
+    opened_at: chrono::DateTime<chrono::Utc>,
+    timeout_secs: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> u64 {
+    let elapsed = now.signed_duration_since(opened_at).num_seconds().max(0) as u64;
+    timeout_secs.saturating_sub(elapsed)
+}
+
+/// The position to score against: the photo's own, else the country's centre.
+fn actual_position(img: &GeoImage) -> (f64, f64) {
+    match (img.lat, img.lon) {
+        (Some(lat), Some(lon)) => (lat, lon),
+        _ => countries::COUNTRIES
+            .iter()
+            .find(|c| c.name == img.country)
+            .map(|c| (c.lat, c.lon))
+            .unwrap_or((0.0, 0.0)),
+    }
+}
+
+/// True when every participant of the open image has sent a guess (never for a
+/// round without a roster: walk-ins cannot end the countdown early).
+async fn all_submitted(ctx: &BotContext, participants: &[OwnedUserId]) -> bool {
+    if participants.is_empty() {
+        return false;
+    }
+    let ag = ctx.active_game.lock().await;
+    match ag.as_ref() {
+        Some(ActiveGame {
+            mode: ActiveGameMode::FreeGuess { guesses, .. },
+            ..
+        }) => participants
+            .iter()
+            .all(|uid| guesses.contains_key(uid.as_str())),
+        None => false,
+    }
+}
+
+/// What `open_free_guess` leaves behind for `run_free_guess`.
+struct OpenedGuess {
+    guess_id: i64,
+    actual_lat: f64,
+    actual_lon: f64,
+    /// The countdown message; edited with the time bar.
+    prompt_event_id: OwnedEventId,
+    /// Personal map links were posted (the prompt carries no `!guess` hint then).
+    web_links: bool,
+    /// The whole answer window; the time bar is scaled to it.
+    total_secs: u64,
+    /// The part of the window still to come (less than `total_secs` after a restart).
+    remaining_secs: u64,
 }
 
 // ── Round entry point ─────────────────────────────────────────────────────────
@@ -372,6 +463,8 @@ pub async fn start_round(
                 answer_timeout_secs: answer_timeout_secs_cfg,
                 dm_participants: dm_state,
                 round_scores: round_scores_free.clone(),
+                open: None,
+                scored: false,
             });
             st.save(&ctx.state_path).await.ok();
         }
@@ -504,14 +597,52 @@ async fn play_free_guess(
     participants: &[OwnedUserId],
     answer_timeout_secs: u64,
 ) -> anyhow::Result<()> {
-    let (actual_lat, actual_lon) = match (img.lat, img.lon) {
-        (Some(lat), Some(lon)) => (lat, lon),
-        _ => countries::COUNTRIES
-            .iter()
-            .find(|c| c.name == img.country)
-            .map(|c| (c.lat, c.lon))
-            .unwrap_or((0.0, 0.0)),
+    let Some(opened) = open_free_guess(
+        ctx,
+        client,
+        room,
+        round_id,
+        guess_num,
+        n_total,
+        img,
+        participants,
+        answer_timeout_secs,
+    )
+    .await?
+    else {
+        return Ok(());
     };
+    run_free_guess(
+        ctx,
+        client,
+        room,
+        round_id,
+        guess_num,
+        n_total,
+        img,
+        round_scores,
+        participants,
+        opened,
+    )
+    .await
+}
+
+/// Uploads and posts the images, the personal map links and the countdown prompt,
+/// and records the open guess in the state file. `None` when the guess was aborted
+/// (no image could be posted).
+#[allow(clippy::too_many_arguments)]
+async fn open_free_guess(
+    ctx: &BotContext,
+    client: &Client,
+    room: &Room,
+    round_id: i64,
+    guess_num: u32,
+    n_total: u32,
+    img: &GeoImage,
+    participants: &[OwnedUserId],
+    answer_timeout_secs: u64,
+) -> anyhow::Result<Option<OpenedGuess>> {
+    let (actual_lat, actual_lon) = actual_position(img);
 
     let guess_id = match ctx.db.find_guess_id(round_id, guess_num).await {
         Some(id) => id,
@@ -555,7 +686,7 @@ async fn play_free_guess(
                 img.country, img.source, img.image_url,
             );
             abort_guess_no_image(ctx, room, guess_id, guess_num, n_total).await;
-            return Ok(());
+            return Ok(None);
         }
     };
 
@@ -604,7 +735,7 @@ async fn play_free_guess(
                      event to room: {e}"
                 );
                 abort_guess_no_image(ctx, room, guess_id, guess_num, n_total).await;
-                return Ok(());
+                return Ok(None);
             }
             Err(e) => warn!(
                 "GeoGuessr guess {guess_num}/{n_total}: failed to send context image {}/{n_imgs}: {e}",
@@ -617,6 +748,7 @@ async fn play_free_guess(
     let timeout_str = format_duration(total_secs);
 
     // Generate per-player web tokens and post the initial links message.
+    let mut links_event_id: Option<OwnedEventId> = None;
     let web_token_map: HashMap<OwnedUserId, String> = if !participants.is_empty() {
         if let Some(ref public_url) = ctx.web_public_url {
             let mut tmap: HashMap<OwnedUserId, String> = HashMap::new();
@@ -655,6 +787,7 @@ async fn play_free_guess(
 
                 if let Ok(ev) = room.send(format::mentionify(&links_line)).await {
                     set_pinned(room, &ev.response.event_id).await;
+                    links_event_id = Some(ev.response.event_id.clone());
                     store.sessions.insert(
                         (round_id, guess_num),
                         crate::web::GuessSession {
@@ -708,11 +841,36 @@ async fn play_free_guess(
         .await?
     };
     let q_event_id = q_event.response.event_id.clone();
+    let opened_at = chrono::Utc::now();
 
     ctx.db
         .set_guess_event_id(guess_id, q_event_id.as_str())
         .await
         .ok();
+
+    // The open guess goes to the state file before any submission can arrive:
+    // a restart from here on carries on with this prompt, these links and the
+    // guesses received (resume_free_guess) instead of posting the image again.
+    {
+        let mut st = ctx.state.lock().await;
+        if let Some(ar) = st.active_round.as_mut() {
+            ar.open = Some(OpenGuess {
+                guess_id,
+                prompt_event_id: q_event_id.to_string(),
+                opened_at,
+                web_tokens: web_token_map
+                    .iter()
+                    .map(|(uid, tok)| (uid.to_string(), tok.clone()))
+                    .collect(),
+                links_event_id: links_event_id.map(|e| e.to_string()),
+                guesses: HashMap::new(),
+            });
+            ar.scored = false;
+            if let Err(e) = st.save(&ctx.state_path).await {
+                warn!("GeoGuessr guess {guess_num}/{n_total}: could not save the open guess: {e}");
+            }
+        }
+    }
 
     // Register active game.
     {
@@ -727,42 +885,220 @@ async fn play_free_guess(
         });
     }
 
+    Ok(Some(OpenedGuess {
+        guess_id,
+        actual_lat,
+        actual_lon,
+        prompt_event_id: q_event_id,
+        web_links: !web_token_map.is_empty(),
+        total_secs,
+        remaining_secs: total_secs,
+    }))
+}
+
+/// Carries on with the guess that was open when the bot stopped: the guesses
+/// received so far, the links posted and the time that is left. A guess that was
+/// already scored is skipped; one whose prompt never made it to the room is played
+/// from the start.
+async fn resume_free_guess(
+    ctx: &BotContext,
+    client: &Client,
+    room: &Room,
+    ar: &ActiveRoundState,
+    round_scores: &mut HashMap<String, i64>,
+    participants: &[OwnedUserId],
+) -> anyhow::Result<()> {
+    if ar.scored {
+        info!(
+            "GeoGuessr guess {}/{}: scored before the restart, moving on",
+            ar.guess_num, ar.total_guesses
+        );
+        return Ok(());
+    }
+
+    let open = ar
+        .open
+        .as_ref()
+        .and_then(|o| match o.prompt_event_id.parse::<OwnedEventId>() {
+            Ok(eid) => Some((o, eid)),
+            Err(e) => {
+                warn!(
+                    "resume_free_guess: bad prompt event id {:?}: {e}",
+                    o.prompt_event_id
+                );
+                None
+            }
+        });
+    let Some((open, prompt_event_id)) = open else {
+        room.send(format::mentionify(&format!(
+            "⚠️ I restarted mid-round.\n🔁 Replaying guess {}/{} with a fresh {} timer.",
+            ar.guess_num,
+            ar.total_guesses,
+            format_duration(ar.answer_timeout_secs),
+        )))
+        .await
+        .ok();
+        return play_free_guess(
+            ctx,
+            client,
+            room,
+            ar.round_id,
+            ar.guess_num,
+            ar.total_guesses,
+            &ar.current_image,
+            round_scores,
+            participants,
+            ar.answer_timeout_secs,
+        )
+        .await;
+    };
+
+    let (actual_lat, actual_lon) = actual_position(&ar.current_image);
+    let remaining = time_left(open.opened_at, ar.answer_timeout_secs, chrono::Utc::now());
+
+    // The guesses received before the restart.
+    {
+        let mut ag = ctx.active_game.lock().await;
+        *ag = Some(ActiveGame {
+            event_id: prompt_event_id.clone(),
+            mode: ActiveGameMode::FreeGuess {
+                guesses: open.guesses.clone(),
+                actual_lat,
+                actual_lon,
+            },
+        });
+    }
+    let web_links = restore_web_links(ctx, ar.round_id, ar.guess_num, open, participants).await;
+
+    let kept = open.guesses.len();
+    let note = if remaining > 0 {
+        format!(
+            "⚠️ I restarted. Guess {}/{} goes on: {kept} guess(es) kept, ⏳ {} left.",
+            ar.guess_num,
+            ar.total_guesses,
+            format_duration(remaining),
+        )
+    } else {
+        format!(
+            "⚠️ I restarted after the time for guess {}/{} was over: closing it with the {kept} guess(es) received.",
+            ar.guess_num, ar.total_guesses,
+        )
+    };
+    room.send(format::mentionify(&note)).await.ok();
+    info!(
+        "GeoGuessr guess {}/{}: resumed with {kept} guess(es), {remaining}s left",
+        ar.guess_num, ar.total_guesses
+    );
+
+    run_free_guess(
+        ctx,
+        client,
+        room,
+        ar.round_id,
+        ar.guess_num,
+        ar.total_guesses,
+        &ar.current_image,
+        round_scores,
+        participants,
+        OpenedGuess {
+            guess_id: open.guess_id,
+            actual_lat,
+            actual_lon,
+            prompt_event_id,
+            web_links,
+            total_secs: ar.answer_timeout_secs,
+            remaining_secs: remaining,
+        },
+    )
+    .await
+}
+
+/// Puts the personal map links of the open guess back into the token store, so the
+/// links posted before the restart keep working. False when there are none (no web
+/// server, or the guess had no roster).
+async fn restore_web_links(
+    ctx: &BotContext,
+    round_id: i64,
+    guess_num: u32,
+    open: &OpenGuess,
+    participants: &[OwnedUserId],
+) -> bool {
+    if ctx.web_public_url.is_none() || open.web_tokens.is_empty() {
+        return false;
+    }
+    let langs = ctx.state.lock().await.user_langs.clone();
+    let mut store = ctx.web_tokens.lock().await;
+    for (uid, token) in &open.web_tokens {
+        let Ok(user_id) = uid.parse::<OwnedUserId>() else {
+            continue;
+        };
+        let lang = langs.get(uid).cloned().unwrap_or_else(|| "en".to_owned());
+        store.tokens.insert(
+            token.clone(),
+            GuessToken {
+                user_id,
+                round_id,
+                guess_num,
+                lang,
+            },
+        );
+    }
+    if let Some(eid) = open.links_event_id.as_deref().and_then(|e| e.parse().ok()) {
+        store.sessions.insert(
+            (round_id, guess_num),
+            GuessSession {
+                links_event_id: eid,
+                participants: participants.to_vec(),
+            },
+        );
+    }
+    true
+}
+
+/// Runs the countdown of an open guess, then closes, scores and reveals it.
+#[allow(clippy::too_many_arguments)]
+async fn run_free_guess(
+    ctx: &BotContext,
+    client: &Client,
+    room: &Room,
+    round_id: i64,
+    guess_num: u32,
+    n_total: u32,
+    img: &GeoImage,
+    round_scores: &mut HashMap<String, i64>,
+    participants: &[OwnedUserId],
+    opened: OpenedGuess,
+) -> anyhow::Result<()> {
+    let OpenedGuess {
+        guess_id,
+        actual_lat,
+        actual_lon,
+        prompt_event_id: q_event_id,
+        web_links,
+        total_secs,
+        remaining_secs,
+    } = opened;
+
     // Smooth countdown in the main room: edits the prompt message with a time bar.
     // DMs are not updated (avoids spamming participants).
     // Early-exit: after each tick, check if every DM participant has already submitted.
     let edit_interval = (total_secs / 20).clamp(15, 900);
-    let mut remaining = total_secs;
-    let mut all_in = false;
+    let mut remaining = remaining_secs;
+    let mut all_in = all_submitted(ctx, participants).await;
 
-    loop {
+    while remaining > 0 && !all_in {
         let sleep_secs = remaining.min(edit_interval);
         tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
         remaining -= sleep_secs;
 
-        // Early-exit check: all participants have submitted a guess.
-        if !participants.is_empty() {
-            let ag = ctx.active_game.lock().await;
-            if let Some(ActiveGame {
-                mode: ActiveGameMode::FreeGuess { ref guesses, .. },
-                ..
-            }) = *ag
-            {
-                if participants
-                    .iter()
-                    .all(|uid| guesses.contains_key(uid.as_str()))
-                {
-                    all_in = true;
-                }
-            }
-        }
-
+        all_in = all_submitted(ctx, participants).await;
         if all_in || remaining == 0 {
             break;
         }
 
         let bar = time_bar(remaining, total_secs);
         let time_str = format_duration(remaining);
-        let edit_msg = if !web_token_map.is_empty() {
+        let edit_msg = if web_links {
             format::mentionify(&format!(
                 "🌍 Guess {guess_num}/{n_total} · ⏳ {time_str} {bar}",
             ))
@@ -798,7 +1134,7 @@ async fn play_free_guess(
     };
 
     // Clear web tokens for this guess so the links expire immediately.
-    if !web_token_map.is_empty() {
+    if web_links {
         let mut store = ctx.web_tokens.lock().await;
         store
             .tokens
@@ -869,6 +1205,22 @@ async fn play_free_guess(
         );
         for uid in &missed_uids {
             round_scores.entry(uid.clone()).or_insert(0);
+        }
+    }
+
+    // The guess is in the database and the round scores carry it: from here on a
+    // restart moves on to the next image instead of playing this one again.
+    {
+        let mut st = ctx.state.lock().await;
+        if let Some(ar) = st.active_round.as_mut() {
+            ar.open = None;
+            ar.scored = true;
+            ar.round_scores = round_scores.clone();
+            if let Err(e) = st.save(&ctx.state_path).await {
+                warn!(
+                    "GeoGuessr guess {guess_num}/{n_total}: could not save the scored guess: {e}"
+                );
+            }
         }
     }
 
@@ -2044,32 +2396,19 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
         .collect();
     participants.sort();
 
-    room.send(format::mentionify(&format!(
-        "⚠️ I restarted mid-round.\n🔁 Replaying guess {}/{} with a fresh {} timer.",
-        ar.guess_num,
-        ar.total_guesses,
-        format_duration(ar.answer_timeout_secs),
-    )))
-    .await
-    .ok();
-
     let mut round_scores_free: HashMap<String, i64> = ar.round_scores.clone();
 
-    if let Err(e) = play_free_guess(
+    if let Err(e) = resume_free_guess(
         &ctx,
         &client,
         &room,
-        ar.round_id,
-        ar.guess_num,
-        ar.total_guesses,
-        &ar.current_image,
+        &ar,
         &mut round_scores_free,
         &participants,
-        ar.answer_timeout_secs,
     )
     .await
     {
-        error!("resume_active_round: replayed guess error: {e}");
+        error!("resume_active_round: resumed guess error: {e}");
     }
 
     // ── Continue with remaining guesses ───────────────────────────────────────
@@ -2103,6 +2442,8 @@ pub async fn resume_active_round(ctx: BotContext, client: Client, ar: ActiveRoun
                 answer_timeout_secs: ar.answer_timeout_secs,
                 dm_participants: dm_state,
                 round_scores: round_scores_free.clone(),
+                open: None,
+                scored: false,
             });
             st.save(&ctx.state_path).await.ok();
         }
@@ -2342,6 +2683,8 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
                 answer_timeout_secs: pj.answer_timeout_secs,
                 dm_participants: dm_state,
                 round_scores: round_scores_free.clone(),
+                open: None,
+                scored: false,
             });
             st.save(&ctx.state_path).await.ok();
         }
@@ -2447,6 +2790,27 @@ mod tests {
             "😴 1 player joined but didn't guess: lost every duel."
         );
         assert!(missed_line(2).starts_with("😴 2 players"));
+    }
+
+    #[test]
+    fn the_time_left_after_a_restart_counts_from_the_prompt() {
+        let opened = chrono::DateTime::parse_from_rfc3339("2026-10-20T18:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let at = |secs: i64| opened + chrono::Duration::seconds(secs);
+        assert_eq!(time_left(opened, 90, at(0)), 90);
+        assert_eq!(time_left(opened, 90, at(30)), 60);
+        assert_eq!(time_left(opened, 90, at(90)), 0);
+        assert_eq!(
+            time_left(opened, 90, at(500)),
+            0,
+            "long outage: the guess closes at once"
+        );
+        assert_eq!(
+            time_left(opened, 90, at(-5)),
+            90,
+            "a clock that went back does not add time"
+        );
     }
 
     #[test]

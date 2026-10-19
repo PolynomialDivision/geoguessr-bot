@@ -216,6 +216,8 @@ async fn main() -> Result<()> {
         let web_state = web::WebState {
             store: Arc::clone(&web_tokens),
             active_game: Arc::clone(&ctx.active_game),
+            state: Arc::clone(&ctx.state),
+            state_path: ctx.state_path.clone(),
             client: client.clone(),
             room_id: room_id.clone(),
             max_guesses: config.schedule.max_guesses_per_player,
@@ -286,6 +288,9 @@ async fn main() -> Result<()> {
                                             }, max_g)
                                         })
                                     };
+                                    if accepted == Some(true) {
+                                        game::persist_guesses(&ctx2.state, &ctx2.state_path, &ctx2.active_game).await;
+                                    }
                                     if let Some(r) = room2 {
                                         let msg = match accepted {
                                             Some(true) => format!("✅ {sender}, your guess \"{query}\" is in."),

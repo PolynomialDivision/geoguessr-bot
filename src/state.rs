@@ -6,7 +6,7 @@ use std::{
     path::Path,
 };
 
-use crate::sources::GeoImage;
+use crate::{game::FreeGuess, sources::GeoImage};
 
 /// Persisted state for a round that is currently in progress.
 /// Saved before each guess so the bot can resume after a restart.
@@ -21,6 +21,37 @@ pub struct ActiveRoundState {
     pub answer_timeout_secs: u64,
     pub dm_participants: HashMap<String, ActiveDmParticipant>,
     pub round_scores: HashMap<String, i64>, // accumulated scores so far
+    /// The guess the players are answering right now: set once the images and the
+    /// prompt are in the room, cleared when the guess is scored. A restart in between
+    /// carries on with the same guess: the guesses received so far, the links that
+    /// were posted and the time that is left (game::resume_free_guess).
+    #[serde(default)]
+    pub open: Option<OpenGuess>,
+    /// True once this guess is scored and in the database: a restart during the
+    /// reveal moves on to the next image instead of playing this one again.
+    #[serde(default)]
+    pub scored: bool,
+}
+
+/// What a restart needs to carry on with the guess that is open.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct OpenGuess {
+    /// The `guesses` row of this image.
+    pub guess_id: i64,
+    /// The countdown message in the main room (edited with the time bar).
+    pub prompt_event_id: String,
+    /// When the countdown started; the time left after a restart counts from here.
+    pub opened_at: DateTime<Utc>,
+    /// Personal map links posted in the room: user ID → token. The links stay valid
+    /// after a restart because the tokens are restored from here.
+    #[serde(default)]
+    pub web_tokens: HashMap<String, String>,
+    /// The "🗺️ alice · bob" links message, edited as the guesses come in.
+    #[serde(default)]
+    pub links_event_id: Option<String>,
+    /// The guesses received so far, saved with every submission.
+    #[serde(default)]
+    pub guesses: HashMap<String, FreeGuess>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -174,6 +205,35 @@ mod tests {
             answer_timeout_secs: 90,
             dm_participants: dm,
             round_scores: scores,
+            open: None,
+            scored: false,
+        }
+    }
+
+    fn sample_open_guess() -> OpenGuess {
+        let mut guesses = HashMap::new();
+        guesses.insert(
+            "@alice:example.com".to_owned(),
+            FreeGuess {
+                text: "Munich".to_owned(),
+                lat: 48.1,
+                lon: 11.6,
+                submitted_at: chrono::DateTime::parse_from_rfc3339("2024-01-01T12:00:30Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            },
+        );
+        let mut web_tokens = HashMap::new();
+        web_tokens.insert("@alice:example.com".to_owned(), "tok-alice".to_owned());
+        OpenGuess {
+            guess_id: 7,
+            prompt_event_id: "$prompt:example.com".to_owned(),
+            opened_at: chrono::DateTime::parse_from_rfc3339("2024-01-01T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            web_tokens,
+            links_event_id: Some("$links:example.com".to_owned()),
+            guesses,
         }
     }
 
@@ -310,6 +370,45 @@ mod tests {
         let path = dir.path().join("nonexistent.json");
         let state = State::load(&path).await.unwrap();
         assert!(state.active_round.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_submitted_guess_survives_save_and_load() {
+        // The point of OpenGuess: what a player sent before a restart is still there
+        // after it, with the links and the prompt the resume carries on with.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut state = State::default();
+        let mut ar = sample_active_round();
+        ar.open = Some(sample_open_guess());
+        state.active_round = Some(ar);
+        state.save(&path).await.unwrap();
+
+        let open = State::load(&path)
+            .await
+            .unwrap()
+            .active_round
+            .unwrap()
+            .open
+            .unwrap();
+        assert_eq!(open.guess_id, 7);
+        assert_eq!(open.prompt_event_id, "$prompt:example.com");
+        assert_eq!(open.links_event_id.as_deref(), Some("$links:example.com"));
+        assert_eq!(open.web_tokens["@alice:example.com"], "tok-alice");
+        let g = &open.guesses["@alice:example.com"];
+        assert_eq!((g.text.as_str(), g.lat, g.lon), ("Munich", 48.1, 11.6));
+    }
+
+    #[test]
+    fn an_old_state_file_without_the_open_guess_still_loads() {
+        // state.json written by the previous version: no `open`, no `scored`.
+        let mut v = serde_json::to_value(sample_active_round()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("open");
+        obj.remove("scored");
+        let ar: ActiveRoundState = serde_json::from_value(v).unwrap();
+        assert!(ar.open.is_none());
+        assert!(!ar.scored);
     }
 
     #[tokio::test]

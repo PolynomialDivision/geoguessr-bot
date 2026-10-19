@@ -63,6 +63,9 @@ pub fn new_token_store() -> SharedTokenStore {
 pub struct WebState {
     pub store: SharedTokenStore,
     pub active_game: Arc<Mutex<Option<ActiveGame>>>,
+    /// The state file: every accepted guess is written there so a restart keeps it.
+    pub state: Arc<Mutex<crate::state::State>>,
+    pub state_path: std::path::PathBuf,
     pub client: Client,
     pub room_id: OwnedRoomId,
     /// 0 = unlimited updates; >0 = only the first submission counts.
@@ -181,7 +184,10 @@ async fn submit_guess(
     );
 
     match accepted {
-        Some(true) => update_links_message(&ws, tok.round_id, tok.guess_num).await,
+        Some(true) => {
+            crate::game::persist_guesses(&ws.state, &ws.state_path, &ws.active_game).await;
+            update_links_message(&ws, tok.round_id, tok.guess_num).await;
+        }
         Some(false) => {}
         // The page shows this text instead of a "recorded" confirmation that
         // would never count.
