@@ -32,6 +32,7 @@ mod commands;
 mod config;
 mod countries;
 mod db;
+mod duels;
 mod format;
 mod game;
 mod geocode;

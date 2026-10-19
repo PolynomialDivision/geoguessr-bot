@@ -10,6 +10,8 @@ use std::{
 };
 use tracing::info;
 
+use crate::duels::Entry;
+
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
 }
@@ -715,6 +717,60 @@ impl Db {
                 best_distance_km: r.get(6)?,
             }))?;
             rows.map(|r| r.context("reading score leaderboard row")).collect()
+        })
+        .await
+    }
+}
+
+// ── Duels ─────────────────────────────────────────────────────────────────────
+
+impl Db {
+    /// Every free-guess row (real and missed) of rounds started at/after
+    /// `since` (all rounds when `None`), the input for `duels::standings`.
+    pub async fn duel_entries(&self, since: Option<DateTime<Utc>>) -> Result<Vec<Entry>> {
+        let since_str = since
+            .map(|s| s.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+            .unwrap_or_default();
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT a.guess_id, a.user_id, a.missed, a.distance_km
+                   FROM answers a
+                   JOIN rounds r ON r.id = a.round_id
+                  WHERE a.source IN ('free_guess', 'missed')
+                    AND r.started_at >= ?1",
+            )?;
+            let rows = stmt.query_map(params![since_str], |r| {
+                let missed: i64 = r.get(2)?;
+                let dist: Option<f64> = r.get(3)?;
+                Ok(Entry {
+                    image: r.get(0)?,
+                    user_id: r.get(1)?,
+                    dist_km: if missed != 0 { None } else { dist },
+                })
+            })?;
+            rows.map(|r| r.context("reading duel row")).collect()
+        })
+        .await
+    }
+
+    /// Duel rows of one round, see `duel_entries`.
+    pub async fn round_duel_entries(&self, round_id: i64) -> Result<Vec<Entry>> {
+        self.run(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT guess_id, user_id, missed, distance_km
+                   FROM answers
+                  WHERE round_id = ?1 AND source IN ('free_guess', 'missed')",
+            )?;
+            let rows = stmt.query_map(params![round_id], |r| {
+                let missed: i64 = r.get(2)?;
+                let dist: Option<f64> = r.get(3)?;
+                Ok(Entry {
+                    image: r.get(0)?,
+                    user_id: r.get(1)?,
+                    dist_km: if missed != 0 { None } else { dist },
+                })
+            })?;
+            rows.map(|r| r.context("reading duel row")).collect()
         })
         .await
     }

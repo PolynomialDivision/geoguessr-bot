@@ -7,6 +7,7 @@ use tracing::error;
 
 use crate::{
     config::ScheduleConfig,
+    duels::{self, Standing},
     game::{self, format_dist},
     state::ScheduledOnce,
     BotContext,
@@ -550,167 +551,99 @@ async fn cmd_scores_month(ctx: &BotContext) -> Result<Option<String>> {
     }
 }
 
-// ── Scoring / rating ─────────────────────────────────────────────────────────
+// ── Leaderboards ─────────────────────────────────────────────────────────────
 //
-// The leaderboard rating is a Bayesian-shrinkage estimate of a player's true
-// skill:
-//
-//   rating = (n / (n + k)) * player_average + (k / (n + k)) * baseline
-//
-// `n` is `guesses_played`. Every guess a player was on the hook for, real
-// submissions AND missed/no-guess rounds (recorded as 0, see
-// `Db::record_missed_guesses`). Counting misses as 0 rather than excluding
-// them is what makes "every round you join counts": skipping a hard guess
-// drags your average down instead of just not counting, so there's no
-// strategic benefit to only answering the easy ones.
-//
-// `baseline` is the community's own average score per guess: derived from
-// the leaderboard data itself (see `community_baseline`), not a fixed
-// constant, so it tracks the actual difficulty/skill level of this room's
-// games over time.
-//
-// `k` (config: `schedule.rating.k`) controls how fast a player's rating
-// trusts their own average over the baseline: at n = k they're weighted
-// equally; at n >> k the rating is essentially their raw average; at n = 0
-// the rating is exactly the baseline. This is what keeps a single lucky
-// perfect round from outranking someone with a long, consistently good
-// track record, while a player who plays a lot but badly still converges to
-// their own (low) rating rather than being propped up by participation
-// alone: shrinkage only pulls toward the baseline, it never adds points
-// for volume.
+// Every board is built from duels (see `duels`) straight from the stored
+// distances, so an image's result never shifts after it closed. The month
+// is a season: duel points add up, so playing more counts. The 90-day and
+// all-time boards measure skill: the share of duels won, ranked once a
+// player has `leaderboard.min_images` images.
 
-fn raw_score_average(entry: &crate::db::ScoreLeaderboardEntry) -> f64 {
-    if entry.guesses_played > 0 {
-        entry.total_score as f64 / entry.guesses_played as f64
-    } else {
-        0.0
-    }
+/// How a board is ranked.
+#[derive(Clone, Copy)]
+enum Order {
+    /// Most duel points (the month).
+    Points,
+    /// Best share of duels won, from this many images (90 days, all time).
+    Rate { min_images: i64 },
 }
 
-/// Community baseline: average score per guess across the whole board
-/// (real + missed guesses). Falls back to `fallback` only when there's no
-/// data yet to derive one from (e.g. right after `!resetstats`).
-fn community_baseline(board: &[crate::db::ScoreLeaderboardEntry], fallback: f64) -> f64 {
-    let total_score: i64 = board.iter().map(|e| e.total_score).sum();
-    let total_guesses: i64 = board.iter().map(|e| e.guesses_played).sum();
-    if total_guesses > 0 {
-        total_score as f64 / total_guesses as f64
-    } else {
-        fallback
-    }
-}
-
-/// Bayesian-shrinkage rating, see the module-level comment above.
-fn shrunk_rating(entry: &crate::db::ScoreLeaderboardEntry, k: f64, baseline: f64) -> f64 {
-    let n = entry.guesses_played as f64;
-    if n <= 0.0 {
-        return baseline;
-    }
-    let weight = n / (n + k.max(0.0));
-    weight * raw_score_average(entry) + (1.0 - weight) * baseline
-}
-
-/// Percentage of `guesses_played` that were real submissions (not missed).
-fn completion_pct(entry: &crate::db::ScoreLeaderboardEntry) -> f64 {
-    if entry.guesses_played > 0 {
-        entry.guesses_answered as f64 / entry.guesses_played as f64 * 100.0
-    } else {
-        0.0
-    }
-}
-
-/// A rating is "provisional" (not yet enough data to trust) below the
-/// configured `provisional_threshold` of guesses played. Display-only; the
-/// rating math already accounts for sample size via shrinkage regardless.
-fn is_provisional(entry: &crate::db::ScoreLeaderboardEntry, threshold: i64) -> bool {
-    entry.guesses_played < threshold
-}
-
-fn sort_score_leaderboard(board: &mut [crate::db::ScoreLeaderboardEntry], k: f64, baseline: f64) {
-    board.sort_by(|a, b| {
-        shrunk_rating(b, k, baseline)
-            .partial_cmp(&shrunk_rating(a, k, baseline))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(b.guesses_played.cmp(&a.guesses_played))
-            // Same rating and volume (e.g. everyone's 1-for-1 this month):
-            // break the tie the same way a round itself does: closer best
-            // guess wins, see the `scored.sort_by` in game.rs, instead of
-            // falling straight through to an alphabetical user_id order that
-            // has nothing to do with who actually played better.
-            .then(
-                a.best_distance_km
-                    .partial_cmp(&b.best_distance_km)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
-            .then(a.user_id.cmp(&b.user_id))
-    });
-}
-
-fn format_leaderboard(
-    mut board: Vec<crate::db::ScoreLeaderboardEntry>,
-    header: &str,
-    round_count: i64,
-    rating_cfg: &crate::config::RatingConfig,
-) -> String {
-    const BAR_W: usize = 10;
-
-    let baseline = community_baseline(&board, rating_cfg.baseline_fallback);
-    let k = rating_cfg.k;
-    sort_score_leaderboard(&mut board, k, baseline);
-
-    let mut lines = vec![
-        format!("🏆 **{}** · {} rounds", header, round_count),
-        format!(
-            "⭐ Rating: your average, blended with the group average (⭐{}) until you have played enough.\n\
-             🔰 Provisional: fewer than {} guesses.",
-            baseline.round() as i64,
-            rating_cfg.provisional_threshold,
+/// "⚔️ 20 of 25 duels · 80%", or a note when there was nobody to duel.
+fn duel_line(s: &Standing) -> String {
+    match s.rate() {
+        Some(rate) => format!(
+            "⚔️ {} of {} duels · {}%",
+            duels::fmt_points(s.halves),
+            s.duels,
+            (rate * 100.0).round() as i64
         ),
-        String::new(),
-    ];
-    for (i, entry) in board.iter().enumerate() {
+        None => "⚔️ no duels yet".to_owned(),
+    }
+}
+
+/// "👑 11 · 🎮 17 · 😴 2 · 🏅 3 m": misses and the closest guess only when
+/// there are any.
+fn record_line(s: &Standing) -> String {
+    let mut parts = vec![format!("👑 {}", s.wins), format!("🎮 {}", s.images)];
+    if s.missed > 0 {
+        parts.push(format!("😴 {}", s.missed));
+    }
+    if let Some(best) = s.best_km {
+        parts.push(format!("🏅 {}", format_dist(best)));
+    }
+    parts.join(" · ")
+}
+
+fn format_leaderboard(mut board: Vec<Standing>, header: &str, round_count: i64, order: Order) -> String {
+    let mut lines = vec![format!("🏆 **{header}** · {round_count} rounds")];
+    let (ranked, unranked) = match order {
+        Order::Points => {
+            lines.push("⚔️ +1 for every player you beat on an image, ½ for a tie.".to_owned());
+            duels::sort_by_points(&mut board);
+            (board, Vec::new())
+        }
+        Order::Rate { min_images } => {
+            lines.push(format!("⚔️ Ranked by the share of duels won, from {min_images} images."));
+            let (mut ranked, mut unranked): (Vec<_>, Vec<_>) = board
+                .into_iter()
+                .partition(|s| s.images >= min_images && s.duels > 0);
+            duels::sort_by_rate(&mut ranked);
+            unranked.sort_by(|a, b| b.images.cmp(&a.images).then(a.user_id.cmp(&b.user_id)));
+            (ranked, unranked)
+        }
+    };
+    lines.push("😴 Joined but no guess loses the duel.".to_owned());
+    lines.push("👑 images won · 🎮 played · 🏅 closest".to_owned());
+
+    for (i, s) in ranked.iter().enumerate() {
         let medal = match i {
             0 => "🥇",
             1 => "🥈",
             2 => "🥉",
             _ => "▪️",
         };
-        let rating = shrunk_rating(entry, k, baseline);
-        let raw_avg = raw_score_average(entry);
-        let pct = completion_pct(entry);
-        let best_dist = if entry.guesses_answered > 0 {
-            format_dist(entry.best_distance_km)
-        } else {
-            "n/a".to_owned()
-        };
-        let filled = ((rating / 5000.0) * BAR_W as f64).round() as usize;
-        let bar = format!(
-            "{}{}",
-            "█".repeat(filled.min(BAR_W)),
-            "░".repeat(BAR_W - filled.min(BAR_W))
-        );
-        let provisional = if is_provisional(entry, rating_cfg.provisional_threshold) {
-            " 🔰"
-        } else {
-            ""
-        };
-        lines.push(format!(
-            "{medal} {}. {}{provisional}\n⭐{} {bar}\n🎯{}/g · ✅{}% · 🎮{} · 🏅{}",
-            i + 1,
-            entry.user_id,
-            rating.round() as i64,
-            raw_avg.round() as i64,
-            pct.round() as i64,
-            entry.guesses_played,
-            best_dist,
-        ));
+        lines.push(String::new());
+        lines.push(format!("{medal} {}. {}", i + 1, s.user_id));
+        lines.push(duel_line(s));
+        lines.push(record_line(s));
+    }
+    if let (Order::Rate { min_images }, false) = (order, unranked.is_empty()) {
+        lines.push(String::new());
+        lines.push(format!("🔰 Not ranked yet, under {min_images} images:"));
+        for s in &unranked {
+            lines.push(format!("▪️ {} · 🎮 {}", s.user_id, s.images));
+        }
     }
     lines.join("\n")
 }
 
+fn min_images(ctx: &BotContext) -> i64 {
+    ctx.config.schedule.leaderboard.min_images.max(1)
+}
+
 /// All-time leaderboard (every round ever played). Used by `!leaderboard`.
 pub async fn build_alltime_leaderboard(ctx: &BotContext) -> Option<String> {
-    let board = ctx.db.score_leaderboard_alltime().await.ok()?;
+    let board = duels::standings(&ctx.db.duel_entries(None).await.ok()?);
     if board.is_empty() {
         return None;
     }
@@ -719,22 +652,27 @@ pub async fn build_alltime_leaderboard(ctx: &BotContext) -> Option<String> {
         board,
         "All-time Leaderboard",
         round_count,
-        &ctx.config.schedule.rating,
+        Order::Rate {
+            min_images: min_images(ctx),
+        },
     ))
 }
 
 /// 90-day rolling leaderboard.
 pub async fn build_rolling_leaderboard(ctx: &BotContext) -> Option<String> {
-    let board = ctx.db.score_leaderboard().await.ok()?;
+    let since = chrono::Utc::now() - chrono::Duration::days(90);
+    let board = duels::standings(&ctx.db.duel_entries(Some(since)).await.ok()?);
     if board.is_empty() {
         return None;
     }
-    let round_count = ctx.db.round_count().await.unwrap_or(0);
+    let round_count = ctx.db.round_count_since(since).await.unwrap_or(0);
     Some(format_leaderboard(
         board,
         "Leaderboard (last 90 days)",
         round_count,
-        &ctx.config.schedule.rating,
+        Order::Rate {
+            min_images: min_images(ctx),
+        },
     ))
 }
 
@@ -763,11 +701,10 @@ fn month_start_utc(tz: Tz, local_now: chrono::DateTime<Tz>) -> chrono::DateTime<
 /// bot's configured timezone). Posted after each round instead of the
 /// all-time leaderboard so recent activity stays prominent; `!scores` /
 /// `!leaderboard` remain the all-time view, and `!scoresmonth` /
-/// `!leaderboardmonth` request this one explicitly. Uses the exact same
-/// rating math as the all-time leaderboard (`format_leaderboard`), only
-/// which rounds are included differs, computed straight from persisted
-/// round timestamps, so there's no separate monthly state to keep in sync
-/// and a restart or month rollover can't duplicate or drift scores.
+/// `!leaderboardmonth` request this one explicitly. Ranked by duel points,
+/// computed straight from persisted round timestamps, so there's no
+/// separate monthly state to keep in sync and a restart or month rollover
+/// can't duplicate or drift scores.
 pub async fn build_monthly_leaderboard(ctx: &BotContext) -> Option<String> {
     let tz: Tz = ctx
         .config
@@ -777,7 +714,7 @@ pub async fn build_monthly_leaderboard(ctx: &BotContext) -> Option<String> {
         .unwrap_or(chrono_tz::UTC);
     let month_start = current_month_start_utc(tz);
 
-    let board = ctx.db.score_leaderboard_month(month_start).await.ok()?;
+    let board = duels::standings(&ctx.db.duel_entries(Some(month_start)).await.ok()?);
     if board.is_empty() {
         return None;
     }
@@ -786,12 +723,7 @@ pub async fn build_monthly_leaderboard(ctx: &BotContext) -> Option<String> {
         "{} Leaderboard",
         chrono::Utc::now().with_timezone(&tz).format("%B %Y")
     );
-    Some(format_leaderboard(
-        board,
-        &header,
-        round_count,
-        &ctx.config.schedule.rating,
-    ))
+    Some(format_leaderboard(board, &header, round_count, Order::Points))
 }
 
 // ── !mystats ──────────────────────────────────────────────────────────────────
@@ -814,37 +746,31 @@ async fn cmd_mystats(ctx: &BotContext, sender: &OwnedUserId) -> Result<Option<St
         0
     };
 
-    let rating_cfg = &ctx.config.schedule.rating;
-    let mut board = ctx.db.score_leaderboard_alltime().await.unwrap_or_default();
-    let baseline = community_baseline(&board, rating_cfg.baseline_fallback);
-    sort_score_leaderboard(&mut board, rating_cfg.k, baseline);
-    let rank = board.iter().position(|e| e.user_id == user).map(|i| i + 1);
-    let rank_str = rank
-        .map(|r| format!(" · rank #{r} of {}", board.len()))
-        .unwrap_or_default();
+    let min_images = min_images(ctx);
+    let mut board = duels::standings(&ctx.db.duel_entries(None).await.unwrap_or_default());
+    board.retain(|s| s.user_id == user || (s.images >= min_images && s.duels > 0));
+    duels::sort_by_rate(&mut board);
+    let me = board.iter().find(|s| s.user_id == user);
+    let rank_str = match me {
+        Some(s) if s.images >= min_images && s.duels > 0 => {
+            let rank = board.iter().position(|e| e.user_id == user).unwrap_or(0) + 1;
+            let ranked = board.iter().filter(|e| e.images >= min_images && e.duels > 0).count();
+            format!(" · rank #{rank} of {ranked}")
+        }
+        _ => String::new(),
+    };
 
     let mut lines = vec![format!(
         "🌍 **Your stats** · {}/{} correct ({}%) · {} round(s){rank_str}",
         stats.total_correct, stats.total_questions, pct, stats.rounds_played,
     )];
 
-    if let Some(entry) = board.iter().find(|e| e.user_id == user) {
-        let rating = shrunk_rating(entry, rating_cfg.k, baseline);
-        let raw_avg = raw_score_average(entry);
-        let pct = completion_pct(entry);
-        let provisional = if is_provisional(entry, rating_cfg.provisional_threshold) {
-            " (provisional)"
-        } else {
-            ""
-        };
-        lines.push(format!(
-            "⭐ Rating {}{provisional} · avg {} pts/guess · {}% completion ({} guesses, {} missed)",
-            rating.round() as i64,
-            raw_avg.round() as i64,
-            pct.round() as i64,
-            entry.guesses_played,
-            entry.guesses_played - entry.guesses_answered,
-        ));
+    if let Some(s) = me {
+        lines.push(duel_line(s));
+        lines.push(record_line(s));
+        if s.images < min_images {
+            lines.push(format!("🔰 Ranked from {min_images} images."));
+        }
     }
 
     let country_stats = ctx.db.user_country_stats(user).await.unwrap_or_default();
@@ -1065,220 +991,82 @@ fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RatingConfig;
-    use crate::db::ScoreLeaderboardEntry;
 
-    /// A player with no missed guesses: `guesses_answered == guesses_played`,
-    /// matching every pre-existing (pre-`missed`-column) row.
-    fn score_entry(user_id: &str, total_score: i64, guesses_played: i64) -> ScoreLeaderboardEntry {
-        score_entry_with_misses(user_id, total_score, guesses_played, guesses_played)
-    }
-
-    /// A player with `guesses_played - guesses_answered` missed guesses
-    /// (each contributing 0 to `total_score`, matching how
-    /// `Db::record_missed_guesses` stores them).
-    fn score_entry_with_misses(
-        user_id: &str,
-        total_score: i64,
-        guesses_played: i64,
-        guesses_answered: i64,
-    ) -> ScoreLeaderboardEntry {
-        ScoreLeaderboardEntry {
-            user_id: user_id.to_owned(),
-            total_score,
-            rounds_played: guesses_played,
-            guesses_played,
-            guesses_answered,
-            avg_distance_km: 1000.0,
-            best_distance_km: 100.0,
+    fn standing(user: &str, halves: i64, duels: i64, images: i64) -> Standing {
+        Standing {
+            user_id: user.to_owned(),
+            halves,
+            duels,
+            wins: halves / 4,
+            images,
+            missed: 0,
+            best_km: Some(0.003),
         }
     }
 
-    const TEST_RATING: RatingConfig = RatingConfig {
-        k: 15.0,
-        provisional_threshold: 10,
-        baseline_fallback: 1500.0,
-    };
-
-    // ── Missed guesses count as zero ────────────────────────────────────────
+    // ── Leaderboard text ─────────────────────────────────────────────────────
 
     #[test]
-    fn missed_guess_drags_average_down_instead_of_being_ignored() {
-        // One perfect 5000-pt guess, then one missed guess (0 pts). If the
-        // miss were simply excluded (the old bug), this would still average
-        // 5000/1 = 5000. Counted as a zero, it should average 5000/2 = 2500.
-        let entry = score_entry_with_misses("@skipper:example.com", 5_000, 2, 1);
-
-        assert_eq!(raw_score_average(&entry), 2500.0);
-        assert_eq!(completion_pct(&entry), 50.0);
-    }
-
-    #[test]
-    fn fully_missed_player_has_zero_average_not_no_average() {
-        let entry = score_entry_with_misses("@ghost:example.com", 0, 3, 0);
-
-        assert_eq!(raw_score_average(&entry), 0.0);
-        assert_eq!(completion_pct(&entry), 0.0);
-    }
-
-    // ── One lucky round shouldn't dominate ──────────────────────────────────
-
-    #[test]
-    fn one_perfect_round_does_not_outrank_sustained_consistent_play() {
-        // A single perfect round (raw average 5000, n=1) vs. 50 rounds of
-        // solid (not perfect) play averaging 2200.
-        let lucky = score_entry("@lucky-one-shot:example.com", 5_000, 1);
-        let consistent = score_entry("@consistent-grinder:example.com", 2_200 * 50, 50);
-
-        let baseline = 1800.0;
-        let rating_lucky = shrunk_rating(&lucky, TEST_RATING.k, baseline);
-        let rating_consistent = shrunk_rating(&consistent, TEST_RATING.k, baseline);
-
-        assert!(
-            rating_consistent > rating_lucky,
-            "consistent play ({rating_consistent}) should outrank a single lucky round ({rating_lucky})"
-        );
-
-        let mut board = vec![lucky, consistent];
-        sort_score_leaderboard(&mut board, TEST_RATING.k, baseline);
-        assert_eq!(board[0].user_id, "@consistent-grinder:example.com");
-    }
-
-    // ── Many consistently good rounds → rating trusts the player's own average ──
-
-    #[test]
-    fn many_good_rounds_converge_close_to_raw_average() {
-        let veteran = score_entry("@veteran:example.com", 2_500 * 200, 200);
-        let baseline = 1800.0;
-
-        let rating = shrunk_rating(&veteran, TEST_RATING.k, baseline);
-        let raw_avg = raw_score_average(&veteran);
-
-        // n=200 vastly outweighs k=15, so the baseline's pull should be minor.
-        assert!(
-            (rating - raw_avg).abs() < 100.0,
-            "rating {rating} should be close to raw average {raw_avg} at large n"
-        );
-    }
-
-    // ── Grinding badly isn't rewarded merely for participation ─────────────
-
-    #[test]
-    fn repeated_bad_play_is_not_propped_up_by_participation() {
-        // Plays constantly but badly: raw average 200, far below baseline.
-        let bad_grinder = score_entry("@bad-grinder:example.com", 200 * 100, 100);
-        // Barely plays, but happens to land right at the baseline average.
-        let mediocre_newcomer = score_entry("@mediocre-newcomer:example.com", 1_800 * 2, 2);
-
-        let baseline = 1800.0;
-        let rating_bad = shrunk_rating(&bad_grinder, TEST_RATING.k, baseline);
-        let rating_newcomer = shrunk_rating(&mediocre_newcomer, TEST_RATING.k, baseline);
-
-        // Volume alone must not lift the bad grinder above someone who merely
-        // played a couple of average rounds. The rating should track their
-        // own poor average, not their participation count.
-        assert!(
-            rating_bad < rating_newcomer,
-            "grinding badly ({rating_bad}) must not outrank a mediocre newcomer ({rating_newcomer})"
-        );
-        // And it should sit close to their own (bad) average, not be pulled
-        // meaningfully toward the baseline just because n is large.
-        assert!(
-            rating_bad < baseline - 1000.0,
-            "rating {rating_bad} should stay well below the baseline {baseline}"
-        );
-    }
-
-    // ── Baseline is a genuine (weighted) community average ─────────────────
-
-    #[test]
-    fn community_baseline_is_guess_weighted_not_a_naive_average_of_averages() {
-        let a = score_entry("@a:example.com", 1_000, 10); // avg 100
-        let b = score_entry("@b:example.com", 100_000, 100); // avg 1000
-
-        // Weighted: (1000 + 100000) / (10 + 100) = 918.18...
-        // A naive mean of the two per-player averages would give 550 instead:
-        // wrong, because it would let a low-volume player skew the
-        // baseline as much as a high-volume one.
-        let baseline = community_baseline(&[a, b], 1500.0);
-        assert!((baseline - 918.18).abs() < 0.1, "baseline was {baseline}");
-    }
-
-    #[test]
-    fn community_baseline_falls_back_when_no_data() {
-        assert_eq!(community_baseline(&[], 1500.0), 1500.0);
-    }
-
-    // ── Existing (pre-`missed`-column) data keeps working ───────────────────
-
-    #[test]
-    fn legacy_style_entries_with_no_misses_behave_sanely() {
-        // Every historical row defaults to missed=0, so guesses_answered ==
-        // guesses_played for all pre-existing data: completion should read
-        // 100% and the rating/average math should behave exactly as before.
-        let legacy = score_entry("@veteran-since-day-one:example.com", 4_000 * 30, 30);
-
-        assert_eq!(completion_pct(&legacy), 100.0);
-        assert_eq!(raw_score_average(&legacy), 4_000.0);
-        assert!(!is_provisional(&legacy, TEST_RATING.provisional_threshold));
-    }
-
-    // ── Sorting + formatting ─────────────────────────────────────────────────
-
-    #[test]
-    fn sort_score_leaderboard_orders_by_rating_then_volume_then_name() {
-        let mut board = vec![
-            score_entry("@high-total-low-average:example.com", 100_000, 100),
-            score_entry("@lower-total-high-average:example.com", 50_000, 10),
-        ];
-
-        sort_score_leaderboard(&mut board, TEST_RATING.k, 1800.0);
-
-        assert_eq!(board[0].user_id, "@lower-total-high-average:example.com");
-    }
-
-    #[test]
-    fn provisional_flag_reflects_threshold() {
-        let new_player = score_entry("@new:example.com", 5_000, 3);
-        let established = score_entry("@established:example.com", 100_000, 30);
-
-        assert!(is_provisional(
-            &new_player,
-            TEST_RATING.provisional_threshold
-        ));
-        assert!(!is_provisional(
-            &established,
-            TEST_RATING.provisional_threshold
-        ));
-    }
-
-    #[test]
-    fn leaderboard_formatting_shows_rating_average_completion_and_volume() {
-        // Single entry → the community baseline equals its own average, so
-        // shrinkage is a no-op and the rating is exactly the raw average:
-        // keeps the expected string deterministic.
+    fn the_month_ranks_by_duel_points_and_explains_them() {
         let text = format_leaderboard(
-            vec![score_entry("@twenty-guesses:example.com", 100_000, 20)],
-            "Test Leaderboard",
-            1,
-            &TEST_RATING,
+            vec![
+                standing("@sharp:example.com", 20, 10, 5),
+                standing("@busy:example.com", 41, 40, 17),
+            ],
+            "October 2026 Leaderboard",
+            17,
+            Order::Points,
         );
-
-        assert!(text.contains(
-            "🥇 1. @twenty-guesses:example.com\n⭐5000 ██████████\n🎯5000/g · ✅100% · 🎮20 · 🏅100 km"
-        ));
+        assert!(text.starts_with("🏆 **October 2026 Leaderboard** · 17 rounds"));
+        assert!(text.contains("+1 for every player you beat"));
+        let busy = text.find("🥇 1. @busy:example.com").expect("busy leads on points");
+        assert!(text.find("🥈 2. @sharp:example.com").unwrap() > busy);
+        assert!(text.contains("⚔️ 20½ of 40 duels · 51%"));
+        assert!(text.contains("👑 10 · 🎮 17 · 🏅 3 m"));
+        assert!(!text.contains("pts"), "no more 5000-point scale");
+        assert!(!text.contains(" | "));
     }
 
     #[test]
-    fn leaderboard_formatting_marks_provisional_entries() {
+    fn the_long_run_ranks_by_share_and_lists_newcomers_apart() {
         let text = format_leaderboard(
-            vec![score_entry("@fresh:example.com", 5_000, 2)],
-            "Test Leaderboard",
-            1,
-            &TEST_RATING,
+            vec![
+                standing("@sharp:example.com", 40, 25, 20),
+                standing("@busy:example.com", 60, 60, 40),
+                standing("@lucky:example.com", 4, 2, 2),
+            ],
+            "All-time Leaderboard",
+            40,
+            Order::Rate { min_images: 20 },
         );
+        let sharp = text.find("🥇 1. @sharp:example.com").expect("80% beats 50%");
+        assert!(text.find("🥈 2. @busy:example.com").unwrap() > sharp);
+        assert!(text.contains("🔰 Not ranked yet, under 20 images:
+▪️ @lucky:example.com · 🎮 2"));
+        assert!(!text.contains(". @lucky"), "two lucky images don't top the board");
+    }
 
-        assert!(text.contains("@fresh:example.com 🔰"));
+    #[test]
+    fn misses_and_solo_players_read_plainly() {
+        let mut s = standing("@solo:example.com", 0, 0, 3);
+        s.missed = 1;
+        s.best_km = None;
+        assert_eq!(duel_line(&s), "⚔️ no duels yet");
+        assert_eq!(record_line(&s), "👑 0 · 🎮 3 · 😴 1");
+    }
+
+    #[test]
+    fn mention_ready_ids_are_left_for_mentionify() {
+        let text = format_leaderboard(
+            vec![standing("@alice:example.com", 2, 1, 1)],
+            "August 2026 Leaderboard",
+            5,
+            Order::Points,
+        );
+        // Raw "@user:server" mxid, unmodified: `format::mentionify` (applied
+        // uniformly wherever command output and round summaries are sent,
+        // see main.rs/game.rs) turns this into a proper mention pill.
+        assert!(text.contains("@alice:example.com"));
     }
 
     // ── Monthly leaderboard ──────────────────────────────────────────────────
@@ -1303,83 +1091,5 @@ mod tests {
         let start = month_start_utc(tz, local_now);
 
         assert_eq!(start.to_rfc3339(), "2025-12-31T23:00:00+00:00");
-    }
-
-    /// Monthly and all-time leaderboards share the exact same sort/format
-    /// pipeline (`format_leaderboard` → `sort_score_leaderboard`). The only
-    /// difference between them is which rounds the DB query includes before
-    /// handing the board over. So tied entries (equal rating, equal volume,
-    /// *and* equal best distance, nothing left to distinguish them) must
-    /// break the tie identically in both: alphabetically by user_id.
-    #[test]
-    fn ties_break_identically_regardless_of_leaderboard_type() {
-        let build_tied_board = || {
-            vec![
-                score_entry("@zed:example.com", 50_000, 10),
-                score_entry("@amy:example.com", 50_000, 10),
-            ]
-        };
-
-        let mut alltime_shaped = build_tied_board();
-        let mut month_shaped = build_tied_board();
-        sort_score_leaderboard(&mut alltime_shaped, TEST_RATING.k, 1800.0);
-        sort_score_leaderboard(&mut month_shaped, TEST_RATING.k, 1800.0);
-
-        assert_eq!(alltime_shaped[0].user_id, "@amy:example.com");
-        assert_eq!(
-            alltime_shaped
-                .iter()
-                .map(|e| &e.user_id)
-                .collect::<Vec<_>>(),
-            month_shaped.iter().map(|e| &e.user_id).collect::<Vec<_>>(),
-        );
-    }
-
-    /// Regression test for the very first round of a month: everyone's 1-for-1
-    /// with the same score (so rating and volume both tie exactly), but one
-    /// player's guess landed closer. That player just beat the other in the
-    /// round itself (see the `scored.sort_by` tie-break in game.rs, which
-    /// also breaks equal scores by closer distance) and must not end up
-    /// ranked below them on the leaderboard merely because their user_id
-    /// sorts later alphabetically.
-    #[test]
-    fn equal_score_ties_break_by_best_distance_not_user_id() {
-        let mut closer_but_alphabetically_later = score_entry("@queen:example.com", 4_999, 1);
-        closer_but_alphabetically_later.best_distance_km = 0.123;
-        closer_but_alphabetically_later.avg_distance_km = 0.123;
-
-        let mut farther_but_alphabetically_first = score_entry("@gg:example.com", 4_999, 1);
-        farther_but_alphabetically_first.best_distance_km = 0.205;
-        farther_but_alphabetically_first.avg_distance_km = 0.205;
-
-        let mut board = vec![
-            farther_but_alphabetically_first,
-            closer_but_alphabetically_later,
-        ];
-        sort_score_leaderboard(&mut board, TEST_RATING.k, 1800.0);
-
-        assert_eq!(
-            board[0].user_id, "@queen:example.com",
-            "the player who actually landed closer should rank first, despite \
-             an identical displayed rating and an alphabetically earlier rival"
-        );
-    }
-
-    #[test]
-    fn monthly_leaderboard_uses_a_month_year_header_and_mention_ready_ids() {
-        let text = format_leaderboard(
-            vec![score_entry("@alice:example.com", 100_000, 20)],
-            "August 2026 Leaderboard",
-            5,
-            &TEST_RATING,
-        );
-
-        assert!(text.starts_with("🏆 **August 2026 Leaderboard** · 5 rounds"));
-        // Raw "@user:server" mxid, unmodified: `format::mentionify` (applied
-        // uniformly wherever command output and round summaries are sent,
-        // see main.rs/game.rs) turns this into a proper mention pill. The
-        // formatter itself must never pre-render a display name or it would
-        // bypass that pipeline.
-        assert!(text.contains("@alice:example.com"));
     }
 }
