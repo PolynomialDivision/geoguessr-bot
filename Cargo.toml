@@ -31,3 +31,5 @@ ab_glyph = "0.2.32"
 tempfile = "3"
 # Config tests (src/config.rs); the version mxbot-common reads configs with.
 toml     = "1"
+# Router tests (src/web.rs).
+tower    = { version = "0.5", features = ["util"] }

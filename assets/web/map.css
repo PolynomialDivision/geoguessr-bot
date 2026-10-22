@@ -1,0 +1,47 @@
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:#1a1a2e;font-family:system-ui,sans-serif}
+#map{height:calc(100% - 60px)}
+#bar{
+  position:fixed;bottom:0;left:0;right:0;height:60px;
+  display:flex;align-items:center;gap:12px;padding:0 16px;
+  background:#16213e;color:#e0e0f0;border-top:1px solid #2a2a4a;
+  z-index:1000;
+}
+#hint{flex:1;font-size:14px;color:#b4c0dc}
+/* The player's name: readable on the bar (#b4c0dc on #16213e is about 9:1). */
+#name{font-size:13px;color:#b4c0dc;white-space:nowrap}
+#btn{
+  padding:10px 22px;border:none;border-radius:8px;font-size:15px;
+  font-weight:600;cursor:pointer;white-space:nowrap;transition:background .15s;
+}
+#btn:disabled{background:#2a2a4a;color:#9aa0c0;cursor:default}
+#btn.ready{background:#1f6fa8;color:#fff}
+#btn.ready:hover{background:#2580c0}
+#btn.done-update{background:#1e7a45;color:#fff}
+#btn.done-update:hover{background:#238d50}
+#btn.done-locked{background:#1e3a2a;color:#a8dcb8;cursor:default}
+#search{
+  position:fixed;top:12px;left:50%;transform:translateX(-50%);
+  display:flex;gap:6px;z-index:1000;width:min(400px,calc(100vw - 24px));
+}
+#search input{
+  flex:1;padding:8px 12px;border:none;border-radius:8px;font-size:14px;
+  background:#fff;color:#222;box-shadow:0 2px 8px rgba(0,0,0,0.35);
+}
+#search button{
+  padding:8px 14px;border:none;border-radius:8px;font-size:15px;
+  background:#1f6fa8;color:#fff;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.35);
+}
+#layer-toggle{
+  position:fixed;top:12px;right:12px;z-index:1000;
+  padding:8px 12px;border:none;border-radius:8px;font-size:13px;
+  background:#fff;color:#333;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.35);
+}
+/* Below the search field on narrow screens, so the two never overlap. */
+@media (max-width:560px){#layer-toggle{top:60px}}
+[dir=rtl] #layer-toggle{right:auto;left:12px}
+input:focus-visible,button:focus-visible{outline:3px solid #ffd166;outline-offset:2px}
+/* The page for a link that no longer works. */
+body.expired{display:flex;align-items:center;justify-content:center;padding:16px;color:#e0e0f0;text-align:center;line-height:1.4}
+body.expired h1{font-size:1.4rem;margin-bottom:12px}
+body.expired p{color:#b4c0dc;font-size:.95rem;margin-top:6px}

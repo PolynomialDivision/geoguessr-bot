@@ -1145,6 +1145,7 @@ dependencies = [
  "tiny-skia",
  "tokio",
  "toml",
+ "tower",
  "tracing",
 ]
 

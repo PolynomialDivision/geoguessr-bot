@@ -1,9 +1,11 @@
 //! HTTP server for interactive map-based guess submission.
 //!
-//! Each DM participant receives a personal token URL posted in the game room.
-//! Opening the URL shows a Leaflet world map.  Clicking places a draggable
-//! pin; pressing Submit records the guess.  Tokens expire at round end.
+//! Each participant gets a personal token URL, posted in the game room.
+//! Opening the URL shows a MapLibre world map (the library served from here,
+//! assets/maplibre-gl-4.7.1).  Clicking places a draggable pin; pressing
+//! Submit records the guess.  Tokens expire at round end.
 
+use mxbot_common::format::html_escape;
 use mxbot_common::matrix_sdk;
 use mxbot_common::send::send_with_retry;
 use std::collections::{HashMap, HashSet};
@@ -11,7 +13,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
     Router,
@@ -78,11 +80,7 @@ pub struct WebState {
 // ── Server entry point ────────────────────────────────────────────────────────
 
 pub async fn run(bind_addr: String, state: WebState) -> anyhow::Result<()> {
-    let app = Router::new()
-        .route("/g/:token", get(serve_map))
-        .route("/g/:token/submit", post(submit_guess))
-        .route("/map-test", get(test_map))
-        .with_state(state);
+    let app = router(state);
 
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("Geo-guess web server listening on {bind_addr}");
@@ -90,24 +88,33 @@ pub async fn run(bind_addr: String, state: WebState) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn router(state: WebState) -> Router {
+    asset_routes(Router::new())
+        .route("/g/:token", get(serve_map))
+        .route("/g/:token/submit", post(submit_guess))
+        .route("/map-test", get(test_map))
+        .with_state(state)
+}
+
 // ── Map page ──────────────────────────────────────────────────────────────────
 
-async fn serve_map(Path(token): Path<String>, State(ws): State<WebState>) -> Response {
+async fn serve_map(
+    Path(token): Path<String>,
+    State(ws): State<WebState>,
+    headers: HeaderMap,
+) -> Response {
     let info = {
         let store = ws.store.lock().await;
         store.tokens.get(&token).cloned()
     };
     let Some(tok) = info else {
-        return (StatusCode::NOT_FOUND, Html(expired_html())).into_response();
+        return page(StatusCode::NOT_FOUND, expired_html(reader_lang(&headers)));
     };
     let one_shot = ws.max_guesses > 0;
-    Html(map_html(
-        &token,
-        tok.user_id.localpart(),
-        one_shot,
-        &tok.lang,
-    ))
-    .into_response()
+    page(
+        StatusCode::OK,
+        map_html(&token, tok.user_id.localpart(), one_shot, &tok.lang),
+    )
 }
 
 async fn test_map(Query(params): Query<HashMap<String, String>>) -> Response {
@@ -115,7 +122,7 @@ async fn test_map(Query(params): Query<HashMap<String, String>>) -> Response {
         .get("lang")
         .cloned()
         .unwrap_or_else(|| "en".to_owned());
-    Html(map_html("test", "test", false, &lang)).into_response()
+    page(StatusCode::OK, map_html("test", "test", false, &lang))
 }
 
 // ── Guess submission ──────────────────────────────────────────────────────────
@@ -274,329 +281,352 @@ pub fn is_valid_coords(lat: f64, lon: f64) -> bool {
 
 // ── HTML ──────────────────────────────────────────────────────────────────────
 
+/// MapLibre GL JS, served from the bot (assets/maplibre-gl-4.7.1/SOURCE.txt): no CDN, so
+/// no third party can change the script the page runs.
+const MAPLIBRE_JS: &str = include_str!("../assets/maplibre-gl-4.7.1/maplibre-gl.js");
+const MAPLIBRE_CSS: &str = include_str!("../assets/maplibre-gl-4.7.1/maplibre-gl.css");
+const MAP_JS: &str = include_str!("../assets/web/map.js");
+const MAP_CSS: &str = include_str!("../assets/web/map.css");
+
+/// The page's policy: scripts and styles only from here; the map's tiles, glyphs and
+/// sprites from OpenFreeMap, the satellite tiles from Esri, the place search at Nominatim.
+/// MapLibre starts its worker from a blob: URL and draws images from blob: and data: URLs.
+pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+img-src 'self' data: blob: https://tiles.openfreemap.org https://server.arcgisonline.com; \
+connect-src 'self' https://tiles.openfreemap.org https://server.arcgisonline.com https://nominatim.openstreetmap.org; \
+font-src 'self'; worker-src blob:; child-src blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
+fn page(status: StatusCode, html: String) -> Response {
+    let mut r = (status, Html(html)).into_response();
+    let h = r.headers_mut();
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CSP),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    r
+}
+
+/// A static file. The MapLibre files carry their version in the path and never change;
+/// the page's own script and style are kept for an hour.
+fn asset(kind: &'static str, body: &'static str, immutable: bool) -> Response {
+    let cache = if immutable {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=3600"
+    };
+    (
+        [
+            (header::CONTENT_TYPE, kind),
+            (header::CACHE_CONTROL, cache),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+pub fn asset_routes<S: Clone + Send + Sync + 'static>(router: Router<S>) -> Router<S> {
+    router
+        .route(
+            "/assets/maplibre-gl-4.7.1/maplibre-gl.js",
+            get(|| async { asset("text/javascript; charset=utf-8", MAPLIBRE_JS, true) }),
+        )
+        .route(
+            "/assets/maplibre-gl-4.7.1/maplibre-gl.css",
+            get(|| async { asset("text/css; charset=utf-8", MAPLIBRE_CSS, true) }),
+        )
+        .route(
+            "/assets/map.js",
+            get(|| async { asset("text/javascript; charset=utf-8", MAP_JS, false) }),
+        )
+        .route(
+            "/assets/map.css",
+            get(|| async { asset("text/css; charset=utf-8", MAP_CSS, false) }),
+        )
+}
+
+/// A language code for `<html lang>`: letters, digits and dashes, else "en".
+fn page_lang(lang: &str) -> &str {
+    let ok = (1..=12).contains(&lang.len())
+        && lang.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && lang.starts_with(|c: char| c.is_ascii_alphabetic());
+    if ok {
+        lang
+    } else {
+        "en"
+    }
+}
+
+/// "rtl" for the right-to-left languages players can pick (Arabic, Hebrew).
+fn text_dir(lang: &str) -> &'static str {
+    match lang.split('-').next().unwrap_or("") {
+        "ar" | "he" => "rtl",
+        _ => "ltr",
+    }
+}
+
+/// The map page. The values reach the script as escaped data attributes (assets/web/map.js
+/// reads them), so the page has no inline script.
 fn map_html(token: &str, display_name: &str, one_shot: bool, lang: &str) -> String {
-    // Use placeholder replacement so Leaflet's {z}/{x}/{y}/{s} tokens and
-    // JavaScript object literals don't need escaping in a format! string.
-    let token_json = script_string(token);
-    let name_json = script_string(display_name);
-    let one_shot_js = if one_shot { "true" } else { "false" };
-    let lang_json = script_string(lang);
-
-    LEAFLET_MAP_TEMPLATE
-        .replace("__TOKEN__", &token_json)
-        .replace("__NAME__", &name_json)
-        .replace("__ONE_SHOT__", one_shot_js)
-        .replace("__LANG__", &lang_json)
+    let lang = page_lang(lang);
+    MAP_PAGE_TEMPLATE
+        .replace("__LANG__", lang)
+        .replace("__DIR__", text_dir(lang))
+        .replace("__TOKEN__", &html_escape(token))
+        .replace("__NAME__", &html_escape(display_name))
+        .replace("__ONE_SHOT__", if one_shot { "true" } else { "false" })
 }
 
-/// `value` as a JavaScript string literal that is safe inside `<script>`:
-/// JSON with `<`, `>` and `&` escaped, so a value (the `lang` of
-/// `/map-test?lang=…`, say) can't close the script element and inject markup.
-fn script_string(value: &str) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| "\"\"".to_owned())
-        .replace('<', "\\u003c")
-        .replace('>', "\\u003e")
-        .replace('&', "\\u0026")
-}
-
-static LEAFLET_MAP_TEMPLATE: &str = r#"<!DOCTYPE html>
-<html lang="en">
+static MAP_PAGE_TEMPLATE: &str = r#"<!DOCTYPE html>
+<html lang="__LANG__" dir="__DIR__">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GeoGuessr – Place your guess</title>
-<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.css">
-<style>
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-html,body{height:100%;background:#1a1a2e;font-family:system-ui,sans-serif}
-#map{height:calc(100% - 60px)}
-#bar{
-  position:fixed;bottom:0;left:0;right:0;height:60px;
-  display:flex;align-items:center;gap:12px;padding:0 16px;
-  background:#16213e;color:#e0e0f0;border-top:1px solid #2a2a4a;
-  z-index:1000;
-}
-#hint{flex:1;font-size:14px;color:#99aacc}
-#name{font-size:13px;color:#556;white-space:nowrap}
-#btn{
-  padding:10px 22px;border:none;border-radius:8px;font-size:15px;
-  font-weight:600;cursor:pointer;white-space:nowrap;transition:background .15s;
-}
-#btn:disabled{background:#2a2a4a;color:#556;cursor:default}
-#btn.ready{background:#2980b9;color:#fff}
-#btn.ready:hover{background:#3498db}
-#btn.done-update{background:#27ae60;color:#fff}
-#btn.done-update:hover{background:#2ecc71}
-#btn.done-locked{background:#1e3a2a;color:#5a8a6a;cursor:default}
-#search{
-  position:fixed;top:12px;left:50%;transform:translateX(-50%);
-  display:flex;gap:6px;z-index:1000;width:min(400px,calc(100vw - 24px));
-}
-#search input{
-  flex:1;padding:8px 12px;border:none;border-radius:8px;font-size:14px;
-  background:#fff;color:#222;box-shadow:0 2px 8px rgba(0,0,0,0.35);outline:none;
-}
-#search button{
-  padding:8px 14px;border:none;border-radius:8px;font-size:15px;
-  background:#2980b9;color:#fff;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.35);
-}
-#layer-toggle{
-  position:fixed;top:12px;right:12px;z-index:1000;
-  padding:8px 12px;border:none;border-radius:8px;font-size:13px;
-  background:#fff;color:#333;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.35);
-}
-</style>
+<title>GeoGuessr</title>
+<link rel="stylesheet" href="/assets/maplibre-gl-4.7.1/maplibre-gl.css">
+<link rel="stylesheet" href="/assets/map.css">
 </head>
-<body>
+<body data-token="__TOKEN__" data-name="__NAME__" data-one-shot="__ONE_SHOT__" data-lang="__LANG__">
 <div id="map"></div>
 <div id="search">
-  <input id="search-input" type="text" placeholder="Search or paste lat, lon…" autocomplete="off">
-  <button id="search-btn">🔍</button>
+  <input id="search-input" type="search" placeholder="Search a place or paste lat, lon…" aria-label="Search a place or paste lat, lon" autocomplete="off">
+  <button id="search-btn" type="button" aria-label="Search">🔍</button>
 </div>
-<button id="layer-toggle">🛰 Satellite</button>
+<button id="layer-toggle" type="button" aria-label="Show satellite view">🛰 Satellite</button>
 <div id="bar">
-  <span id="hint">Tap the map to place your pin</span>
-  <button id="btn" disabled>Submit guess</button>
+  <span id="hint" aria-live="polite">Tap the map to place your pin</span>
+  <button id="btn" type="button" disabled>Submit guess</button>
   <span id="name"></span>
 </div>
-<script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
-<script>
-(function(){
-  var TOKEN    = __TOKEN__;
-  var NAME     = __NAME__;
-  var ONE_SHOT = __ONE_SHOT__;
-  var LANG     = __LANG__;
-
-  var T = {
-    en:{tap:'Tap the map to place your pin',submit:'Submit guess',submitting:'Submitting…',locked_in:'✅ Locked in: ',locked_btn:'✅ Guess locked in',update:'✏️ Update guess',recorded:'✅ Guess recorded: ',net_err:'❌ Network error: try again',err:'Error: try again'},
-    de:{tap:'Karte antippen, um Stecknadel zu setzen',submit:'Antwort absenden',submitting:'Wird gesendet…',locked_in:'✅ Festgelegt: ',locked_btn:'✅ Antwort festgelegt',update:'✏️ Antwort ändern',recorded:'✅ Antwort gespeichert: ',net_err:'❌ Netzwerkfehler: erneut versuchen',err:'Fehler: erneut versuchen'},
-    fr:{tap:'Appuyez sur la carte pour placer votre repère',submit:'Soumettre',submitting:'Envoi…',locked_in:'✅ Verrouillé : ',locked_btn:'✅ Réponse verrouillée',update:'✏️ Modifier',recorded:'✅ Réponse enregistrée : ',net_err:'❌ Erreur réseau: réessayez',err:'Erreur: réessayez'},
-    es:{tap:'Toca el mapa para colocar tu pin',submit:'Enviar respuesta',submitting:'Enviando…',locked_in:'✅ Confirmado: ',locked_btn:'✅ Respuesta confirmada',update:'✏️ Actualizar respuesta',recorded:'✅ Respuesta guardada: ',net_err:'❌ Error de red: inténtalo de nuevo',err:'Error: inténtalo de nuevo'},
-    ru:{tap:'Нажмите на карту, чтобы поставить метку',submit:'Отправить ответ',submitting:'Отправка…',locked_in:'✅ Зафиксировано: ',locked_btn:'✅ Ответ зафиксирован',update:'✏️ Изменить ответ',recorded:'✅ Ответ записан: ',net_err:'❌ Ошибка сети: попробуйте снова',err:'Ошибка: попробуйте снова'},
-    it:{tap:'Tocca la mappa per posizionare il pin',submit:'Invia risposta',submitting:'Invio…',locked_in:'✅ Bloccato: ',locked_btn:'✅ Risposta bloccata',update:'✏️ Aggiorna risposta',recorded:'✅ Risposta registrata: ',net_err:'❌ Errore di rete: riprova',err:'Errore: riprova'},
-    pl:{tap:'Dotknij mapę, aby umieścić pinezkę',submit:'Prześlij odpowiedź',submitting:'Wysyłanie…',locked_in:'✅ Zablokowano: ',locked_btn:'✅ Odpowiedź zablokowana',update:'✏️ Zaktualizuj odpowiedź',recorded:'✅ Odpowiedź zapisana: ',net_err:'❌ Błąd sieci: spróbuj ponownie',err:'Błąd: spróbuj ponownie'},
-    nl:{tap:'Tik op de kaart om je pin te plaatsen',submit:'Antwoord verzenden',submitting:'Verzenden…',locked_in:'✅ Vergrendeld: ',locked_btn:'✅ Antwoord vergrendeld',update:'✏️ Antwoord bijwerken',recorded:'✅ Antwoord opgeslagen: ',net_err:'❌ Netwerkfout: probeer opnieuw',err:'Fout: probeer opnieuw'},
-    pt:{tap:'Toque no mapa para colocar seu marcador',submit:'Enviar resposta',submitting:'Enviando…',locked_in:'✅ Confirmado: ',locked_btn:'✅ Resposta confirmada',update:'✏️ Atualizar resposta',recorded:'✅ Resposta registada: ',net_err:'❌ Erro de rede: tente novamente',err:'Erro: tente novamente'},
-    uk:{tap:'Натисніть на карту, щоб поставити мітку',submit:'Надіслати відповідь',submitting:'Надсилання…',locked_in:'✅ Зафіксовано: ',locked_btn:'✅ Відповідь зафіксована',update:'✏️ Оновити відповідь',recorded:'✅ Відповідь збережено: ',net_err:'❌ Помилка мережі: спробуйте ще раз',err:'Помилка: спробуйте ще раз'},
-    ja:{tap:'地図をタップしてピンを置く',submit:'回答を送信',submitting:'送信中…',locked_in:'✅ 確定: ',locked_btn:'✅ 回答を確定',update:'✏️ 回答を更新',recorded:'✅ 回答を記録: ',net_err:'❌ ネットワークエラー: 再試行',err:'エラー: 再試行'},
-    zh:{tap:'点击地图放置图钉',submit:'提交答案',submitting:'提交中…',locked_in:'✅ 已确认: ',locked_btn:'✅ 答案已确认',update:'✏️ 更新答案',recorded:'✅ 答案已记录: ',net_err:'❌ 网络错误: 请重试',err:'错误: 请重试'},
-    ar:{tap:'اضغط على الخريطة لوضع الدبوس',submit:'إرسال الإجابة',submitting:'جارٍ الإرسال…',locked_in:'✅ تم التأكيد: ',locked_btn:'✅ تم تأكيد الإجابة',update:'✏️ تحديث الإجابة',recorded:'✅ تم تسجيل الإجابة: ',net_err:'❌ خطأ في الشبكة: حاول مرة أخرى',err:'خطأ: حاول مرة أخرى'},
-    tr:{tap:'Pini yerleştirmek için haritaya dokun',submit:'Tahmin gönder',submitting:'Gönderiliyor…',locked_in:'✅ Kilitlendi: ',locked_btn:'✅ Tahmin kilitlendi',update:'✏️ Tahmini güncelle',recorded:'✅ Tahmin kaydedildi: ',net_err:'❌ Ağ hatası: tekrar dene',err:'Hata: tekrar dene'},
-    sv:{tap:'Tryck på kartan för att placera din nål',submit:'Skicka svar',submitting:'Skickar…',locked_in:'✅ Låst: ',locked_btn:'✅ Svar låst',update:'✏️ Uppdatera svar',recorded:'✅ Svar registrerat: ',net_err:'❌ Nätverksfel: försök igen',err:'Fel: försök igen'},
-    fi:{tap:'Napauta karttaa asettaaksesi nuppineulan',submit:'Lähetä arvaus',submitting:'Lähetetään…',locked_in:'✅ Lukittu: ',locked_btn:'✅ Arvaus lukittu',update:'✏️ Päivitä arvaus',recorded:'✅ Arvaus tallennettu: ',net_err:'❌ Verkkovirhe: yritä uudelleen',err:'Virhe: yritä uudelleen'},
-    da:{tap:'Tryk på kortet for at placere din nål',submit:'Send gæt',submitting:'Sender…',locked_in:'✅ Låst: ',locked_btn:'✅ Gæt låst',update:'✏️ Opdater gæt',recorded:'✅ Gæt registreret: ',net_err:'❌ Netværksfejl: prøv igen',err:'Fejl: prøv igen'},
-    cs:{tap:'Klepněte na mapu a umístěte špendlík',submit:'Odeslat odpověď',submitting:'Odesílám…',locked_in:'✅ Uzamčeno: ',locked_btn:'✅ Odpověď uzamčena',update:'✏️ Aktualizovat odpověď',recorded:'✅ Odpověď zaznamenána: ',net_err:'❌ Chyba sítě: zkuste znovu',err:'Chyba: zkuste znovu'},
-    hu:{tap:'Koppintson a térképre a gombostű elhelyezéséhez',submit:'Tipp elküldése',submitting:'Küldés…',locked_in:'✅ Rögzítve: ',locked_btn:'✅ Tipp rögzítve',update:'✏️ Tipp frissítése',recorded:'✅ Tipp rögzítve: ',net_err:'❌ Hálózati hiba: próbálja újra',err:'Hiba: próbálja újra'},
-    ro:{tap:'Atinge harta pentru a plasa acul',submit:'Trimite răspuns',submitting:'Se trimite…',locked_in:'✅ Blocat: ',locked_btn:'✅ Răspuns blocat',update:'✏️ Actualizează răspuns',recorded:'✅ Răspuns înregistrat: ',net_err:'❌ Eroare de rețea: încearcă din nou',err:'Eroare: încearcă din nou'},
-    el:{tap:'Πατήστε στον χάρτη για να τοποθετήσετε την καρφίτσα',submit:'Αποστολή απάντησης',submitting:'Αποστολή…',locked_in:'✅ Κλειδωμένο: ',locked_btn:'✅ Απάντηση κλειδωμένη',update:'✏️ Ενημέρωση απάντησης',recorded:'✅ Απάντηση καταγράφηκε: ',net_err:'❌ Σφάλμα δικτύου: δοκιμάστε ξανά',err:'Σφάλμα: δοκιμάστε ξανά'},
-    he:{tap:'גע במפה כדי למקם את הסיכה',submit:'שלח תשובה',submitting:'שולח…',locked_in:'✅ נעול: ',locked_btn:'✅ תשובה נעולה',update:'✏️ עדכן תשובה',recorded:'✅ תשובה נרשמה: ',net_err:'❌ שגיאת רשת: נסה שוב',err:'שגיאה: נסה שוב'},
-    ko:{tap:'지도를 눌러 핀을 놓으세요',submit:'답안 제출',submitting:'제출 중…',locked_in:'✅ 확정됨: ',locked_btn:'✅ 답안 확정',update:'✏️ 답안 수정',recorded:'✅ 답안 기록됨: ',net_err:'❌ 네트워크 오류: 다시 시도',err:'오류: 다시 시도'},
-    th:{tap:'แตะแผนที่เพื่อวางหมุด',submit:'ส่งคำตอบ',submitting:'กำลังส่ง…',locked_in:'✅ ล็อคแล้ว: ',locked_btn:'✅ ล็อคคำตอบแล้ว',update:'✏️ อัปเดตคำตอบ',recorded:'✅ บันทึกคำตอบแล้ว: ',net_err:'❌ เครือข่ายผิดพลาด: ลองอีกครั้ง',err:'ผิดพลาด: ลองอีกครั้ง'},
-    vi:{tap:'Chạm vào bản đồ để đặt ghim',submit:'Gửi đoán',submitting:'Đang gửi…',locked_in:'✅ Đã xác nhận: ',locked_btn:'✅ Đã khóa đoán',update:'✏️ Cập nhật đoán',recorded:'✅ Đoán đã được ghi: ',net_err:'❌ Lỗi mạng: thử lại',err:'Lỗi: thử lại'},
-    id:{tap:'Ketuk peta untuk meletakkan pin',submit:'Kirim tebakan',submitting:'Mengirim…',locked_in:'✅ Dikunci: ',locked_btn:'✅ Tebakan dikunci',update:'✏️ Perbarui tebakan',recorded:'✅ Tebakan dicatat: ',net_err:'❌ Kesalahan jaringan: coba lagi',err:'Kesalahan: coba lagi'}
-  };
-
-  function t(key) {
-    var base = (LANG || 'en').split('-')[0];
-    var row  = T[base] || T['en'];
-    return row[key] || T['en'][key] || key;
-  }
-
-  if (NAME) document.getElementById('name').textContent = '👤 ' + NAME;
-
-  var lang = (LANG || 'en').split('-')[0];
-
-  var LIBERTY    = 'https://tiles.openfreemap.org/styles/liberty';
-  var SATELLITE  = {
-    version: 8,
-    sources: {sat: {type:'raster', tileSize:256, attribution:'© Esri',
-      tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}']}},
-    layers: [{id:'sat', type:'raster', source:'sat'}]
-  };
-  var isSatellite = false;
-
-  var map = new maplibregl.Map({
-    container: 'map',
-    style:     LIBERTY,
-    center:    [0, 20],
-    zoom:      2,
-  });
-
-  function applyLanguage() {
-    map.getStyle().layers.forEach(function(layer) {
-      if (layer.layout && layer.layout['text-field']) {
-        map.setLayoutProperty(layer.id, 'text-field', [
-          'coalesce',
-          ['get', 'name:' + lang],
-          ['get', 'name:en'],
-          ['get', 'name'],
-        ]);
-      }
-    });
-  }
-
-  map.on('style.load', function() { if (!isSatellite) applyLanguage(); });
-
-  var toggleBtn = document.getElementById('layer-toggle');
-  toggleBtn.addEventListener('click', function() {
-    isSatellite = !isSatellite;
-    map.setStyle(isSatellite ? SATELLITE : LIBERTY);
-    toggleBtn.textContent = isSatellite ? '🗺 Map' : '🛰 Satellite';
-  });
-
-  var hint      = document.getElementById('hint');
-  var btn       = document.getElementById('btn');
-  var pin       = null;
-  var pinLat    = null;
-  var pinLon    = null;
-  var submitted = false;
-
-  hint.textContent = t('tap');
-  btn.textContent  = t('submit');
-
-  function placePin(lat, lon) {
-    pinLat = lat;
-    pinLon = lon;
-    if (pin) {
-      pin.setLngLat([lon, lat]);
-    } else {
-      pin = new maplibregl.Marker({draggable: true})
-        .setLngLat([lon, lat])
-        .addTo(map);
-      pin.on('dragend', function() {
-        if (submitted && ONE_SHOT) return;
-        var ll = pin.getLngLat();
-        pinLat = ll.lat;
-        pinLon = ll.lng;
-        hint.textContent = fmt(pinLat, pinLon);
-        if (!submitted) setReady();
-      });
-    }
-    hint.textContent = fmt(pinLat, pinLon);
-    if (!submitted || !ONE_SHOT) setReady();
-  }
-
-  function handleClick(e) {
-    if (submitted && ONE_SHOT) return;
-    placePin(e.lngLat.lat, e.lngLat.lng);
-  }
-  map.on('click', handleClick);
-
-  var searchInput = document.getElementById('search-input');
-  async function doSearch() {
-    var q = searchInput.value.trim();
-    if (!q) return;
-    var m = q.match(/^(-?\d+\.?\d*)[,\s]+(-?\d+\.?\d*)$/);
-    if (m) {
-      var lat = parseFloat(m[1]), lon = parseFloat(m[2]);
-      if (lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
-        map.flyTo({center: [lon, lat], zoom: 12});
-        placePin(lat, lon);
-        return;
-      }
-    }
-    try {
-      var url = 'https://nominatim.openstreetmap.org/search?q=' + encodeURIComponent(q) +
-                '&format=json&limit=1&accept-language=' + lang;
-      var r = await fetch(url);
-      var d = await r.json();
-      if (d && d[0]) {
-        map.flyTo({center: [parseFloat(d[0].lon), parseFloat(d[0].lat)], zoom: 10});
-        placePin(parseFloat(d[0].lat), parseFloat(d[0].lon));
-      }
-    } catch(_) {}
-  }
-  document.getElementById('search-btn').addEventListener('click', doSearch);
-  searchInput.addEventListener('keydown', function(e) { if (e.key === 'Enter') doSearch(); });
-
-  function setReady() {
-    btn.disabled = false;
-    btn.className = 'ready';
-    btn.textContent = submitted ? t('update') : t('submit');
-  }
-
-  btn.addEventListener('click', async function() {
-    if (!pinLat || btn.disabled) return;
-    btn.disabled = true;
-    btn.textContent = t('submitting');
-    try {
-      var r = await fetch('/g/' + TOKEN + '/submit', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({lat: pinLat, lon: pinLon}),
-      });
-      if (r.ok) {
-        var j = await r.json();
-        var place = (j && j.geocoded) ? j.geocoded : fmt(pinLat, pinLon);
-        submitted = true;
-        if (ONE_SHOT) {
-          hint.textContent = t('locked_in') + place;
-          btn.textContent = t('locked_btn');
-          btn.className = 'done-locked';
-          btn.disabled = true;
-          map.off('click', handleClick);
-          if (pin) pin.setDraggable(false);
-        } else {
-          hint.textContent = t('recorded') + place;
-          btn.textContent = t('update');
-          btn.className = 'done-update';
-          btn.disabled = false;
-        }
-      } else {
-        var txt = await r.text();
-        hint.textContent = '❌ ' + (txt || t('err'));
-        setReady();
-      }
-    } catch(e) {
-      hint.textContent = t('net_err');
-      setReady();
-    }
-  });
-
-  function fmt(lat, lon) { return lat.toFixed(3) + ', ' + lon.toFixed(3); }
-})();
-</script>
+<script src="/assets/maplibre-gl-4.7.1/maplibre-gl.js"></script>
+<script src="/assets/map.js"></script>
 </body>
 </html>"#;
 
-fn expired_html() -> String {
-    r#"<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="utf-8"><title>Link expired</title>
-<style>
-body{background:#1a1a2e;color:#e0e0f0;font-family:system-ui,sans-serif;
-  display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-div{text-align:center}
-h2{font-size:1.4rem;margin-bottom:12px}
-p{color:#99aacc;font-size:0.95rem}
-</style></head>
-<body><div>
-<h2>⏰ This link has expired</h2>
-<p>The round has ended or the link is invalid.</p>
-</div></body></html>"#
-        .to_owned()
+/// The page's texts for a link that no longer works: (heading, why, what now).
+fn expired_texts(lang: &str) -> (&'static str, &'static str, &'static str) {
+    match lang {
+        "de" => (
+            "⏰ Dieser Link ist abgelaufen",
+            "Die Runde ist vorbei oder der Link stimmt nicht.",
+            "💬 Zurück in den Chat: Mit der nächsten Runde kommt ein neuer Link.",
+        ),
+        "uk" => (
+            "⏰ Термін дії посилання минув",
+            "Раунд закінчився або посилання неправильне.",
+            "💬 Повертайтеся в чат: наступний раунд принесе нове посилання.",
+        ),
+        _ => (
+            "⏰ This link has expired",
+            "The round has ended or the link is wrong.",
+            "💬 Back to the chat: the next round brings a new link.",
+        ),
+    }
+}
+
+/// The reader's language for pages without a token: the house's `house_lang` cookie
+/// (set by the start page), else the first of German, English and Ukrainian in
+/// Accept-Language, else English.
+pub fn reader_lang(headers: &HeaderMap) -> &'static str {
+    const KNOWN: [&str; 3] = ["de", "en", "uk"];
+    let pick = |code: &str| {
+        let base = code.trim().split(['-', '_']).next().unwrap_or("");
+        KNOWN.iter().find(|k| k.eq_ignore_ascii_case(base)).copied()
+    };
+    let cookie = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|c| c.trim().strip_prefix("house_lang="))
+        .find_map(pick);
+    if let Some(lang) = cookie {
+        return lang;
+    }
+    headers
+        .get(header::ACCEPT_LANGUAGE)
+        .and_then(|v| v.to_str().ok())
+        .into_iter()
+        .flat_map(|v| v.split(','))
+        .filter(|part| {
+            // "de;q=0" means "not German".
+            part.split(';').skip(1).all(|param| {
+                param
+                    .trim()
+                    .strip_prefix("q=")
+                    .and_then(|q| q.parse::<f32>().ok())
+                    .is_none_or(|q| q > 0.0)
+            })
+        })
+        .find_map(|part| pick(part.split(';').next().unwrap_or("")))
+        .unwrap_or("en")
+}
+
+fn expired_html(lang: &str) -> String {
+    let (heading, why, next) = expired_texts(lang);
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="{lang}">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{heading}</title>
+<link rel="stylesheet" href="/assets/map.css">
+</head>
+<body class="expired"><main>
+<h1>{heading}</h1>
+<p>{why}</p>
+<p>{next}</p>
+</main></body></html>"#
+    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn page_values_cannot_close_the_script() {
-        let html = map_html("tok", "name", false, "</script><script>alert(1)</script>&");
-        assert!(!html.contains("<script>alert"), "{html}");
-        assert!(html.contains(
-            r#""\u003c/script\u003e\u003cscript\u003ealert(1)\u003c/script\u003e\u0026""#
-        ));
-        // Ordinary values are unchanged JSON strings.
-        assert_eq!(script_string("de-DE"), "\"de-DE\"");
-    }
-
     use super::*;
     use crate::game::{ActiveGame, ActiveGameMode};
     use matrix_sdk::ruma::OwnedUserId;
     use std::collections::HashMap;
+
+    // ── Pages ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn page_values_are_escaped_attributes_and_the_page_has_no_inline_script() {
+        let html = map_html("tok", "\"><script>alert(1)</script>&", false, "de");
+        assert!(!html.contains("<script>alert"), "{html}");
+        assert!(
+            html.contains(r#"data-name="&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;&amp;""#)
+        );
+        // Every script comes from this server (CSP script-src 'self').
+        assert_eq!(html.matches("<script").count(), 2);
+        assert_eq!(html.matches("<script src=\"/assets/").count(), 2);
+        assert!(!html.contains("unpkg") && !html.contains("https://"));
+    }
+
+    #[test]
+    fn the_page_language_and_direction() {
+        let html = map_html("tok", "a", true, "uk");
+        assert!(html.contains(r#"<html lang="uk" dir="ltr">"#));
+        assert!(html.contains(r#"data-one-shot="true""#));
+        assert!(map_html("t", "a", false, "ar").contains(r#"<html lang="ar" dir="rtl">"#));
+        assert!(map_html("t", "a", false, "he").contains(r#"dir="rtl""#));
+        // /map-test?lang=… can't break out of the attribute.
+        let html = map_html("t", "a", false, "x\" onload=\"alert(1)");
+        assert!(html.contains(r#"<html lang="en" dir="ltr">"#), "{html}");
+        assert!(!html.contains("onload"));
+    }
+
+    #[test]
+    fn the_search_and_map_buttons_have_names() {
+        let html = map_html("t", "a", false, "en");
+        assert!(html.contains(r#"id="search-input" type="search""#));
+        for id in ["search-input", "search-btn", "layer-toggle"] {
+            let at = html.find(&format!("id=\"{id}\"")).unwrap();
+            let tag = &html[at..at + html[at..].find('>').unwrap()];
+            assert!(tag.contains("aria-label=\""), "{id}: {tag}");
+        }
+    }
+
+    #[test]
+    fn the_vendored_maplibre_is_the_pinned_version() {
+        assert!(MAPLIBRE_JS.starts_with("/**\n * MapLibre GL JS"));
+        assert!(MAPLIBRE_JS[..200].contains("/v4.7.1/LICENSE.txt"));
+        assert!(MAPLIBRE_CSS.contains(".maplibregl-map"));
+        // Without eval: script-src needs no 'unsafe-eval'.
+        assert!(!MAPLIBRE_JS.contains("new Function"));
+    }
+
+    #[test]
+    fn the_policy_allows_what_the_map_loads_and_nothing_inline() {
+        assert!(CSP.contains("script-src 'self';"));
+        assert!(CSP.contains("style-src 'self';"));
+        assert!(!CSP.contains("unsafe"));
+        for host in [
+            "https://tiles.openfreemap.org",
+            "https://server.arcgisonline.com",
+            "https://nominatim.openstreetmap.org",
+        ] {
+            assert!(CSP.contains(host), "{host}");
+            assert!(MAP_JS.contains(host), "{host} is no longer used: drop it");
+        }
+        assert!(CSP.contains("worker-src blob:"));
+    }
+
+    fn lang_of(pairs: &[(header::HeaderName, &str)]) -> &'static str {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(name.clone(), HeaderValue::from_str(value).unwrap());
+        }
+        reader_lang(&headers)
+    }
+
+    #[test]
+    fn the_expired_page_speaks_the_readers_language() {
+        assert_eq!(lang_of(&[]), "en");
+        assert_eq!(
+            lang_of(&[(header::ACCEPT_LANGUAGE, "de-DE,de;q=0.9,en;q=0.8")]),
+            "de"
+        );
+        assert_eq!(
+            lang_of(&[(header::ACCEPT_LANGUAGE, "fr-FR, uk;q=0.5")]),
+            "uk"
+        );
+        assert_eq!(lang_of(&[(header::ACCEPT_LANGUAGE, "de;q=0, en")]), "en");
+        // The start page's choice wins.
+        assert_eq!(
+            lang_of(&[
+                (header::COOKIE, "a=b; house_lang=uk"),
+                (header::ACCEPT_LANGUAGE, "de")
+            ]),
+            "uk"
+        );
+        let html = expired_html("de");
+        assert!(html.contains(r#"<html lang="de">"#));
+        assert!(html.contains("abgelaufen") && html.contains("Chat"));
+        assert!(expired_html("en").contains("Back to the chat"));
+        assert!(expired_html("uk").contains("чат"));
+    }
+
+    #[tokio::test]
+    async fn assets_are_served_with_their_types() {
+        use tower::ServiceExt;
+        let app: Router = asset_routes(Router::new());
+        for (path, kind) in [
+            (
+                "/assets/maplibre-gl-4.7.1/maplibre-gl.js",
+                "text/javascript",
+            ),
+            ("/assets/maplibre-gl-4.7.1/maplibre-gl.css", "text/css"),
+            ("/assets/map.js", "text/javascript"),
+            ("/assets/map.css", "text/css"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let ct = response.headers()[header::CONTENT_TYPE].to_str().unwrap();
+            assert!(ct.starts_with(kind), "{path}: {ct}");
+            assert_eq!(
+                response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+                "nosniff"
+            );
+        }
+    }
 
     // ── Token generation ──────────────────────────────────────────────────────
 
