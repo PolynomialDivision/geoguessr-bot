@@ -148,6 +148,14 @@ pub struct ScheduleOverrides {
 // ── I/O ───────────────────────────────────────────────────────────────────────
 
 impl State {
+    /// Record that the round of scheduled `slot` ("HH:MM") has run, as of
+    /// `today`. The scheduler already recorded the day it fired the slot,
+    /// and that day stays: a round that ends after midnight would otherwise
+    /// claim the next day, and that day's game at the same time is skipped.
+    pub fn mark_slot_played(&mut self, slot: &str, today: NaiveDate) {
+        self.last_game_dates.entry(slot.to_owned()).or_insert(today);
+    }
+
     pub async fn load(path: &Path) -> Result<Self> {
         mxbot_common::persist::load_json_or_default(path).await
     }
@@ -503,6 +511,20 @@ mod tests {
         let loaded = State::load(&path).await.unwrap();
         assert!(loaded.active_round.is_none());
         assert!(loaded.last_game_dates.contains_key("12:00"));
+    }
+
+    #[test]
+    fn a_round_ending_after_midnight_keeps_the_day_its_slot_fired() {
+        let day = |d| chrono::NaiveDate::from_ymd_opt(2026, 10, d).unwrap();
+        let mut state = State::default();
+        // The scheduler fires the 22:00 slot on the 21st…
+        state.last_game_dates.insert("22:00".to_owned(), day(21));
+        // …and the round ends on the 22nd: the 22nd's game still runs.
+        state.mark_slot_played("22:00", day(22));
+        assert_eq!(state.last_game_dates["22:00"], day(21));
+        // A slot without a record gets today.
+        state.mark_slot_played("08:00", day(22));
+        assert_eq!(state.last_game_dates["08:00"], day(22));
     }
 
     #[test]

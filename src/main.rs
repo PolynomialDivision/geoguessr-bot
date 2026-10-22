@@ -21,6 +21,7 @@ use mxbot_common::{
         },
         Client, Room, RoomState,
     },
+    send::send_with_retry,
     send::{in_thread, thread_root},
     Bot,
 };
@@ -250,7 +251,7 @@ async fn main() -> Result<()> {
                         // Admin commands sent privately are answered privately.
                         let MessageType::Text(text) = &ev.content.msgtype else { return; };
                         if let Some(reply) = command_reply(&ctx, &ev.sender, text.body.trim()).await {
-                            room.send(format::mentionify(&reply)).await.ok();
+                            send_with_retry(&room, format::mentionify(&reply)).await.ok();
                         }
                         return;
                     }
@@ -297,15 +298,14 @@ async fn main() -> Result<()> {
                                             Some(false) => format!("☝️ {sender}, you already sent a guess."),
                                             None => format!("⏳ {sender}, no guess is open right now."),
                                         };
-                                        r.send(format::mentionify(&msg)).await.ok();
+                                        send_with_retry(&r, format::mentionify(&msg)).await.ok();
                                     }
                                 }
                                 None => {
                                     if let Some(r) = room2 {
-                                        r.send(format::mentionify(&format!(
+                                        send_with_retry(&r, format::mentionify(&format!(
                                             "❓ {sender}, I couldn't find \"{query}\".\n💡 Try a different name."
-                                        )))
-                                        .await
+                                        ))).await
                                         .ok();
                                     }
                                 }
@@ -318,7 +318,7 @@ async fn main() -> Result<()> {
                 if let Some(reply) = command_reply(&ctx, &ev.sender, body).await {
                     if let Some(r) = client.get_room(&ctx.room_id) {
                         let content = in_thread(format::mentionify(&reply), thread_root, ev.event_id.clone());
-                        r.send(content).await.ok();
+                        send_with_retry(&r, content).await.ok();
                     }
                 }
             }

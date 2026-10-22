@@ -261,12 +261,7 @@ async fn cmd_schedulegeo(
 
     let reminder = reminder_override.unwrap_or(ctx.config.schedule.reminder_before_secs);
 
-    let tz: Tz = ctx
-        .config
-        .schedule
-        .timezone
-        .parse()
-        .unwrap_or(chrono_tz::UTC);
+    let tz: Tz = ctx.config.schedule.timezone;
     let local_now = chrono::Utc::now().with_timezone(&tz);
 
     let game_secs = (qh * 3600 + qm * 60) as i64;
@@ -685,7 +680,7 @@ pub async fn build_rolling_leaderboard(ctx: &BotContext) -> Option<String> {
 
 /// Start of the current calendar month, in `tz`, as a UTC instant. The SQL
 /// lower bound for "this month's" rounds. Uses the bot's configured
-/// timezone (`schedule.timezone`, UTC if unset/invalid) so the monthly
+/// timezone (`schedule.timezone`, UTC if unset) so the monthly
 /// leaderboard rolls over at local, not UTC, midnight on the 1st. On the
 /// rare local-midnight DST gap, falls back to the current wall-clock
 /// instant, which is still safely within the target month.
@@ -713,12 +708,7 @@ fn month_start_utc(tz: Tz, local_now: chrono::DateTime<Tz>) -> chrono::DateTime<
 /// separate monthly state to keep in sync and a restart or month rollover
 /// can't duplicate or drift scores.
 pub async fn build_monthly_leaderboard(ctx: &BotContext) -> Option<String> {
-    let tz: Tz = ctx
-        .config
-        .schedule
-        .timezone
-        .parse()
-        .unwrap_or(chrono_tz::UTC);
+    let tz: Tz = ctx.config.schedule.timezone;
     let month_start = current_month_start_utc(tz);
 
     let board = duels::standings(&ctx.db.duel_entries(Some(month_start)).await.ok()?);
@@ -893,7 +883,11 @@ async fn cmd_gameinfo(ctx: &BotContext) -> Result<Option<String>> {
     let times_str = if s.game_times.is_empty() {
         "not scheduled".to_owned()
     } else {
-        s.game_times.join(", ")
+        s.game_times
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
     };
 
     let reminder_line = if s.reminder_before_secs > 0 {

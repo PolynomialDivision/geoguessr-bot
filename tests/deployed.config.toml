@@ -1,0 +1,61 @@
+# A copy of the config house-infra renders (stacks/matrix-bots/secrets/geoguessr-bot.config.toml.j2), placeholder secrets. Must keep loading.
+[matrix]
+homeserver = "http://tuwunel:8008"
+user_id = "@geoguessr-bot:example.org"
+device_id = "HOUSEINFRAGEOGUESSRBOT"
+# access_token: MATRIX_ACCESS_TOKEN from session/matrix.env (roles/matrix_accounts).
+
+[security]
+admin_users = ["@admin:example.org", "@admin2:matrix.org"]
+allowed_inviters = ["@admin:example.org", "@admin2:matrix.org"]
+allowed_rooms = ["!lOzPcaRR6TlOEGeMOP1WC3QLKMeKnuTNnbcOUlw-Pj8"]
+dm_rooms = ["!lOzPcaRR6TlOEGeMOP1WC3QLKMeKnuTNnbcOUlw-Pj8"]
+encryption_strategy = "identity_based"
+# verified: a person's identity as verified with the bot (!admin verify); a new identity stops
+# everything until they verify again. cross_signed: every device they signed with their
+# current identity; a new identity is accepted and logged (mxbot-common, 2026-10-19).
+trust = "cross_signed"
+
+[security.verification]
+allowed_users = []
+allow_users_from_joined_rooms = true
+
+[security.admin_dm]
+enabled = true
+require_encryption = true
+require_verified_device = false
+# Also the bot's broadcast posts (digests, reminders) into the admins' private chats.
+receive_broadcasts = false
+
+[schedule]
+room_id = "!lOzPcaRR6TlOEGeMOP1WC3QLKMeKnuTNnbcOUlw-Pj8"   # its own room (make matrix-rooms)
+game_times = ["13:00"]
+reminder_before_secs = 14400
+answer_timeout_secs = 21600
+guesses_per_round = 1
+photos_per_location = 5
+max_guesses_per_player = 1
+inter_guess_secs = 15
+timezone = "Europe/Berlin"
+
+[schedule.leaderboard]
+# Duels since 2026-10-19 (the rating with a group average is gone): on every image each
+# player meets every other, the closer guess wins +1. The month adds up points; 90 days and
+# all time rank by the share of duels won from this many images (fewer: "Not ranked yet").
+min_images = 20
+
+[web]
+bind_addr = "0.0.0.0:80"      # service_registry.geoguessr.upstream
+public_url = "https://geoguessr.example.org"   # also GEOGUESSR_PUBLIC_URL
+
+[sources]
+enabled = ["mapillary"]
+
+[sources.mapillary]
+access_token = "placeholder"
+search_radius = 50000
+# Difficulty (2026-10-19, "more countryside"): 0 searches each seed city's centre and the game
+# ends on the metre; a value in km searches random points up to that far around the city
+# (10 suburbs, 30 to 50 countryside; fewer photos there, so a round may find no image).
+# Photos over 3 km out are revealed as "near <city>".
+spread_km = 30

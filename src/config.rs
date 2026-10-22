@@ -1,5 +1,5 @@
-pub use mxbot_common::config::{MatrixConfig, SecurityConfig};
-use serde::Deserialize;
+pub use mxbot_common::config::{MatrixConfig, SecurityConfig, TimeOfDay};
+use serde::{Deserialize, Deserializer};
 
 #[derive(Deserialize)]
 pub struct Config {
@@ -83,8 +83,9 @@ impl WebConfig {
 #[derive(Deserialize)]
 pub struct ScheduleConfig {
     pub room_id: String,
-    /// One or more "HH:MM" times (in the configured timezone) to run the game.
-    pub game_times: Vec<String>,
+    /// One or more "HH:MM" times (in the configured timezone) to run the
+    /// game. A malformed time is refused at startup.
+    pub game_times: Vec<TimeOfDay>,
     /// Seconds to collect answers per guess before revealing.
     #[serde(default = "default_answer_timeout")]
     pub answer_timeout_secs: u64,
@@ -97,9 +98,13 @@ pub struct ScheduleConfig {
     /// Seconds before game_time to post a "starting soon" reminder. 0 = disabled.
     #[serde(default = "default_reminder_before_secs")]
     pub reminder_before_secs: u64,
-    /// IANA timezone (e.g. "Europe/Berlin").
-    #[serde(default = "default_timezone")]
-    pub timezone: String,
+    /// IANA timezone (e.g. "Europe/Berlin"). Default: UTC. An unknown
+    /// name is refused at startup.
+    #[serde(
+        default = "default_timezone",
+        deserialize_with = "deserialize_timezone"
+    )]
+    pub timezone: chrono_tz::Tz,
     /// Emoji the bot reacts with on the join-prompt message.
     /// Any other user who reacts with the same emoji opts in to play via DM.
     /// Only used when game_mode = "free_guess" and reminder_before_secs > 0.
@@ -127,16 +132,23 @@ pub struct ScheduleConfig {
 }
 
 impl ScheduleConfig {
+    /// "HH:MM" typed by a player (`!schedulegeo`) or stored with a one-time game.
     pub fn parse_game_time(s: &str) -> Option<(u32, u32)> {
-        let (h, m) = s.split_once(':')?;
-        let hour: u32 = h.trim().parse().ok()?;
-        let minute: u32 = m.trim().parse().ok()?;
-        if hour < 24 && minute < 60 {
-            Some((hour, minute))
-        } else {
-            None
-        }
+        let time: TimeOfDay = s.parse().ok()?;
+        Some((time.hour, time.minute))
     }
+}
+
+/// An IANA timezone name such as "Europe/Berlin".
+fn deserialize_timezone<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<chrono_tz::Tz, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    name.trim().parse().map_err(|_| {
+        serde::de::Error::custom(format!(
+            "unknown timezone {name:?} (expected an IANA name such as \"Europe/Berlin\")"
+        ))
+    })
 }
 
 fn default_join_emoji() -> String {
@@ -154,8 +166,8 @@ fn default_inter_guess_secs() -> u64 {
 fn default_reminder_before_secs() -> u64 {
     300
 }
-fn default_timezone() -> String {
-    "UTC".to_owned()
+fn default_timezone() -> chrono_tz::Tz {
+    chrono_tz::UTC
 }
 fn default_photos_per_location() -> usize {
     1
@@ -254,6 +266,53 @@ mod tests {
             bind_addr: "0.0.0.0:80".to_owned(),
             public_url: "https://old.example.net".to_owned(),
         }
+    }
+
+    /// The config house-infra renders today (stacks/matrix-bots/secrets/
+    /// geoguessr-bot.config.toml.j2, with placeholder secrets) still loads.
+    #[test]
+    fn the_deployed_config_parses() {
+        let config: Config = toml::from_str(include_str!("../tests/deployed.config.toml")).unwrap();
+        let s = &config.schedule;
+        assert_eq!(s.game_times, [TimeOfDay::new(13, 0)]);
+        assert_eq!(s.timezone, chrono_tz::Europe::Berlin);
+        assert_eq!(s.answer_timeout_secs, 21600);
+        assert_eq!(s.leaderboard.min_images, 20);
+        assert_eq!(
+            config.web.unwrap().public_url,
+            "https://geoguessr.example.org"
+        );
+        assert_eq!(config.sources.mapillary.spread_km, 30.0);
+        config.security.validate().unwrap();
+    }
+
+    fn schedule(extra: &str) -> Result<ScheduleConfig, toml::de::Error> {
+        toml::from_str(&format!("room_id = \"!room:example.org\"\n{extra}"))
+    }
+
+    #[test]
+    fn game_times_and_timezone_are_checked_at_load() {
+        let s = schedule("game_times = [\"09:00\", \"7:05\"]").unwrap();
+        assert_eq!(s.game_times, [TimeOfDay::new(9, 0), TimeOfDay::new(7, 5)]);
+        assert_eq!(s.timezone, chrono_tz::UTC);
+        for bad in ["24:00", "12:60", "noon", "12", ""] {
+            let Err(e) = schedule(&format!("game_times = [\"13:00\", \"{bad}\"]")) else {
+                panic!("{bad} was accepted");
+            };
+            assert!(e.to_string().contains("time"), "{bad}: {e}");
+        }
+        let Err(e) = schedule("game_times = []\ntimezone = \"Europe/Berln\"") else {
+            panic!("a misspelt timezone was accepted");
+        };
+        assert!(e.to_string().contains("unknown timezone"), "{e}");
+    }
+
+    #[test]
+    fn typed_game_times() {
+        assert_eq!(ScheduleConfig::parse_game_time("18:30"), Some((18, 30)));
+        assert_eq!(ScheduleConfig::parse_game_time(" 9:05 "), Some((9, 5)));
+        assert_eq!(ScheduleConfig::parse_game_time("24:00"), None);
+        assert_eq!(ScheduleConfig::parse_game_time("x"), None);
     }
 
     #[test]

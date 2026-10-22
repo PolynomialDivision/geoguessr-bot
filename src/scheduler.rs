@@ -1,5 +1,4 @@
-use chrono::Timelike;
-use chrono_tz::Tz;
+use chrono::{NaiveDate, NaiveDateTime, Timelike};
 use matrix_sdk::Client;
 use mxbot_common::matrix_sdk;
 use tracing::{error, info, warn};
@@ -16,17 +15,50 @@ pub async fn run(ctx: BotContext, client: Client) {
     }
 }
 
+/// How late a tick may still fire a slot: the loop sleeps a minute *after*
+/// each tick, so now and then one skips a minute, and a restart takes a
+/// while. Matching the exact minute lost the game on those days.
+const CATCH_UP_SECS: i64 = 5 * 60;
+
+/// When a game whose join message fires at `fire_secs` after local midnight
+/// is due, as of local `now`.
+#[derive(Debug, PartialEq)]
+enum Due {
+    /// Fire now: it was due on this (local) date, at most `CATCH_UP_SECS` ago.
+    Now(NaiveDate),
+    /// Not yet, or long past.
+    No,
+}
+
+fn due(now: NaiveDateTime, fire_secs: i64) -> Due {
+    // Whole minutes, as the slots were always matched.
+    let fire_secs = fire_secs.rem_euclid(86400) / 60 * 60;
+    let now_secs = i64::from(now.time().num_seconds_from_midnight());
+    let late = now_secs - fire_secs;
+    let (late, date) = if late >= 0 {
+        (late, now.date())
+    } else {
+        // Fired just before midnight, yesterday.
+        (late + 86400, now.date().pred_opt().unwrap_or(now.date()))
+    };
+    if late < CATCH_UP_SECS {
+        Due::Now(date)
+    } else {
+        Due::No
+    }
+}
+
+/// Whether a game due on `date` at `fire_secs` is past its catch-up window.
+fn missed(now: NaiveDateTime, date: NaiveDate, fire_secs: i64) -> bool {
+    let fire = date.and_time(chrono::NaiveTime::MIN)
+        + chrono::Duration::seconds(fire_secs.rem_euclid(86400) / 60 * 60);
+    (now - fire).num_seconds() >= CATCH_UP_SECS
+}
+
 async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
-    let tz: Tz = ctx
-        .config
-        .schedule
-        .timezone
-        .parse()
-        .unwrap_or(chrono_tz::UTC);
-    let local_now = chrono::Utc::now().with_timezone(&tz);
+    let local_now = chrono::Utc::now().with_timezone(&ctx.config.schedule.timezone);
     let local_date = local_now.date_naive();
-    let now_hour = local_now.hour();
-    let now_minute = local_now.minute();
+    let now = local_now.naive_local();
     let offset = ctx.config.schedule.reminder_before_secs as i64;
 
     // Guard: at most one round may be spawned per tick.
@@ -38,27 +70,19 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
     let mut round_spawned = false;
 
     // ── Recurring slots from config ───────────────────────────────────────────
-    for time_str in &ctx.config.schedule.game_times {
-        let (qh, qm) = match ScheduleConfig::parse_game_time(time_str) {
-            Some(t) => t,
-            None => {
-                warn!("Invalid game_times entry {:?}, skipping", time_str);
-                continue;
-            }
-        };
+    for game_time in &ctx.config.schedule.game_times {
+        let (qh, qm) = (game_time.hour, game_time.minute);
+        // The slot's key in `last_game_dates`, as "HH:MM".
+        let time_str = &game_time.to_string();
 
         let game_secs = (qh * 3600 + qm * 60) as i64;
-        let fire_secs = (game_secs - offset).rem_euclid(86400);
-        let fire_hour = (fire_secs / 3600) as u32;
-        let fire_min = ((fire_secs % 3600) / 60) as u32;
-
-        if now_hour != fire_hour || now_minute != fire_min {
+        let Due::Now(fire_date) = due(now, game_secs - offset) else {
             continue;
-        }
+        };
 
         {
             let state = ctx.state.lock().await;
-            if state.last_game_dates.get(time_str.as_str()) == Some(&local_date) {
+            if state.last_game_dates.get(time_str.as_str()) == Some(&fire_date) {
                 continue;
             }
         }
@@ -81,7 +105,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         // active_game has not been set yet.
         {
             let mut state = ctx.state.lock().await;
-            state.last_game_dates.insert(time_str.clone(), local_date);
+            state.last_game_dates.insert(time_str.clone(), fire_date);
             state.save(&ctx.state_path).await.ok();
         }
 
@@ -102,7 +126,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
     let once_entries: Vec<ScheduledOnce> = ctx.state.lock().await.scheduled_once.clone();
 
     for entry in once_entries {
-        if entry.date != local_date {
+        if entry.date > local_date {
             continue;
         }
 
@@ -128,7 +152,17 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         let fire_hour = (fire_secs / 3600) as u32;
         let fire_min = ((fire_secs % 3600) / 60) as u32;
 
-        if now_hour != fire_hour || now_minute != fire_min {
+        if due(now, fire_secs) != Due::Now(entry.date) {
+            if missed(now, entry.date, fire_secs) {
+                // The bot was down then: drop it, or it's listed forever.
+                warn!(
+                    "One-time game at {} on {} was missed, removing",
+                    entry.game_time, entry.date
+                );
+                let mut state = ctx.state.lock().await;
+                state.scheduled_once.retain(|e| e != &entry);
+                state.save(&ctx.state_path).await.ok();
+            }
             continue;
         }
 
@@ -181,4 +215,61 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(day: u32, h: u32, m: u32, s: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 10, day)
+            .unwrap()
+            .and_hms_opt(h, m, s)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_slot_is_due_from_its_minute_for_the_catch_up_window() {
+        let nine = 9 * 3600;
+        assert_eq!(due(at(22, 8, 59, 59), nine), Due::No);
+        assert_eq!(due(at(22, 9, 0, 0), nine), Due::Now(at(22, 0, 0, 0).date()));
+        // A tick that skipped the minute, or a restart, still fires it.
+        assert_eq!(due(at(22, 9, 1, 0), nine), Due::Now(at(22, 0, 0, 0).date()));
+        assert_eq!(
+            due(at(22, 9, 4, 59), nine),
+            Due::Now(at(22, 0, 0, 0).date())
+        );
+        assert_eq!(due(at(22, 9, 5, 0), nine), Due::No);
+        // Seconds in the fire time (a trimmed reminder) count from its minute.
+        assert_eq!(
+            due(at(22, 9, 0, 10), nine + 30),
+            Due::Now(at(22, 0, 0, 0).date())
+        );
+    }
+
+    #[test]
+    fn a_slot_just_before_midnight_counts_for_its_own_day() {
+        let fire = 23 * 3600 + 58 * 60;
+        assert_eq!(
+            due(at(22, 23, 58, 30), fire),
+            Due::Now(at(22, 0, 0, 0).date())
+        );
+        assert_eq!(due(at(23, 0, 1, 0), fire), Due::Now(at(22, 0, 0, 0).date()));
+        assert_eq!(due(at(23, 0, 4, 0), fire), Due::No);
+        // A negative fire time (reminder before midnight) wraps to the day before.
+        assert_eq!(
+            due(at(22, 23, 0, 0), -3600),
+            Due::Now(at(22, 0, 0, 0).date())
+        );
+    }
+
+    #[test]
+    fn a_one_time_game_is_missed_after_its_window() {
+        let date = at(22, 0, 0, 0).date();
+        let nine = 9 * 3600;
+        assert!(!missed(at(22, 8, 0, 0), date, nine));
+        assert!(!missed(at(22, 9, 4, 0), date, nine));
+        assert!(missed(at(22, 9, 5, 0), date, nine));
+        assert!(missed(at(23, 8, 0, 0), date, nine));
+    }
 }

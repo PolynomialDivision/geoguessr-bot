@@ -5,6 +5,7 @@
 //! pin; pressing Submit records the guess.  Tokens expire at round end.
 
 use mxbot_common::matrix_sdk;
+use mxbot_common::send::send_with_retry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -249,7 +250,7 @@ pub async fn update_links_message(ws: &WebState, round_id: i64, guess_num: u32) 
         session.links_event_id.clone(),
         None,
     ));
-    if let Err(e) = room.send(edit).await {
+    if let Err(e) = send_with_retry(&room, edit).await {
         warn!("Failed to update links message: {e}");
     }
 }
@@ -276,16 +277,27 @@ pub fn is_valid_coords(lat: f64, lon: f64) -> bool {
 fn map_html(token: &str, display_name: &str, one_shot: bool, lang: &str) -> String {
     // Use placeholder replacement so Leaflet's {z}/{x}/{y}/{s} tokens and
     // JavaScript object literals don't need escaping in a format! string.
-    let token_json = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_owned());
-    let name_json = serde_json::to_string(display_name).unwrap_or_else(|_| "\"\"".to_owned());
+    let token_json = script_string(token);
+    let name_json = script_string(display_name);
     let one_shot_js = if one_shot { "true" } else { "false" };
-    let lang_json = serde_json::to_string(lang).unwrap_or_else(|_| "\"en\"".to_owned());
+    let lang_json = script_string(lang);
 
     LEAFLET_MAP_TEMPLATE
         .replace("__TOKEN__", &token_json)
         .replace("__NAME__", &name_json)
         .replace("__ONE_SHOT__", one_shot_js)
         .replace("__LANG__", &lang_json)
+}
+
+/// `value` as a JavaScript string literal that is safe inside `<script>`:
+/// JSON with `<`, `>` and `&` escaped, so a value (the `lang` of
+/// `/map-test?lang=…`, say) can't close the script element and inject markup.
+fn script_string(value: &str) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "\"\"".to_owned())
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
 }
 
 static LEAFLET_MAP_TEMPLATE: &str = r#"<!DOCTYPE html>
@@ -570,6 +582,17 @@ p{color:#99aacc;font-size:0.95rem}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn page_values_cannot_close_the_script() {
+        let html = map_html("tok", "name", false, "</script><script>alert(1)</script>&");
+        assert!(!html.contains("<script>alert"), "{html}");
+        assert!(html.contains(
+            r#""\u003c/script\u003e\u003cscript\u003ealert(1)\u003c/script\u003e\u0026""#
+        ));
+        // Ordinary values are unchanged JSON strings.
+        assert_eq!(script_string("de-DE"), "\"de-DE\"");
+    }
+
     use super::*;
     use crate::game::{ActiveGame, ActiveGameMode};
     use matrix_sdk::ruma::OwnedUserId;

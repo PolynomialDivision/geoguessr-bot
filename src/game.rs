@@ -1,9 +1,9 @@
 //! Round and image game logic.
 
 use mxbot_common::matrix_sdk;
+use mxbot_common::send::send_with_retry;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use chrono_tz::Tz;
 use matrix_sdk::{
     ruma::{
         events::{
@@ -255,16 +255,16 @@ pub async fn start_round(
             m.room = true;
             m
         });
-        let join_event = room.send(join_content).await?;
-        let join_event_id = join_event.response.event_id.clone();
+        let join_event = send_with_retry(&room, join_content).await?;
+        let join_event_id = join_event.clone();
         set_pinned(&room, &join_event_id).await;
 
         // Bot primes the flag reactions so clients show them as tappable buttons.
         for flag in JOIN_REACTION_FLAGS {
-            room.send(ReactionEventContent::new(Annotation::new(
-                join_event_id.clone(),
-                flag.to_string(),
-            )))
+            send_with_retry(
+                &room,
+                ReactionEventContent::new(Annotation::new(join_event_id.clone(), flag.to_string())),
+            )
             .await
             .ok();
         }
@@ -320,20 +320,16 @@ pub async fn start_round(
         }
 
         if participants.is_empty() {
-            room.send(format::mentionify("😴 Nobody joined · skipping."))
+            send_with_retry(&room, format::mentionify("😴 Nobody joined · skipping."))
                 .await
                 .ok();
             // Mark slot as done so we don't retry.
             if let Some(slot) = slot {
-                let tz: Tz = ctx
-                    .config
-                    .schedule
-                    .timezone
-                    .parse()
-                    .unwrap_or(chrono_tz::UTC);
-                let today = chrono::Utc::now().with_timezone(&tz).date_naive();
+                let today = chrono::Utc::now()
+                    .with_timezone(&ctx.config.schedule.timezone)
+                    .date_naive();
                 let mut st = ctx.state.lock().await;
-                st.last_game_dates.insert(slot, today);
+                st.mark_slot_played(&slot, today);
                 st.save(&ctx.state_path).await.ok();
             }
             return Ok(());
@@ -345,7 +341,8 @@ pub async fn start_round(
         let participant_list: Vec<String> = sorted.iter().map(|u| u.to_string()).collect();
         let participant_ids: Vec<OwnedUserId> = sorted.clone();
         let n = sorted.len();
-        room.send(
+        send_with_retry(
+            &room,
             format::mentionify(&format!(
                 "🌍 GeoGuessr starting now!\n👥 {} player{}: {}",
                 n,
@@ -511,15 +508,11 @@ pub async fn start_round(
     }
 
     if let Some(slot) = slot {
-        let tz: Tz = ctx
-            .config
-            .schedule
-            .timezone
-            .parse()
-            .unwrap_or(chrono_tz::UTC);
-        let today = chrono::Utc::now().with_timezone(&tz).date_naive();
+        let today = chrono::Utc::now()
+            .with_timezone(&ctx.config.schedule.timezone)
+            .date_naive();
         let mut st = ctx.state.lock().await;
-        st.last_game_dates.insert(slot, today);
+        st.mark_slot_played(&slot, today);
         st.save(&ctx.state_path).await.ok();
     }
 
@@ -548,10 +541,13 @@ async fn abort_round_no_images(ctx: &BotContext, client: &Client, round_id: i64,
          after quality/dedup filtering; see preceding 'pop-time dedup' warnings for the reason(s)"
     );
     if let Some(r) = client.get_room(&ctx.room_id) {
-        r.send(format::mentionify(
-            "⚠️ Round aborted · no location with enough valid images was available. \
+        send_with_retry(
+            &r,
+            format::mentionify(
+                "⚠️ Round aborted · no location with enough valid images was available. \
              An admin may need to run !prefetch or check the image source config.",
-        ))
+            ),
+        )
         .await
         .ok();
     }
@@ -574,9 +570,12 @@ async fn abort_guess_no_image(
     guess_num: u32,
     n_total: u32,
 ) {
-    room.send(format::mentionify(&format!(
-        "⚠️ Guess {guess_num}/{n_total} skipped.\n📸 I couldn't send the image (see the logs).",
-    )))
+    send_with_retry(
+        room,
+        format::mentionify(&format!(
+            "⚠️ Guess {guess_num}/{n_total} skipped.\n📸 I couldn't send the image (see the logs).",
+        )),
+    )
     .await
     .ok();
     ctx.db.finish_guess(guess_id, 0, 0).await.ok();
@@ -712,22 +711,24 @@ async fn open_free_guess(
         } else {
             format!("📍 Context image ({}/{})", i + 1, n_imgs)
         };
-        let send_result = room
-            .send(image_content_with_info(
+        let send_result = send_with_retry(
+            room,
+            image_content_with_info(
                 label,
                 media.uri.clone(),
                 &media.mime,
                 media.w,
                 media.h,
                 media.size,
-            ))
-            .await;
+            ),
+        )
+        .await;
         match send_result {
             Ok(ev) => info!(
                 "GeoGuessr guess {guess_num}/{n_total}: sent image {}/{n_imgs} to room \
                  (event_id={})",
                 i + 1,
-                ev.response.event_id,
+                ev,
             ),
             Err(e) if i == 0 => {
                 error!(
@@ -785,13 +786,13 @@ async fn open_free_guess(
                     .collect::<Vec<_>>()
                     .join("  ·  ");
 
-                if let Ok(ev) = room.send(format::mentionify(&links_line)).await {
-                    set_pinned(room, &ev.response.event_id).await;
-                    links_event_id = Some(ev.response.event_id.clone());
+                if let Ok(ev) = send_with_retry(room, format::mentionify(&links_line)).await {
+                    set_pinned(room, &ev).await;
+                    links_event_id = Some(ev.clone());
                     store.sessions.insert(
                         (round_id, guess_num),
                         crate::web::GuessSession {
-                            links_event_id: ev.response.event_id.clone(),
+                            links_event_id: ev.clone(),
                             participants: participants.to_vec(),
                         },
                     );
@@ -819,7 +820,7 @@ async fn open_free_guess(
                 .collect::<Vec<_>>()
                 .join("  ·  ");
             drop(st);
-            room.send(format::mentionify(&line)).await.ok();
+            send_with_retry(room, format::mentionify(&line)).await.ok();
             HashMap::new()
         }
     } else {
@@ -829,18 +830,24 @@ async fn open_free_guess(
     // Countdown message: web mode shows just the timer (links message handles the rest),
     // otherwise show the !guess hint.
     let q_event = if !web_token_map.is_empty() {
-        room.send(format::mentionify(&format!(
-            "🌍 Guess {guess_num}/{n_total} · ⏳ {timeout_str}",
-        )))
+        send_with_retry(
+            room,
+            format::mentionify(&format!(
+                "🌍 Guess {guess_num}/{n_total} · ⏳ {timeout_str}",
+            )),
+        )
         .await?
     } else {
-        room.send(format::mentionify(&format!(
-            "🌍 Guess {guess_num}/{n_total} · ⏳ {timeout_str}\n\
+        send_with_retry(
+            room,
+            format::mentionify(&format!(
+                "🌍 Guess {guess_num}/{n_total} · ⏳ {timeout_str}\n\
              📍 Where is this?\n💬 Type **!guess** with a city, a country or lat,lon",
-        )))
+            )),
+        )
         .await?
     };
-    let q_event_id = q_event.response.event_id.clone();
+    let q_event_id = q_event.clone();
     let opened_at = chrono::Utc::now();
 
     ctx.db
@@ -930,12 +937,15 @@ async fn resume_free_guess(
             }
         });
     let Some((open, prompt_event_id)) = open else {
-        room.send(format::mentionify(&format!(
-            "⚠️ I restarted mid-round.\n🔁 Replaying guess {}/{} with a fresh {} timer.",
-            ar.guess_num,
-            ar.total_guesses,
-            format_duration(ar.answer_timeout_secs),
-        )))
+        send_with_retry(
+            room,
+            format::mentionify(&format!(
+                "⚠️ I restarted mid-round.\n🔁 Replaying guess {}/{} with a fresh {} timer.",
+                ar.guess_num,
+                ar.total_guesses,
+                format_duration(ar.answer_timeout_secs),
+            )),
+        )
         .await
         .ok();
         return play_free_guess(
@@ -984,7 +994,7 @@ async fn resume_free_guess(
             ar.guess_num, ar.total_guesses,
         )
     };
-    room.send(format::mentionify(&note)).await.ok();
+    send_with_retry(room, format::mentionify(&note)).await.ok();
     info!(
         "GeoGuessr guess {}/{}: resumed with {kept} guess(es), {remaining}s left",
         ar.guess_num, ar.total_guesses
@@ -1111,7 +1121,7 @@ async fn run_free_guess(
         if let Some(r) = client.get_room(&ctx.room_id) {
             let edit =
                 edit_msg.make_replacement(ReplacementMetadata::new(q_event_id.clone(), None));
-            r.send(edit).await.ok();
+            send_with_retry(&r, edit).await.ok();
         }
     }
 
@@ -1120,7 +1130,7 @@ async fn run_free_guess(
         if let Some(r) = client.get_room(&ctx.room_id) {
             let edit = RoomMessageEventContent::text_plain(&final_msg)
                 .make_replacement(ReplacementMetadata::new(q_event_id.clone(), None));
-            r.send(edit).await.ok();
+            send_with_retry(&r, edit).await.ok();
         }
     }
 
@@ -1390,7 +1400,7 @@ async fn post_reveal_free_guess(
     };
     if let Some(r) = client.get_room(&ctx.room_id) {
         if text.len() <= MATRIX_SPLIT_THRESHOLD || scored.is_empty() {
-            r.send(quiet(&text)).await.ok();
+            send_with_retry(&r, quiet(&text)).await.ok();
         } else {
             // Build summary (overview URL + scores, no per-player map links).
             let make_summary = |ov: &str| -> String {
@@ -1419,7 +1429,7 @@ async fn post_reveal_free_guess(
             } else {
                 summary
             };
-            r.send(quiet(&summary)).await.ok();
+            send_with_retry(&r, quiet(&summary)).await.ok();
 
             // Build all individual map links as one block of text.
             let link_lines: Vec<String> = scored
@@ -1434,10 +1444,10 @@ async fn post_reveal_free_guess(
             let links_text = link_lines.join("\n");
 
             if links_text.len() <= MATRIX_SPLIT_THRESHOLD {
-                r.send(quiet(&links_text)).await.ok();
+                send_with_retry(&r, quiet(&links_text)).await.ok();
             } else {
                 for line in &link_lines {
-                    r.send(quiet(line)).await.ok();
+                    send_with_retry(&r, quiet(line)).await.ok();
                 }
             }
         }
@@ -1497,16 +1507,11 @@ async fn post_reveal_free_guess(
     };
     let label = format!("🗺️ Guess {guess_num}/{n_total} · {location_str}");
     if let Some(r) = client.get_room(&ctx.room_id) {
-        if let Err(e) = r
-            .send(image_content_with_info(
-                label,
-                uploaded.content_uri,
-                &map_mime,
-                w,
-                h,
-                size,
-            ))
-            .await
+        if let Err(e) = send_with_retry(
+            &r,
+            image_content_with_info(label, uploaded.content_uri, &map_mime, w, h, size),
+        )
+        .await
         {
             warn!("GeoGuessr guess {guess_num}/{n_total}: result map send failed: {e}");
         }
@@ -1577,11 +1582,10 @@ async fn post_round_summary_free_guess(
 ) {
     if scores.is_empty() {
         if let Some(r) = client.get_room(&ctx.room_id) {
-            if let Ok(ev) = r
-                .send(format::mentionify("🌍 Round over · nobody played."))
-                .await
+            if let Ok(ev) =
+                send_with_retry(&r, format::mentionify("🌍 Round over · nobody played.")).await
             {
-                set_pinned(&r, &ev.response.event_id).await;
+                set_pinned(&r, &ev).await;
             }
         }
         return;
@@ -1598,8 +1602,8 @@ async fn post_round_summary_free_guess(
     let round_text = round_summary_text(n_guesses, crate::duels::standings(&entries));
 
     if let Some(r) = client.get_room(&ctx.room_id) {
-        if let Ok(ev) = r.send(format::mentionify(&round_text)).await {
-            set_pinned(&r, &ev.response.event_id).await;
+        if let Ok(ev) = send_with_retry(&r, format::mentionify(&round_text)).await {
+            set_pinned(&r, &ev).await;
         }
     }
 
@@ -1608,7 +1612,7 @@ async fn post_round_summary_free_guess(
     // all-time board is still available via `!scores`.
     if let Some(r) = client.get_room(&ctx.room_id) {
         if let Some(lb_text) = crate::commands::build_monthly_leaderboard(ctx).await {
-            r.send(format::mentionify(&lb_text)).await.ok();
+            send_with_retry(&r, format::mentionify(&lb_text)).await.ok();
         }
     }
 }
@@ -2559,19 +2563,15 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
     let triggered_by = "scheduler";
 
     if participants.is_empty() {
-        room.send(format::mentionify("😴 Nobody joined · skipping."))
+        send_with_retry(&room, format::mentionify("😴 Nobody joined · skipping."))
             .await
             .ok();
         if let Some(slot) = &pj.slot {
-            let tz: Tz = ctx
-                .config
-                .schedule
-                .timezone
-                .parse()
-                .unwrap_or(chrono_tz::UTC);
-            let today = chrono::Utc::now().with_timezone(&tz).date_naive();
+            let today = chrono::Utc::now()
+                .with_timezone(&ctx.config.schedule.timezone)
+                .date_naive();
             let mut st = ctx.state.lock().await;
-            st.last_game_dates.insert(slot.clone(), today);
+            st.mark_slot_played(slot, today);
             st.save(&ctx.state_path).await.ok();
         }
         return;
@@ -2583,7 +2583,8 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
     let participant_list: Vec<String> = sorted_participants.iter().map(|u| u.to_string()).collect();
     let participant_ids: Vec<OwnedUserId> = sorted_participants.clone();
     let n_players = sorted_participants.len();
-    room.send(
+    send_with_retry(
+        &room,
         format::mentionify(&format!(
             "🌍 GeoGuessr starting now!\n👥 {} player{}: {}",
             n_players,
@@ -2727,14 +2728,10 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
         let mut st = ctx.state.lock().await;
         st.active_round = None;
         if let Some(slot) = &pj.slot {
-            let tz: Tz = ctx
-                .config
-                .schedule
-                .timezone
-                .parse()
-                .unwrap_or(chrono_tz::UTC);
-            let today = chrono::Utc::now().with_timezone(&tz).date_naive();
-            st.last_game_dates.insert(slot.clone(), today);
+            let today = chrono::Utc::now()
+                .with_timezone(&ctx.config.schedule.timezone)
+                .date_naive();
+            st.mark_slot_played(slot, today);
         }
         st.save(&ctx.state_path).await.ok();
     }
