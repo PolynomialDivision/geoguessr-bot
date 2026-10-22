@@ -748,14 +748,32 @@ async fn get_images(
     client: &reqwest::Client,
     url: &str,
 ) -> Result<MapillaryResp, ImagesFetchError> {
+    get_images_with_backoff(client, url, RETRY_BACKOFF_UNIT).await
+}
+
+/// The first retry delay; each further retry doubles it (capped at 16 units).
+const RETRY_BACKOFF_UNIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Delay before retry number `attempt` (1-based): 1, 2, 4, 8, 16, 16, ... units.
+fn retry_delay(attempt: u32, unit: std::time::Duration) -> std::time::Duration {
+    unit * 2u32.pow(attempt.saturating_sub(1).min(4))
+}
+
+/// `get_images` with the backoff unit passed in, so tests can retry against
+/// a local server without sleeping through the real 1+2+4+8 s.
+async fn get_images_with_backoff(
+    client: &reqwest::Client,
+    url: &str,
+    backoff_unit: std::time::Duration,
+) -> Result<MapillaryResp, ImagesFetchError> {
     const MAX_RETRIES: u32 = 5;
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
-            let delay = 2u64.pow(attempt - 1).min(16);
-            warn!("Mapillary: HTTP retry {attempt}/{MAX_RETRIES} in {delay}s");
-            tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
+            let delay = retry_delay(attempt, backoff_unit);
+            warn!("Mapillary: HTTP retry {attempt}/{MAX_RETRIES} in {delay:?}");
+            tokio::time::sleep(delay).await;
         }
 
         let resp = match client.get(url).send().await {
@@ -1312,6 +1330,17 @@ mod tests {
         (format!("http://{addr}/images"), counter, handle)
     }
 
+    /// Retry tests talk to a local server: a millisecond backoff keeps the
+    /// retry path real without sleeping through the production 1+2+4+8 s.
+    const TEST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
+
+    #[test]
+    fn retry_delay_doubles_from_one_unit_and_is_capped_at_sixteen() {
+        let unit = RETRY_BACKOFF_UNIT;
+        let secs: Vec<u64> = (1..=6).map(|a| retry_delay(a, unit).as_secs()).collect();
+        assert_eq!(secs, vec![1, 2, 4, 8, 16, 16]);
+    }
+
     #[tokio::test]
     async fn get_images_classifies_the_real_mapillary_too_much_data_response() {
         // Exact body captured from the live API for a bbox in a dense city
@@ -1344,7 +1373,7 @@ mod tests {
         .await;
         let client = reqwest::Client::new();
 
-        let result = get_images(&client, &url).await;
+        let result = get_images_with_backoff(&client, &url, TEST_BACKOFF).await;
 
         assert!(
             result.is_ok(),
@@ -1382,7 +1411,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            get_images(&client, &url),
+            get_images_with_backoff(&client, &url, TEST_BACKOFF),
         )
         .await
         .expect("get_images must terminate on its own, not hang forever");
