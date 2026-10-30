@@ -5,6 +5,7 @@ use std::{
     collections::HashSet,
     path::PathBuf,
     sync::{atomic::AtomicU32, Arc},
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -23,6 +24,7 @@ use mxbot_common::{
     },
     send::send_with_retry,
     send::{in_thread, thread_root},
+    supervise::{supervise, supervise_ticking},
     Bot,
 };
 use tokio::sync::Mutex;
@@ -225,11 +227,7 @@ async fn main() -> Result<()> {
             public_url: web_cfg.public_url.clone(),
         };
         let bind_addr = web_cfg.bind_addr.clone();
-        tokio::spawn(async move {
-            if let Err(e) = web::run(bind_addr, web_state).await {
-                error!("Web server error: {e}");
-            }
-        });
+        supervise("web server", web::run(bind_addr, web_state));
     }
 
     // ── Message / command handler (main game room) ────────────────────────────
@@ -439,7 +437,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    tokio::spawn(scheduler::run(ctx, client.clone()));
+    // A round a minute, each a few lock and state-file operations.
+    supervise_ticking("game scheduler", Duration::from_secs(5 * 60), |alive| {
+        scheduler::run(ctx, client.clone(), alive)
+    });
 
     bot.run().await
 }

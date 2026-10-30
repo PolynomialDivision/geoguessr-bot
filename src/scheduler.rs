@@ -1,13 +1,14 @@
 use chrono::{NaiveDate, NaiveDateTime, Timelike};
 use matrix_sdk::Client;
-use mxbot_common::matrix_sdk;
+use mxbot_common::{matrix_sdk, supervise::Alive};
 use tracing::{error, info, warn};
 
 use crate::{config::ScheduleConfig, game::GameOverrides, state::ScheduledOnce, BotContext};
 
-pub async fn run(ctx: BotContext, client: Client) {
+pub async fn run(ctx: BotContext, client: Client, alive: Alive) {
     info!("GeoGuessr scheduler started");
     loop {
+        alive.tick();
         if let Err(e) = tick(&ctx, &client).await {
             error!("Scheduler error: {e}");
         }

@@ -33,3 +33,7 @@ tempfile = "3"
 toml     = "1"
 # Router tests (src/web.rs).
 tower    = { version = "0.5", features = ["util"] }
+
+# No panic = "abort" (unlike the other bots): panics are caught on purpose in
+# drawing the map and fetching its tiles (images from outside).
+# Its background loops still end the bot on a panic (mxbot_common::supervise).
