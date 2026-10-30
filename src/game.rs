@@ -1,6 +1,7 @@
 //! Round and image game logic.
 
 use mxbot_common::matrix_sdk;
+use mxbot_common::media;
 use mxbot_common::send::send_with_retry;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -15,13 +16,12 @@ use matrix_sdk::{
                     RoomMessageEventContent,
                 },
                 pinned_events::RoomPinnedEventsEventContent,
-                ImageInfo,
+                ImageInfo, MediaSource,
             },
             Mentions,
         },
         // (ReactionEventContent and Annotation kept for join-phase reactions)
         OwnedEventId,
-        OwnedMxcUri,
         OwnedUserId,
         UInt,
     },
@@ -41,9 +41,10 @@ use crate::{
     BotContext,
 };
 
-/// Metadata about an image that has been uploaded to the Matrix media store.
+/// Metadata about an image that has been uploaded to the Matrix media store (encrypted
+/// for an encrypted room).
 struct UploadedMedia {
-    uri: OwnedMxcUri,
+    source: MediaSource,
     mime: mime::Mime,
     w: u32,
     h: u32,
@@ -598,7 +599,6 @@ async fn play_free_guess(
 ) -> anyhow::Result<()> {
     let Some(opened) = open_free_guess(
         ctx,
-        client,
         room,
         round_id,
         guess_num,
@@ -632,7 +632,6 @@ async fn play_free_guess(
 #[allow(clippy::too_many_arguments)]
 async fn open_free_guess(
     ctx: &BotContext,
-    client: &Client,
     room: &Room,
     round_id: i64,
     guess_num: u32,
@@ -675,8 +674,8 @@ async fn open_free_guess(
         img.lon,
     );
 
-    // Upload all images once; reuse mxc_uris across main room + all DMs.
-    let all_images = match upload_all_images(client, img).await {
+    // Upload all images once, for the main room.
+    let all_images = match upload_all_images(room, img).await {
         Ok(v) => v,
         Err(e) => {
             error!(
@@ -715,7 +714,7 @@ async fn open_free_guess(
             room,
             image_content_with_info(
                 label,
-                media.uri.clone(),
+                media.source.clone(),
                 &media.mime,
                 media.w,
                 media.h,
@@ -1498,23 +1497,24 @@ async fn post_reveal_free_guess(
     let map_mime: mime::Mime = "image/png".parse().unwrap();
     let (w, h) = image_dimensions(&png);
     let size = png.len();
-    let uploaded = match client.media().upload(&map_mime, png, None).await {
-        Ok(resp) => resp,
+    let Some(r) = client.get_room(&ctx.room_id) else {
+        return;
+    };
+    let uploaded = match media::upload(&r, &map_mime, png).await {
+        Ok(source) => source,
         Err(e) => {
             warn!("GeoGuessr guess {guess_num}/{n_total}: result map upload failed: {e}");
             return;
         }
     };
     let label = format!("🗺️ Guess {guess_num}/{n_total} · {location_str}");
-    if let Some(r) = client.get_room(&ctx.room_id) {
-        if let Err(e) = send_with_retry(
-            &r,
-            image_content_with_info(label, uploaded.content_uri, &map_mime, w, h, size),
-        )
-        .await
-        {
-            warn!("GeoGuessr guess {guess_num}/{n_total}: result map send failed: {e}");
-        }
+    if let Err(e) = send_with_retry(
+        &r,
+        image_content_with_info(label, uploaded, &map_mime, w, h, size),
+    )
+    .await
+    {
+        warn!("GeoGuessr guess {guess_num}/{n_total}: result map send failed: {e}");
     }
 }
 
@@ -1890,12 +1890,12 @@ async fn reconcile_join_reactions(
 /// Upload the primary image and all extra images.
 /// Returns a vec of `UploadedMedia`: primary first.
 /// Extra images that fail to upload are silently skipped (logged as warnings).
-async fn upload_all_images(client: &Client, img: &GeoImage) -> anyhow::Result<Vec<UploadedMedia>> {
-    let primary = upload_image(client, img).await?;
+async fn upload_all_images(room: &Room, img: &GeoImage) -> anyhow::Result<Vec<UploadedMedia>> {
+    let primary = upload_image(room, img).await?;
     let mut results = vec![primary];
 
     for url in &img.extra_image_urls {
-        match upload_http_url(client, url).await {
+        match upload_http_url(room, url).await {
             Ok(r) => results.push(r),
             Err(e) => warn!("GeoGuessr: failed to upload extra image: {e}"),
         }
@@ -1904,7 +1904,7 @@ async fn upload_all_images(client: &Client, img: &GeoImage) -> anyhow::Result<Ve
 }
 
 /// Download an image from an HTTP(S) URL and upload it to the Matrix media store.
-async fn upload_http_url(client: &Client, url: &str) -> anyhow::Result<UploadedMedia> {
+async fn upload_http_url(room: &Room, url: &str) -> anyhow::Result<UploadedMedia> {
     let resp = reqwest::Client::builder()
         .user_agent("geoguessr-bot/0.1")
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -1927,9 +1927,9 @@ async fn upload_http_url(client: &Client, url: &str) -> anyhow::Result<UploadedM
     let data = resp.bytes().await?.to_vec();
     let (w, h) = image_dimensions(&data);
     let size = data.len();
-    let response = client.media().upload(&mime, data, None).await?;
+    let source = media::upload(room, &mime, data).await?;
     Ok(UploadedMedia {
-        uri: response.content_uri,
+        source,
         mime,
         w,
         h,
@@ -1937,23 +1937,23 @@ async fn upload_http_url(client: &Client, url: &str) -> anyhow::Result<UploadedM
     })
 }
 
-async fn upload_image(client: &Client, img: &GeoImage) -> anyhow::Result<UploadedMedia> {
+async fn upload_image(room: &Room, img: &GeoImage) -> anyhow::Result<UploadedMedia> {
     if img.image_url.starts_with('/') || img.image_url.starts_with("file://") {
         let path = img.image_url.trim_start_matches("file://");
         let data = tokio::fs::read(path).await?;
         let mime = detect_mime(&data);
         let (w, h) = image_dimensions(&data);
         let size = data.len();
-        let response = client.media().upload(&mime, data, None).await?;
+        let source = media::upload(room, &mime, data).await?;
         Ok(UploadedMedia {
-            uri: response.content_uri,
+            source,
             mime,
             w,
             h,
             size,
         })
     } else {
-        upload_http_url(client, &img.image_url).await
+        upload_http_url(room, &img.image_url).await
     }
 }
 
@@ -1986,7 +1986,7 @@ fn image_dimensions(data: &[u8]) -> (u32, u32) {
 /// the event to the image renderer; without it they fall back to plain text body.
 fn image_content_with_info(
     label: String,
-    uri: OwnedMxcUri,
+    source: MediaSource,
     mime: &mime::Mime,
     w: u32,
     h: u32,
@@ -2016,7 +2016,7 @@ fn image_content_with_info(
     } else {
         None
     };
-    let mut content = ImageMessageEventContent::plain(label, uri);
+    let mut content = ImageMessageEventContent::new(label, source);
     content.filename = Some(safe_filename);
     content.info = Some(Box::new(info));
     RoomMessageEventContent::new(MessageType::Image(content))
@@ -2745,6 +2745,69 @@ pub async fn resume_pending_join(ctx: BotContext, client: Client, pj: PendingJoi
 mod tests {
     use super::*;
     use crate::duels::{score_image, standings, Entry};
+
+    #[test]
+    fn an_image_in_a_plain_room_has_its_url_caption_and_info() {
+        let content = image_content_with_info(
+            "📍 Reference location (1/2)".to_owned(),
+            MediaSource::Plain("mxc://example.org/abc".into()),
+            &mime::IMAGE_JPEG,
+            1024,
+            768,
+            5000,
+        );
+        assert_eq!(
+            serde_json::to_value(&content).unwrap(),
+            serde_json::json!({
+                "msgtype": "m.image",
+                "body": "📍 Reference location (1/2)",
+                "filename": crate::format::sanitize_filename("📍 Reference location (1/2).jpg"),
+                "url": "mxc://example.org/abc",
+                "info": { "mimetype": "image/jpeg", "w": 1024, "h": 768, "size": 5000 }
+            })
+        );
+        // unknown dimensions are left out
+        let content = image_content_with_info(
+            "x".to_owned(),
+            MediaSource::Plain("mxc://example.org/abc".into()),
+            &mime::IMAGE_PNG,
+            0,
+            0,
+            5,
+        );
+        assert_eq!(
+            serde_json::to_value(&content).unwrap()["info"],
+            serde_json::json!({ "mimetype": "image/png", "size": 5 })
+        );
+    }
+
+    #[test]
+    fn an_image_in_an_encrypted_room_carries_the_key_not_a_url() {
+        let file = serde_json::from_value(serde_json::json!({
+            "url": "mxc://example.org/enc",
+            "key": {
+                "kty": "oct", "key_ops": ["encrypt", "decrypt"], "alg": "A256CTR",
+                "k": "qcHVMSgYg-71CauWBezXI5qkaRb0LuIy-Wx5kIaHMIA", "ext": true
+            },
+            "iv": "X85+XgHN+HEAAAAAAAAAAA",
+            "hashes": { "sha256": "5qG4fFnbbVdlAB1Q72JDKwCagV6Dbkx9uds4rSak37c" },
+            "v": "v2"
+        }))
+        .unwrap();
+        let content = image_content_with_info(
+            "🗺️ Guess 1/5 · Lisbon".to_owned(),
+            MediaSource::Encrypted(Box::new(file)),
+            &mime::IMAGE_PNG,
+            800,
+            600,
+            42,
+        );
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json.get("url").is_none(), "{json}");
+        assert_eq!(json["file"]["url"], "mxc://example.org/enc");
+        assert_eq!(json["body"], "🗺️ Guess 1/5 · Lisbon");
+        assert_eq!(json["info"]["w"], 800);
+    }
 
     fn e(user: &str, metres: Option<f64>) -> Entry {
         Entry {

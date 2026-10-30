@@ -453,15 +453,9 @@ async fn try_seed(
     let (resp, left, bottom, right, top) = loop {
         let (left, bottom, right, top) =
             bbox_from_half_degs(seed.lat, seed.lon, half_lat_deg, half_lon_deg);
-        let url = format!(
-            "{API}?access_token={token}\
-             &fields=id,geometry,computed_geometry,thumb_1024_url,creator,sequence,captured_at,width,height,compass_angle,quality_score\
-             &bbox={left},{bottom},{right},{top}\
-             &limit={MAPILLARY_IMAGES_LIMIT}",
-            token = cfg.access_token,
-        );
+        let url = images_url(left, bottom, right, top);
 
-        match get_images(client, &url).await {
+        match get_images(client, &url, &cfg.access_token).await {
             Ok(resp) => break (resp, left, bottom, right, top),
             Err(ImagesFetchError::TooMuchData) if shrinks < MAX_BBOX_SHRINKS => {
                 shrinks += 1;
@@ -738,7 +732,19 @@ enum ImagesFetchError {
     Other(anyhow::Error),
 }
 
-/// GET the `/images` endpoint at `url`, retrying network errors, response
+/// The `/images` query for one bbox. The access token is not part of it: `get_images` sends
+/// it in the `Authorization` header, so the URLs that reqwest errors (and the logs and errors
+/// made from them) carry never contain it.
+fn images_url(left: f64, bottom: f64, right: f64, top: f64) -> String {
+    format!(
+        "{API}?fields=id,geometry,computed_geometry,thumb_1024_url,creator,sequence,captured_at,width,height,compass_angle,quality_score\
+         &bbox={left},{bottom},{right},{top}\
+         &limit={MAPILLARY_IMAGES_LIMIT}"
+    )
+}
+
+/// GET the `/images` endpoint at `url` with `token` (`Authorization: OAuth <token>`, which
+/// Mapillary's API accepts like the `access_token` parameter), retrying network errors, response
 /// parse errors, HTTP 429, and other 5xx statuses with the same exponential
 /// backoff as the rest of the codebase (1 s, 2 s, 4 s, 8 s; 5 attempts
 /// total), but returning immediately on a persistent 4xx (401/403/404/...,
@@ -747,8 +753,9 @@ enum ImagesFetchError {
 async fn get_images(
     client: &reqwest::Client,
     url: &str,
+    token: &str,
 ) -> Result<MapillaryResp, ImagesFetchError> {
-    get_images_with_backoff(client, url, RETRY_BACKOFF_UNIT).await
+    get_images_with_backoff(client, url, token, RETRY_BACKOFF_UNIT).await
 }
 
 /// The first retry delay; each further retry doubles it (capped at 16 units).
@@ -764,9 +771,17 @@ fn retry_delay(attempt: u32, unit: std::time::Duration) -> std::time::Duration {
 async fn get_images_with_backoff(
     client: &reqwest::Client,
     url: &str,
+    token: &str,
     backoff_unit: std::time::Duration,
 ) -> Result<MapillaryResp, ImagesFetchError> {
     const MAX_RETRIES: u32 = 5;
+    let mut auth =
+        reqwest::header::HeaderValue::from_str(&format!("OAuth {token}")).map_err(|_| {
+            ImagesFetchError::Other(anyhow::anyhow!(
+                "Mapillary: access_token contains characters not allowed in a header"
+            ))
+        })?;
+    auth.set_sensitive(true);
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 0..MAX_RETRIES {
@@ -776,7 +791,12 @@ async fn get_images_with_backoff(
             tokio::time::sleep(delay).await;
         }
 
-        let resp = match client.get(url).send().await {
+        let resp = match client
+            .get(url)
+            .header(reqwest::header::AUTHORIZATION, auth.clone())
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 warn!("Mapillary: HTTP request error: {e}");
@@ -1334,6 +1354,8 @@ mod tests {
     /// retry path real without sleeping through the production 1+2+4+8 s.
     const TEST_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1);
 
+    const TEST_TOKEN: &str = "MLY|4242|not-a-real-token-but-secret";
+
     #[test]
     fn retry_delay_doubles_from_one_unit_and_is_capped_at_sixteen() {
         let unit = RETRY_BACKOFF_UNIT;
@@ -1354,7 +1376,7 @@ mod tests {
         .await;
         let client = reqwest::Client::new();
 
-        let result = get_images(&client, &url).await;
+        let result = get_images(&client, &url, TEST_TOKEN).await;
 
         assert!(matches!(result, Err(ImagesFetchError::TooMuchData)));
         assert_eq!(
@@ -1373,7 +1395,7 @@ mod tests {
         .await;
         let client = reqwest::Client::new();
 
-        let result = get_images_with_backoff(&client, &url, TEST_BACKOFF).await;
+        let result = get_images_with_backoff(&client, &url, TEST_TOKEN, TEST_BACKOFF).await;
 
         assert!(
             result.is_ok(),
@@ -1390,7 +1412,7 @@ mod tests {
             spawn_canned_server(vec![(403, r#"{"error":{"message":"forbidden"}}"#)]).await;
         let client = reqwest::Client::new();
 
-        let result = get_images(&client, &url).await;
+        let result = get_images(&client, &url, TEST_TOKEN).await;
 
         assert!(matches!(result, Err(ImagesFetchError::Other(_))));
         assert_eq!(
@@ -1411,7 +1433,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            get_images_with_backoff(&client, &url, TEST_BACKOFF),
+            get_images_with_backoff(&client, &url, TEST_TOKEN, TEST_BACKOFF),
         )
         .await
         .expect("get_images must terminate on its own, not hang forever");
@@ -1422,5 +1444,102 @@ mod tests {
             5,
             "must attempt exactly MAX_RETRIES times, not loop forever"
         );
+    }
+
+    // ── The access token never reaches a URL, an error or a log line ─────────
+
+    #[test]
+    fn images_url_does_not_contain_the_token() {
+        let url = images_url(4.83, 45.76, 4.84, 45.77);
+        assert!(url.starts_with("https://graph.mapillary.com/images?fields=id,"));
+        assert!(url.contains("&bbox=4.83,45.76,4.84,45.77&limit="));
+        assert!(!url.contains("access_token"));
+    }
+
+    #[tokio::test]
+    async fn get_images_sends_the_token_in_the_authorization_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/images",
+            axum::routing::get(
+                |uri: axum::http::Uri, headers: axum::http::HeaderMap| async move {
+                    let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+                    let in_url = uri.query().unwrap_or("").contains("access_token");
+                    if auth == Some(&format!("OAuth {TEST_TOKEN}")) && !in_url {
+                        (axum::http::StatusCode::OK, r#"{"data":[]}"#)
+                    } else {
+                        (axum::http::StatusCode::UNAUTHORIZED, "{}")
+                    }
+                },
+            ),
+        );
+        let _server = tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+        let url = format!("http://{addr}/images?fields=id&bbox=1,2,3,4&limit=1");
+
+        let result = get_images(&reqwest::Client::new(), &url, TEST_TOKEN).await;
+
+        assert!(result.is_ok(), "the server did not see the token header");
+    }
+
+    /// Every event's message and fields as text, recorded on this thread.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<String>>);
+
+    impl tracing::field::Visit for LogCapture {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let mut text = self.0.lock().unwrap();
+            text.push_str(&format!("{}={value:?} ", field.name()));
+        }
+    }
+
+    impl tracing::Subscriber for LogCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            event.record(&mut self.clone());
+            self.0.lock().unwrap().push('\n');
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn logged_and_returned_errors_do_not_contain_the_token() {
+        let capture = LogCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        let client = reqwest::Client::new();
+
+        // A network error (nothing listens on the port) on every attempt ...
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let url = format!("http://{addr}/images?fields=id&bbox=1,2,3,4&limit=1");
+        let network = get_images_with_backoff(&client, &url, TEST_TOKEN, TEST_BACKOFF).await;
+
+        // ... and a response that does not parse.
+        let (url, _counter, _server) = spawn_canned_server(vec![(200, "not json")]).await;
+        let decode = get_images_with_backoff(&client, &url, TEST_TOKEN, TEST_BACKOFF).await;
+
+        let logs = capture.0.lock().unwrap().clone();
+        assert!(logs.contains("Mapillary: HTTP request error"), "{logs}");
+        assert!(
+            logs.contains("Mapillary: HTTP response parse error"),
+            "{logs}"
+        );
+        assert!(!logs.contains(TEST_TOKEN), "token in the logs: {logs}");
+        for result in [network, decode] {
+            let Err(ImagesFetchError::Other(e)) = result else {
+                panic!("expected an error");
+            };
+            let text = format!("{e:#} {e:?}");
+            assert!(!text.contains(TEST_TOKEN), "token in the error: {text}");
+        }
     }
 }
