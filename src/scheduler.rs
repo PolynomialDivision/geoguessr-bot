@@ -5,15 +5,62 @@ use tracing::{error, info, warn};
 
 use crate::{config::ScheduleConfig, game::GameOverrides, state::ScheduledOnce, BotContext};
 
+/// A round a minute.
+const ROUND: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub async fn run(ctx: BotContext, client: Client, alive: Alive) {
     info!("GeoGuessr scheduler started");
+    // For the status file: a round should succeed every minute.
+    alive.expect_every(ROUND);
     loop {
         alive.tick();
-        if let Err(e) = tick(&ctx, &client).await {
-            error!("Scheduler error: {e}");
+        match tick(&ctx, &client).await {
+            Ok(true) => alive.ok(),
+            Ok(false) => alive.idle(),
+            Err(e) => {
+                error!("Scheduler error: {e}");
+                alive.failed(format!("scheduler round failed: {e}"));
+            }
         }
-        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        alive.next_due(next_fire(&ctx));
+        tokio::time::sleep(ROUND).await;
     }
+}
+
+/// When the next recurring game fires (its join message), for the status file.
+fn next_fire(ctx: &BotContext) -> Option<std::time::SystemTime> {
+    let tz = ctx.config.schedule.timezone;
+    let now = chrono::Utc::now().with_timezone(&tz).naive_local();
+    let offset = ctx.config.schedule.reminder_before_secs as i64;
+    let fire_secs = ctx
+        .config
+        .schedule
+        .game_times
+        .iter()
+        .map(|t| (t.hour * 3600 + t.minute * 60) as i64 - offset);
+    let next = next_fire_after(now, fire_secs)?;
+    next.and_local_timezone(tz)
+        .earliest()
+        .map(|at| std::time::SystemTime::from(at.with_timezone(&chrono::Utc)))
+}
+
+/// The first fire moment (seconds after local midnight, whole minutes as [`due`] counts
+/// them) strictly after `now`, today or tomorrow.
+fn next_fire_after(
+    now: NaiveDateTime,
+    fire_secs: impl Iterator<Item = i64>,
+) -> Option<NaiveDateTime> {
+    let midnight = now.date().and_time(chrono::NaiveTime::MIN);
+    fire_secs
+        .map(|secs| {
+            let today = midnight + chrono::Duration::seconds(secs.rem_euclid(86400) / 60 * 60);
+            if today > now {
+                today
+            } else {
+                today + chrono::Duration::days(1)
+            }
+        })
+        .min()
 }
 
 /// How late a tick may still fire a slot: the loop sleeps a minute *after*
@@ -56,7 +103,8 @@ fn missed(now: NaiveDateTime, date: NaiveDate, fire_secs: i64) -> bool {
     (now - fire).num_seconds() >= CATCH_UP_SECS
 }
 
-async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
+/// One scheduler round; `true` when it started a game.
+async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<bool> {
     let local_now = chrono::Utc::now().with_timezone(&ctx.config.schedule.timezone);
     let local_date = local_now.date_naive();
     let now = local_now.naive_local();
@@ -215,7 +263,7 @@ async fn tick(ctx: &BotContext, client: &Client) -> anyhow::Result<()> {
         *ctx.round_abort.lock().await = Some(handle.abort_handle());
     }
 
-    Ok(())
+    Ok(round_spawned)
 }
 
 #[cfg(test)]
@@ -262,6 +310,30 @@ mod tests {
             due(at(22, 23, 0, 0), -3600),
             Due::Now(at(22, 0, 0, 0).date())
         );
+    }
+
+    #[test]
+    fn the_next_fire_is_the_first_slot_after_now() {
+        let slots = || [9 * 3600, 18 * 3600 + 30 * 60].into_iter();
+        assert_eq!(
+            next_fire_after(at(22, 8, 0, 0), slots()),
+            Some(at(22, 9, 0, 0))
+        );
+        assert_eq!(
+            next_fire_after(at(22, 9, 0, 0), slots()),
+            Some(at(22, 18, 30, 0)),
+            "strictly after"
+        );
+        assert_eq!(
+            next_fire_after(at(22, 20, 0, 0), slots()),
+            Some(at(23, 9, 0, 0))
+        );
+        // A reminder before midnight wraps to the evening before.
+        assert_eq!(
+            next_fire_after(at(22, 20, 0, 0), [-300].into_iter()),
+            Some(at(22, 23, 55, 0))
+        );
+        assert_eq!(next_fire_after(at(22, 20, 0, 0), [].into_iter()), None);
     }
 
     #[test]
