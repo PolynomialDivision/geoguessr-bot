@@ -330,7 +330,7 @@ fn decode_pixmap(bytes: &[u8]) -> Option<Pixmap> {
     let rgba = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (w, h) = rgba.dimensions();
     let mut data = rgba.into_raw();
-    for px in data.chunks_exact_mut(4) {
+    for px in data.as_chunks_mut::<4>().0 {
         let a = u16::from(px[3]);
         for c in &mut px[..3] {
             *c = ((u16::from(*c) * a + 127) / 255) as u8;
