@@ -91,6 +91,9 @@ pub struct BotContext {
     /// Consecutive Mapillary quality-filter rejections across prefetch sessions.
     /// Persists the anti-starvation streak so it survives between prefetch calls.
     pub prefetch_streak: Arc<AtomicU32>,
+    /// Held while the image cache is being filled, so only one fetch runs at a time
+    /// (game::prefetch_if_needed waits for it, game::refill_cache skips).
+    pub prefetch_lock: Arc<Mutex<()>>,
     /// Per-image-ID thumbnail metrics cache: avoids re-downloading thumbnails
     /// across prefetch sessions.  Stores (sharpness, overlay_penalty).
     /// Evicts oldest 20 % of entries at 1000-entry capacity.
@@ -207,6 +210,7 @@ async fn main() -> Result<()> {
         join_state,
         round_abort: Arc::new(Mutex::new(None)),
         prefetch_streak: Arc::new(AtomicU32::new(0)),
+        prefetch_lock: Arc::new(Mutex::new(())),
         blur_cache: Arc::new(std::sync::Mutex::new(
             crate::sources::mapillary::BlurCache::new(1000),
         )),
@@ -376,12 +380,17 @@ async fn main() -> Result<()> {
     bot.initial_sync().await;
     info!("Initial sync complete");
 
-    // Pre-warm the image cache.
+    // Fill the image cache now and keep it topped up: a restart or a failed
+    // fetch is retried within the hour, not at the next round's start.
     {
         let ctx2 = ctx.clone();
         tokio::spawn(async move {
-            game::prefetch_if_needed(&ctx2, ctx2.config.schedule.guesses_per_round as usize + 2)
-                .await;
+            let mut every = tokio::time::interval(game::REFILL_EVERY);
+            every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                every.tick().await; // the first tick is immediate
+                game::refill_cache(&ctx2).await;
+            }
         });
     }
 

@@ -504,7 +504,7 @@ pub async fn start_round(
     {
         let ctx2 = ctx.clone();
         tokio::spawn(async move {
-            prefetch_if_needed(&ctx2, n + 2).await;
+            refill_cache(&ctx2).await;
         });
     }
 
@@ -553,9 +553,16 @@ async fn abort_round_no_images(ctx: &BotContext, client: &Client, round_id: i64,
         .ok();
     }
     ctx.db.finish_round(round_id).await.ok();
-    let mut st = ctx.state.lock().await;
-    st.active_round = None;
-    st.save(&ctx.state_path).await.ok();
+    {
+        let mut st = ctx.state.lock().await;
+        st.active_round = None;
+        st.save(&ctx.state_path).await.ok();
+    }
+    // Start on the next round's locations now, not at its start.
+    let ctx2 = ctx.clone();
+    tokio::spawn(async move {
+        refill_cache(&ctx2).await;
+    });
 }
 
 /// Abort a single guess because its image could not be delivered to Matrix
@@ -2190,7 +2197,35 @@ async fn fetch_names(room: &Room, user_ids: &[&str]) -> HashMap<String, String> 
 
 // ── Prefetch ──────────────────────────────────────────────────────────────────
 
+/// Usable locations the cache keeps on top of the next round's images. A single
+/// fetch often finds nothing (most seeds have no photos or were played nearby),
+/// so a round that fetches only right before it starts can end up with none.
+pub const CACHE_RESERVE: usize = 3;
+
+/// How often the cache is topped up in the background, so a failed fetch is
+/// retried long before the next round instead of at its start.
+pub const REFILL_EVERY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Top the cache up to the next round plus `CACHE_RESERVE` in the background
+/// (at startup, after a round, hourly). Skipped while another fetch runs: that
+/// one fills the same cache, and two at once would pick locations close to each
+/// other.
+pub async fn refill_cache(ctx: &BotContext) {
+    let Ok(_fetching) = ctx.prefetch_lock.try_lock() else {
+        return;
+    };
+    let target = ctx.effective_guesses_per_round().await + CACHE_RESERVE;
+    fill_cache(ctx, target).await;
+}
+
+/// Fill the cache up to `target` usable locations, waiting for a background
+/// refill that is still running (it may already bring enough).
 pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
+    let _fetching = ctx.prefetch_lock.lock().await;
+    fill_cache(ctx, target).await;
+}
+
+async fn fill_cache(ctx: &BotContext, target: usize) {
     // Load played coords once: used for both cache eviction and new-image dedup.
     let db_coords: Vec<(f64, f64)> = ctx.db.recent_played_coords().await.unwrap_or_default();
 
@@ -2346,6 +2381,16 @@ pub async fn prefetch_if_needed(ctx: &BotContext, target: usize) {
         };
 
         match result {
+            Ok(img) if img.extra_image_urls.len() + 1 < n_photos_needed => {
+                // A round discards it anyway; cached, it would only count as a
+                // location that is there.
+                warn!(
+                    "GeoGuessr: prefetch ({source}): skipped {} with {} photo(s), {} required",
+                    img.country,
+                    img.extra_image_urls.len() + 1,
+                    n_photos_needed
+                );
+            }
             Ok(img) => {
                 // Reset the starvation streak but keep exploration mode active
                 // for the rest of this batch (homogeneity was computed upfront).

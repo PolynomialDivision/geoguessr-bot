@@ -273,6 +273,7 @@ pub async fn fetch(
     let mut n_no_images = 0u32;
     let mut n_deduped = 0u32;
     let mut n_unconfirmed = 0u32;
+    let mut n_too_few_photos = 0u32;
     let mut n_other_failures = 0u32;
 
     // With `spread_km` every seed city is tried at a few random points
@@ -345,6 +346,7 @@ pub async fn fetch(
                     SeedFailureCategory::NoImages => n_no_images += 1,
                     SeedFailureCategory::Deduped => n_deduped += 1,
                     SeedFailureCategory::Unconfirmed => n_unconfirmed += 1,
+                    SeedFailureCategory::TooFewPhotos => n_too_few_photos += 1,
                     SeedFailureCategory::Other => n_other_failures += 1,
                 }
                 warn!(
@@ -359,7 +361,8 @@ pub async fn fetch(
         "Mapillary: could not find a suitable image after trying {n_tried} seed(s) \
          ({n_quality_rejected} quality-rejected, {n_too_dense} too dense for any bbox, \
          {n_no_images} with no images, {n_deduped} fully deduped against history/cache, \
-         {n_unconfirmed} without a confirmed position, {n_other_failures} other failures, see preceding WARNs for detail)"
+         {n_unconfirmed} without a confirmed position, {n_too_few_photos} with too few photos, \
+         {n_other_failures} other failures, see preceding WARNs for detail)"
     )
 }
 
@@ -396,6 +399,8 @@ enum SeedFailureCategory {
     Deduped,
     /// No remaining candidate had GPS and reconstructed positions agreeing.
     Unconfirmed,
+    /// No candidate came with enough context photos for `photos_per_location`.
+    TooFewPhotos,
     /// Network error, persistent HTTP error, or anything else.
     Other,
 }
@@ -412,6 +417,8 @@ fn classify_seed_failure(msg: &str) -> SeedFailureCategory {
         SeedFailureCategory::Deduped
     } else if msg.contains("has a confirmed position") {
         SeedFailureCategory::Unconfirmed
+    } else if msg.contains("photos needed") {
+        SeedFailureCategory::TooFewPhotos
     } else {
         SeedFailureCategory::Other
     }
@@ -601,7 +608,20 @@ async fn try_seed(
     // ── Try each diversity-passing candidate through the quality filter ────────
     // Iterating over indices lets us remove and return the first one that passes
     // without cloning the whole struct up front.
+    //
+    // A location needs `n_photos` photos to be played at all (the round discards
+    // anything with fewer), so a candidate without enough context photos is skipped
+    // here: cached, it would only block its area and its country for later fetches.
+    let mut most_photos: Option<usize> = None;
     for primary_idx in passing {
+        // Before the thumbnail download: the context photos only get fewer once the
+        // download below adds blur metrics.
+        let available = 1 + extra_photo_urls(&candidates, primary_idx, blur_cache, n_photos).len();
+        if available < n_photos {
+            most_photos = most_photos.max(Some(available));
+            continue;
+        }
+
         // Clone ID and URL before any borrow of `candidates` crosses an await.
         let img_id = candidates[primary_idx].id.clone();
         let thumb_url = candidates[primary_idx]
@@ -666,6 +686,12 @@ async fn try_seed(
             qr.score, qr.reason, seed.city
         );
 
+        let extra_image_urls = extra_photo_urls(&candidates, primary_idx, blur_cache, n_photos);
+        if 1 + extra_image_urls.len() < n_photos {
+            most_photos = most_photos.max(Some(1 + extra_image_urls.len()));
+            continue;
+        }
+
         let primary = candidates.remove(primary_idx);
         let (lat, lon) = primary
             .trusted_position()
@@ -677,26 +703,6 @@ async fn try_seed(
             .and_then(|c| c.username.as_deref())
             .map(|u| format!("© {u} on Mapillary (CC BY-SA)"))
             .unwrap_or_else(|| "© Mapillary contributors (CC BY-SA)".to_owned());
-
-        // Extra photos: from the remaining pool, different sequence from primary.
-        // Skip candidates whose cached metrics indicate blur or heavy overlay.
-        let primary_seq = primary.sequence.as_deref();
-        let extra_image_urls: Vec<String> = candidates
-            .iter()
-            .filter(|img| img.sequence.as_deref() != primary_seq || primary_seq.is_none())
-            .filter(|img| {
-                let metrics = blur_cache.lock().ok().and_then(|c| c.get(&img.id));
-                match metrics {
-                    Some((sharpness, overlay)) => {
-                        sharpness.map(|s| s >= 0.2).unwrap_or(true)
-                            && overlay.map(|o| o >= 0.3).unwrap_or(true)
-                    }
-                    None => true,
-                }
-            })
-            .filter_map(|img| img.thumb_1024_url.clone())
-            .take(n_photos.saturating_sub(1))
-            .collect();
 
         return Ok(Some(GeoImage {
             country: seed.country.name.to_owned(),
@@ -713,8 +719,48 @@ async fn try_seed(
         }));
     }
 
+    if let Some(most) = most_photos {
+        bail!(
+            "only {most} of the {n_photos} photos needed near {}, {}",
+            seed.city,
+            seed.country.name
+        );
+    }
+
     // All diversity-passing candidates in this seed area failed quality check.
     Ok(None)
+}
+
+/// The context photos for the reference image `candidates[primary_idx]`: up to
+/// `n_photos - 1` thumbnails of other candidates from a different sequence (any
+/// other candidate when the reference has none) that the blur cache does not
+/// mark as blurry or covered by an overlay.
+fn extra_photo_urls(
+    candidates: &[MapillaryImage],
+    primary_idx: usize,
+    blur_cache: &Mutex<BlurCache>,
+    n_photos: usize,
+) -> Vec<String> {
+    let primary_seq = candidates[primary_idx].sequence.as_deref();
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != primary_idx)
+        .map(|(_, img)| img)
+        .filter(|img| primary_seq.is_none() || img.sequence.as_deref() != primary_seq)
+        .filter(|img| {
+            let metrics = blur_cache.lock().ok().and_then(|c| c.get(&img.id));
+            match metrics {
+                Some((sharpness, overlay)) => {
+                    sharpness.map(|s| s >= 0.2).unwrap_or(true)
+                        && overlay.map(|o| o >= 0.3).unwrap_or(true)
+                }
+                None => true,
+            }
+        })
+        .filter_map(|img| img.thumb_1024_url.clone())
+        .take(n_photos.saturating_sub(1))
+        .collect()
 }
 
 /// Outcome of a failed `/images` request, distinguishing the one failure
@@ -1265,7 +1311,41 @@ mod tests {
     }
 
     #[test]
+    fn context_photos_come_from_other_sequences_and_skip_blurry_ones() {
+        let photo = |id: &str, seq: Option<&str>| MapillaryImage {
+            id: id.to_owned(),
+            thumb_1024_url: Some(format!("https://t/{id}.jpg")),
+            sequence: seq.map(str::to_owned),
+            ..image_at((1.0, 2.0), None)
+        };
+        let candidates = vec![
+            photo("ref", Some("a")),
+            photo("same-run", Some("a")),
+            photo("other-run", Some("b")),
+            photo("blurry", Some("c")),
+            photo("no-run", None),
+        ];
+        let blur = Mutex::new(BlurCache::new(10));
+        blur.lock()
+            .unwrap()
+            .insert("blurry".to_owned(), (Some(0.05), None));
+
+        assert_eq!(
+            extra_photo_urls(&candidates, 0, &blur, 5),
+            ["https://t/other-run.jpg", "https://t/no-run.jpg"]
+        );
+        // Never more than the location needs.
+        assert_eq!(extra_photo_urls(&candidates, 0, &blur, 2).len(), 1);
+        // A reference without a sequence takes any other candidate, never itself.
+        assert_eq!(extra_photo_urls(&candidates, 4, &blur, 5).len(), 3);
+    }
+
+    #[test]
     fn classify_seed_failure_buckets_each_try_seed_bail_message() {
+        assert!(matches!(
+            classify_seed_failure("only 2 of the 5 photos needed near Dakar, Senegal"),
+            SeedFailureCategory::TooFewPhotos
+        ));
         assert!(matches!(
             classify_seed_failure(
                 "too densely covered even at the smallest bbox (0.00031°×0.00031°, 4 shrink(s))"
